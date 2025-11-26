@@ -4438,6 +4438,9 @@ TInterp_t CreateInterpreter(const std::vector<const char*>& Args /*={}*/,
       StringRef Arg;
       std::tie(Arg, Env) = Env.split(' ');
       ExtraArgs.push_back(Arg.str());
+#ifdef _DEBUG_CTC
+      llvm::errs() << "[XXX]: " << Arg << "\n";
+#endif
     }
   }
   std::transform(ExtraArgs.begin(), ExtraArgs.end(),
@@ -4450,11 +4453,22 @@ TInterp_t CreateInterpreter(const std::vector<const char*>& Args /*={}*/,
 #ifdef CPPINTEROP_USE_CLING
   auto I = new compat::Interpreter(ClingArgv.size(), &ClingArgv[0]);
 #else
+
+#ifdef _DEBUG_CTC
+  llvm::errs() << "[CreateInterpreter]: with args";
+  for (auto const* v : ClingArgv) {
+    llvm::errs() << " " << v;
+  }
+  llvm::errs() << "\n";
+#endif
+
   auto Interp =
       compat::Interpreter::create(static_cast<int>(ClingArgv.size()),
                                   ClingArgv.data(), nullptr, {}, nullptr, true);
+
   if (!Interp)
     return INTEROP_RETURN(nullptr);
+
   auto* I = Interp.release();
 #endif
 
