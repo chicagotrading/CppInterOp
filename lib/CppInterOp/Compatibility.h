@@ -449,10 +449,18 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
         << "(To enable recompile CppInterOp with -DLLVM_BUILT_WITH_OOP_JIT=ON)"
         << "\n";
   }
+
+  // FIXME: this is the simplest way to hard code large code model
+  auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
+  JTMB->setCodeModel(llvm::CodeModel::Large);
+  auto JB = std::make_unique<llvm::orc::LLJITBuilder>();
+  JB->setJITTargetMachineBuilder(std::move(*JTMB));
+
   auto innerOrErr =
-      CudaEnabled ? clang::Interpreter::createWithCUDA(std::move(*ciOrErr),
-                                                       std::move(DeviceCI))
-                  : clang::Interpreter::create(std::move(*ciOrErr));
+      CudaEnabled
+          ? clang::Interpreter::createWithCUDA(std::move(*ciOrErr),
+                                               std::move(DeviceCI))
+          : clang::Interpreter::create(std::move(*ciOrErr), std::move(JB));
 #endif
   if (!innerOrErr) {
     llvm::logAllUnhandledErrors(innerOrErr.takeError(), llvm::errs(),
