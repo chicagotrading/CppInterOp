@@ -612,6 +612,37 @@ cmake --build . --target check-cppinterop --parallel $env:ncpus
 
 </details>
 
+## Building with Bazel (experimental)
+
+CMake (above) is the supported way to build CppInterOp. An **experimental,
+best-effort** Bazel build is also provided; it is not gated in CI and may lag
+the CMake build.
+
+The Bazel build consumes a local LLVM/Clang tree rather than building one.
+Point it at one with the `LLVM_DIR` environment variable (an LLVM install tree
+whose `include/` carries the full LLVM and Clang headers works best):
+
+```sh
+export LLVM_DIR=/path/to/llvm
+```
+
+The shared Bazel machinery lives in the `cppyy_bazel` module under the sibling
+`cppyy` repository. CppInterOp's `MODULE.bazel` references it via
+`local_path_override(... path = "../cppyy/bazel")`, so check out `cppyy`
+alongside CppInterOp and run Bazel from the CppInterOp directory:
+
+```
+<workspace>/
+  CppInterOp/   # this repo
+  cppyy/        # provides cppyy_bazel
+```
+
+```sh
+cd CppInterOp
+LLVM_DIR=/path/to/llvm bazelisk build //...
+LLVM_DIR=/path/to/llvm bazelisk test //:tests
+```
+
 ______________________________________________________________________
 
 Further Reading: [C++ Language Interoperability Layer](https://compiler-research.org/libinterop/)

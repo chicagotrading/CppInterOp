@@ -1,0 +1,53 @@
+# Best-effort, non-gating Bazel build. CMake is the supported build for
+# CppInterOp; this job must NEVER gate a PR. Everything is wrapped so a
+# failure only emits a warning and the job is marked successful.
+name: bazel (best-effort)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bazel:
+    name: bazel (best-effort)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      # local_path_override points cppyy_bazel at ../cppyy/bazel, so lay out
+      # CppInterOp and cppyy as siblings and run bazel from ./CppInterOp.
+      - name: Checkout CppInterOp
+        uses: actions/checkout@v4
+        with:
+          path: CppInterOp
+
+      - name: Checkout cppyy (provides the cppyy_bazel module)
+        uses: actions/checkout@v4
+        with:
+          repository: compiler-research/cppyy
+          path: cppyy
+
+      - name: Download an LLVM release for LLVM_DIR
+        run: |
+          set -x
+          url="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz"
+          curl -fL "$url" -o llvm.tar.xz
+          mkdir -p llvm
+          tar -xf llvm.tar.xz -C llvm --strip-components=1
+          echo "LLVM_DIR=$PWD/llvm" >> "$GITHUB_ENV"
+
+      - name: Build //...
+        working-directory: CppInterOp
+        run: |
+          bazelisk build //... \
+            || echo "::warning::bazel build //... failed (best-effort, non-gating)"
+
+      - name: Test //:tests
+        working-directory: CppInterOp
+        run: |
+          bazelisk test //:tests \
+            || echo "::warning::bazel test //:tests failed (best-effort, non-gating)"
