@@ -39,3 +39,9 @@ install
 
 # Default Virtual Environments
 .venv
+
+# Bazel (convenience symlinks; bazel-support/ is checked in)
+/bazel-bin
+/bazel-out
+/bazel-testlogs
+/bazel-CppInterOp
