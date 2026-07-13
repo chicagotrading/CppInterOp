@@ -311,6 +311,17 @@ cc_library(
     includes = ["include"],
 )
 
+# CPPINTEROP_DIR / CPPINTEROP_BINARY_DIR: the repo's runfiles root (the test's
+# cwd at run time). repo_rloc self-corrects between the standalone build
+# (cppinterop is the main repo -> ".") and being an external dep (-> "../<canon>").
+# This BUILD is always @cppinterop, so is_main_repo() marks the self-reference.
+# CMake defines these for every unittest; needed by CppInterOpTests
+# (FunctionReflectionTest's APINotes check) and TracingTests.
+_CPPINTEROP_RUNFILES_DIR = repo_rloc(
+    "@cppinterop",
+    is_main_repo(repository_name()),
+)
+
 # CppInterOpTests: the main gtest suite. Source list = CMake's
 # add_cppinterop_unittest(CppInterOpTests ...) plus the non-EMSCRIPTEN
 # target_sources additions (CUDATest, VTableOverlayTest) plus main.cpp.
@@ -321,6 +332,7 @@ cppinterop_cc_test(
         "unittests/CppInterOp/CUDATest.cpp",
         "unittests/CppInterOp/CommentReflectionTest.cpp",
         "unittests/CppInterOp/CppInterOpThunksTest.cpp",
+        "unittests/CppInterOp/DiagnosticTest.cpp",
         "unittests/CppInterOp/EnumReflectionTest.cpp",
         "unittests/CppInterOp/FunctionReflectionTest.cpp",
         "unittests/CppInterOp/HandleTypesTest.cpp",
@@ -336,7 +348,17 @@ cppinterop_cc_test(
         "unittests/CppInterOp/main.cpp",
     ],
     # CMake sets -Wno-pedantic on VariableReflectionTest.cpp; applied suite-wide.
-    extra_copts = ["-Wno-pedantic"],
+    # Trailing slash: FunctionReflectionTest's APINotes check concatenates
+    # CPPINTEROP_DIR + "unittests/..." with no separator (TracingTests instead
+    # writes CPPINTEROP_DIR "/include", so its own value stays slash-free).
+    extra_copts = [
+        "-Wno-pedantic",
+        "-DCPPINTEROP_DIR=\\\"" + _CPPINTEROP_RUNFILES_DIR + "/\\\"",
+    ],
+    # The APINotes check #include's TestHeader.h from CPPINTEROP_DIR at run time
+    # (its -fmodules .pcm cache goes to $TEST_TMPDIR, set by the test itself; the
+    # sandbox denies clang's default ~/.cache/clang).
+    data = glob(["unittests/CppInterOp/APINotes/**"]),
     extra_deps = [":CAPITestC"],
 )
 
@@ -353,16 +375,7 @@ cppinterop_cc_test(
 )
 
 # TracingTests reads CppInterOp.h, the generated .inc, and lib/*.cpp at runtime,
-# relative to CPPINTEROP_DIR / CPPINTEROP_BINARY_DIR (the repo's runfiles root,
-# which is the test's cwd). repo_rloc self-corrects between the standalone build
-# (cppinterop is the main repo -> ".") and being an external dep (-> "../<canon>").
-# This BUILD is always @cppinterop, so is_main_repo() marks the self-reference.
-# No test-source changes needed.
-_CPPINTEROP_RUNFILES_DIR = repo_rloc(
-    "@cppinterop",
-    is_main_repo(repository_name()),
-)
-
+# relative to CPPINTEROP_DIR / CPPINTEROP_BINARY_DIR (shared definition above).
 cppinterop_cc_test(
     name = "TracingTests",
     srcs = [
