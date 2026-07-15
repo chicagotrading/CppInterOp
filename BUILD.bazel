@@ -4,6 +4,8 @@ LLVM tree (selected via the LLVM_DIR env var, see @cppyy_bazel//:llvm.bzl)."""
 
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
 load("@cppyy_bazel//:defs.bzl", "BASE_COPTS", "CPPINTEROP_COPTS", "DEFAULT_LTO_OPT_LEVEL", "LTO_OPT_LEVELS", "is_main_repo", "jit_cxx_interp_args", "llvm_linkopts", "llvm_lto_opt_linkopts", "llvm_system_libs", "llvm_tblgen_linkopts", "repo_rloc")
+load("@@rules_cc+//cc:defs.bzl", "cc_binary", "cc_library", "cc_shared_library", "cc_test")
+load("@@rules_shell+//shell:sh_test.bzl", "sh_test")
 load(
     "@cppyy_bazel//:rules.bzl",
     "cppinterop_buildinfo_inc",
