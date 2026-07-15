@@ -5870,3 +5870,46 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, FunctionReflection_DecltypeReturn) {
   JC.Invoke(&result, {args.data(), /*args_size=*/1}, /*self=*/nullptr);
   EXPECT_EQ(result.v, 21);
 }
+
+// Jitted std::call_once crosses the emulated-TLS boundary: the inlined
+// call_once template writes libstdc++'s native-TLS __once_callable /
+// __once_call (via once_flag::_Prepare_execution), which under the JIT's
+// emulated TLS lowers to __emutls_v.* companion lookups nothing defines.
+// The redirect (compat::redirectNativeTLSDeclarations) routes those accesses
+// to the calling thread's native copies instead, so the jitted writer and
+// libstdc++'s native reader (__once_proxy) share storage. Exercises the full
+// protocol: the callable must run exactly once and its effect be observable.
+TYPED_TEST(CPPINTEROP_TEST_MODE, FunctionReflection_NativeTLSStdCallOnce) {
+#ifdef EMSCRIPTEN
+  GTEST_SKIP() << "Test fails for Emscripten builds";
+#endif
+#ifdef CPPINTEROP_USE_CLING
+  GTEST_SKIP() << "redirectNativeTLSDeclarations is wired into the clang-repl "
+                  "CppInternal::Interpreter path, not cling's interpreter";
+#endif
+#if defined(_WIN32) || defined(__APPLE__)
+  GTEST_SKIP() << "the native-TLS redirect targets ELF emulated TLS";
+#endif
+  if (TypeParam::isOutOfProcess)
+    GTEST_SKIP() << "the dlsym-based native-TLS redirect is in-process only";
+
+  std::vector<Decl*> Decls;
+  std::string header = R"(
+    #include <mutex>
+    namespace BlogOnce {
+      inline int onceValue = 0;
+      inline std::once_flag onceFlag;
+      inline int runTwice() {
+        std::call_once(onceFlag, [] { ++onceValue; });
+        std::call_once(onceFlag, [] { ++onceValue; });
+        return onceValue;
+      }
+    }
+  )";
+  // -include new: MakeFunctionCallable's wrapper uses placement new.
+  GetAllTopLevelDecls(header, Decls, /*filter_implicitGenerated=*/false,
+                      /*interpreter_args=*/{"-std=c++23", "-include", "new"});
+
+  Interp->process("namespace BlogOnce { int drive() { return runTwice(); } }");
+  EXPECT_EQ(JitCallIntNullary("BlogOnce", "drive"), 1);
+}

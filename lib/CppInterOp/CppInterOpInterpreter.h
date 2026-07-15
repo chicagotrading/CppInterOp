@@ -332,6 +332,36 @@ private:
   llvm::StringSet<> DedupedWeakTLS;
 #endif
 
+#ifndef _WIN32
+  // Whether compat::nativeThreadLocalAddress has been defined into the main
+  // JITDylib under the name the redirected IR calls. See
+  // compat::redirectNativeTLSDeclarations.
+  bool NativeTLSHelperInstalled = false;
+
+  void installNativeTLSHelperOnce() {
+    if (NativeTLSHelperInstalled)
+      return;
+    NativeTLSHelperInstalled = true;
+    // Redirects run pre-Execute, so the executor may not exist yet on the
+    // very first input; an empty execution forces it into existence.
+    if (llvm::Error Err = inner->ParseAndExecute("")) {
+      llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),
+                                  "Failed to create the execution engine:");
+      return;
+    }
+    llvm::orc::LLJIT* J = compat::getExecutionEngine(*inner);
+    llvm::orc::SymbolMap Syms;
+    Syms[J->mangleAndIntern("__cppinterop_native_tls_addr")] =
+        llvm::orc::ExecutorSymbolDef(
+            llvm::orc::ExecutorAddr::fromPtr(&compat::nativeThreadLocalAddress),
+            llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+    if (llvm::Error Err = J->getMainJITDylib().define(
+            llvm::orc::absoluteSymbols(std::move(Syms))))
+      llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),
+                                  "Failed to define the native-TLS helper:");
+  }
+#endif
+
 public:
   Interpreter(std::unique_ptr<clang::Interpreter> CI,
               std::unique_ptr<IOContext> ctx = nullptr, bool oop = false)
@@ -466,6 +496,11 @@ public:
 #if CLANG_VERSION_MAJOR < 24
       compat::dedupeWeakEmulatedTLS(*PTU->TheModule, DedupedWeakTLS);
 #endif
+#ifndef _WIN32
+      if (!outOfProcess &&
+          compat::redirectNativeTLSDeclarations(*PTU->TheModule))
+        installNativeTLSHelperOnce();
+#endif
       // WORKAROUND: see bindProcessWeakGlobals in Compatibility.h -- remove
       // with the pass once the clang JIT fix lands.
 #if !defined(_WIN32) && CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
@@ -573,6 +608,11 @@ public:
 #if CLANG_VERSION_MAJOR < 24
     if (PTUOrErr->TheModule)
       compat::dedupeWeakEmulatedTLS(*PTUOrErr->TheModule, DedupedWeakTLS);
+#endif
+#ifndef _WIN32
+    if (PTUOrErr->TheModule && !outOfProcess &&
+        compat::redirectNativeTLSDeclarations(*PTUOrErr->TheModule))
+      installNativeTLSHelperOnce();
 #endif
       // WORKAROUND: see bindProcessWeakGlobals in Compatibility.h -- remove
       // with the pass once the clang JIT fix lands.
