@@ -362,6 +362,70 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
   EXPECT_TRUE(Cpp::GetVariableOffset(var));
 }
 
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           VariableReflection_GetVariableOffset_NoStaleUsedHandle) {
+  // Emitting a discardable-ODR variable through the UsedAttr route records
+  // the global as a weak handle in codegen's llvm.used list. If the global
+  // is later replaced/erased (weak-def discard when a later PTU re-emits
+  // the same entity), the next PTU's emitUsed dereferences the nulled
+  // handle. The offset query must not leave used-list residue.
+  TestFixture::CreateInterpreter();
+  Cpp::Declare(R"(
+    struct UsedHandle {
+      inline static int probe = 3;
+    };
+  )");
+  Cpp::DeclRef klass = Cpp::GetNamed("UsedHandle");
+  EXPECT_TRUE(klass);
+  Cpp::DeclRef var = Cpp::GetNamed("probe", klass);
+  EXPECT_TRUE(var);
+  EXPECT_TRUE(Cpp::GetVariableOffset(var));
+  // ForceCodeGen's UsedAttr is planted permanently on the AST decl; the
+  // odr-use route must not.
+  EXPECT_FALSE(Cpp::unwrap<Decl>(var)->hasAttr<clang::UsedAttr>());
+  // The UsedAttr lives on the AST decl, so every later PTU that re-emits
+  // the entity re-adds it to that module's llvm.used — the residue the
+  // stale-handle crash grows from. Neither a module that re-emits the
+  // variable nor an unrelated one may carry llvm.used.
+  {
+    auto PTUOrErr = Interp->Parse("int consume_probe = UsedHandle::probe;");
+    ASSERT_TRUE(bool(PTUOrErr));
+    EXPECT_EQ(PTUOrErr->TheModule->getNamedGlobal("llvm.used"), nullptr);
+    if (auto Err = Interp->Execute(*PTUOrErr))
+      llvm::consumeError(std::move(Err));
+  }
+  {
+    auto PTUOrErr = Interp->Parse("int flush_ptu = 0;");
+    ASSERT_TRUE(bool(PTUOrErr));
+    EXPECT_EQ(PTUOrErr->TheModule->getNamedGlobal("llvm.used"), nullptr);
+    if (auto Err = Interp->Execute(*PTUOrErr))
+      llvm::consumeError(std::move(Err));
+  }
+  EXPECT_TRUE(Cpp::GetNamed("flush_ptu"));
+  // A reflection sweep interleaves offset queries with parse failures
+  // (absorbed probe errors); a failed parse rolls back its PTU and erases
+  // that PTU's globals, so any used-list handle re-emitted there goes
+  // stale. Mimic the sweep: many discardable statics, offset queries,
+  // interleaved failed parses, then more successful PTUs.
+  for (int i = 0; i < 8; ++i) {
+    std::string n = std::to_string(i);
+    Cpp::Declare(("struct Sweep" + n + " { inline static int v" + n + " = " +
+                  n + "; };")
+                     .c_str());
+    Cpp::DeclRef k = Cpp::GetNamed(("Sweep" + n).c_str());
+    ASSERT_TRUE(k);
+    Cpp::DeclRef v = Cpp::GetNamed(("v" + n).c_str(), k);
+    ASSERT_TRUE(v);
+    EXPECT_TRUE(Cpp::GetVariableOffset(v));
+    Cpp::Declare(("template <> struct Sweep" + n + "<int>;").c_str(),
+                 /*silent=*/true); // expected parse failure, absorbed
+    Cpp::Declare(
+        ("int use" + n + " = Sweep" + n + "::v" + n + ";").c_str());
+  }
+  Cpp::Declare("int sweep_done = 1;");
+  EXPECT_TRUE(Cpp::GetNamed("sweep_done"));
+}
+
 #define CODE                                                                   \
   class BaseA {                                                                \
   public:                                                                      \

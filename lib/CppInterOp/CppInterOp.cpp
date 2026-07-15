@@ -402,6 +402,45 @@ static void ForceCodeGen(Decl* D, compat::Interpreter& I) {
 #endif
 }
 
+int Declare(compat::Interpreter& I, const char* code, bool silent);
+
+// Force emission of a variable's definition by declaring an odr-use of it,
+// instead of ForceCodeGen's UsedAttr route. The UsedAttr route records the
+// emitted global in codegen's llvm.used list as a weak handle; the handle
+// can go null (global deleted) before a later incremental PTU's emitUsed
+// runs, and release-built clang dereferences it without checking — a
+// process crash that accumulates with interpreter state rather than
+// tracing to any one declaration. The odr-use emits the (discardable)
+// definition through the regular deferred-decl path and leaves no
+// used-list residue. Returns false when the variable cannot be named from
+// a fresh chunk of source (anonymous scopes, or printed names that fail to
+// parse) — the caller falls back to ForceCodeGen.
+static bool EmitVariableViaOdrUse(compat::Interpreter& I, VarDecl* VD) {
+  std::string name;
+  {
+    llvm::raw_string_ostream OS(name);
+    VD->printQualifiedName(OS);
+  }
+  if (name.find("(anonymous ") != std::string::npos ||
+      name.find("(unnamed ") != std::string::npos ||
+      name.find("(lambda ") != std::string::npos)
+    return false;
+  // Template-specialization spellings do not reliably round-trip as source
+  // (e.g. a printed LLONG_MIN non-type argument re-parses as an overflowing
+  // literal), and a parse-failing declaration poisons the incremental
+  // interpreter; keep those on the caller's UsedAttr path.
+  if (name.find('<') != std::string::npos)
+    return false;
+
+  // External linkage on the dummy keeps it — and therefore the referenced
+  // definition — from being discarded as unused internal state.
+  static unsigned Counter = 0;
+  std::string code = "namespace __cppinterop_odr_use { const void* __v" +
+                     std::to_string(Counter++) +
+                     " = (const void*)__builtin_addressof(::" + name + "); }";
+  return Declare(I, code.c_str(), /*silent=*/true) == 0;
+}
+
 #define DEBUG_TYPE "jitcall"
 bool JitCall::AreArgumentsValid(void* result, ArgList args, void* self,
                                 size_t nary) const {
@@ -2803,7 +2842,14 @@ intptr_t GetVariableOffset(compat::Interpreter& I, Decl* D,
     }
     if (!address) {
       auto Linkage = C.GetGVALinkageForVariable(VD);
-      if (isDiscardableGVALinkage(Linkage))
+      // Odr-use emission only for discardable-ODR entities (inline/constexpr
+      // statics) — the class the used-list crash traced to. Internal-linkage
+      // variables cannot be odr-used from a later PTU (module-local symbol:
+      // the reference duplicates or misses the entity), and an
+      // available-externally definition would not be emitted by a mere
+      // reference; both stay on the stock UsedAttr path.
+      if (isDiscardableGVALinkage(Linkage) &&
+          (Linkage != GVA_DiscardableODR || !EmitVariableViaOdrUse(I, VD)))
         ForceCodeGen(VD, I);
     }
     auto VDAorErr = compat::getSymbolAddress(I, StringRef(mangledName));
