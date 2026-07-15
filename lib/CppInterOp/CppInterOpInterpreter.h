@@ -262,7 +262,7 @@ private:
   mutable std::once_flag sDLMInit;
   bool outOfProcess;
 
-#if CLANG_VERSION_MAJOR < 23
+#if CLANG_VERSION_MAJOR < 24
   // Weak thread_local definitions already handed to the JIT, so later modules
   // demote their duplicates. See compat::dedupeWeakEmulatedTLS.
   llvm::StringSet<> DedupedWeakTLS;
@@ -414,7 +414,7 @@ public:
     if (!PTU)
       return PTU.takeError();
     if (PTU->TheModule) {
-#if CLANG_VERSION_MAJOR < 23
+#if CLANG_VERSION_MAJOR < 24
       compat::dedupeWeakEmulatedTLS(*PTU->TheModule, DedupedWeakTLS);
 #endif
 #ifndef _WIN32
@@ -520,7 +520,7 @@ public:
     if (PTU)
       *PTU = &*PTUOrErr;
 
-#if CLANG_VERSION_MAJOR < 23
+#if CLANG_VERSION_MAJOR < 24
     if (PTUOrErr->TheModule)
       compat::dedupeWeakEmulatedTLS(*PTUOrErr->TheModule, DedupedWeakTLS);
 #endif
