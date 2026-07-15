@@ -2779,9 +2779,18 @@ intptr_t GetVariableOffset(compat::Interpreter& I, Decl* D,
       address = I.getAddressOfGlobal(GD);
     if (!address) {
       if (!VD->hasInit()) {
-        compat::SynthesizingCodeRAII RAII(&getInterp());
-        getSema().InstantiateVariableDefinition(SourceLocation(), VD);
-        VD = VD->getDefinition();
+        // Sema::InstantiateVariableDefinition requires a variable that was
+        // instantiated from a template; without a pattern it dereferences a
+        // null VarDecl in release builds. A non-template class's static data
+        // member declared in-class and defined out-of-line (for example
+        // std::partial_ordering::less) reaches here with no pattern: skip
+        // instantiation and just look up the out-of-line definition.
+        if (VD->getTemplateInstantiationPattern()) {
+          compat::SynthesizingCodeRAII RAII(&getInterp());
+          getSema().InstantiateVariableDefinition(SourceLocation(), VD);
+        }
+        if (VarDecl* Def = VD->getDefinition())
+          VD = Def;
       }
       if (VD->hasInit() &&
           (VD->isConstexpr() || VD->getType().isConstQualified())) {
