@@ -5408,7 +5408,20 @@ DeclRef InstantiateTemplate(compat::Interpreter& I, DeclRef tmpl,
   auto* TmplD = unwrap<TemplateDecl>(tmpl);
   // We will create a new decl, push a transaction.
   compat::SynthesizingCodeRAII RAII(&getInterp());
-  return InstantiateTemplate(TmplD, TemplateArgs, S, instantiate_body);
+  // A rejected instantiation emits its error diagnostic outside any
+  // incremental parse, and DiagnosticsEngine's ErrorOccurred flag is sticky:
+  // the next IncrementalParser::Parse would report the stale flag as its own
+  // failure and then soft-reset it, poisoning exactly one parse. Restore a
+  // clean diagnostic state if this call introduced the error (same cleanup
+  // the incremental parser performs on a real parse failure).
+  clang::DiagnosticsEngine& Diags = S.getDiagnostics();
+  bool HadErrors = Diags.hasErrorOccurred();
+  Decl* Result = InstantiateTemplate(TmplD, TemplateArgs, S, instantiate_body);
+  if (!HadErrors && Diags.hasErrorOccurred()) {
+    Diags.Reset(/*soft=*/true);
+    Diags.getClient()->clear();
+  }
+  return Result;
 }
 
 DeclRef InstantiateTemplate(DeclRef tmpl, const TemplateArgInfo* template_args,
