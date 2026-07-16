@@ -558,6 +558,13 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
 #else
   // FIXME: this is the simplest way to hard code large code model
   auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
+  if (!JTMB) {
+    // Also required for correctness: dereferencing an unchecked Expected
+    // aborts under LLVM_ENABLE_ABI_BREAKING_CHECKS builds.
+    llvm::logAllUnhandledErrors(JTMB.takeError(), llvm::errs(),
+                                "Failed to detect host for the JIT:");
+    return nullptr;
+  }
   JTMB->setCodeModel(llvm::CodeModel::Large);
   auto JB = std::make_unique<llvm::orc::LLJITBuilder>();
   JB->setJITTargetMachineBuilder(std::move(*JTMB));
