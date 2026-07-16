@@ -103,6 +103,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -5570,10 +5571,21 @@ std::string GetFunctionArgDefault(ConstFuncRef func, size_t param_index) {
     if (PI->getType()->isFloatingType()) {
       if (!Result.empty() && Result.back() == '.')
         return INTEROP_RETURN(Result);
-      auto DefaultArgValue = std::stod(Result);
-      std::ostringstream oss;
-      oss << DefaultArgValue;
-      Result = oss.str();
+      // The printed default need not be a numeric literal (an identifier
+      // such as `kDefaultRatio`, or a call such as `quiet_NaN()`); std::stod
+      // would throw std::invalid_argument, and this library is built
+      // without exception support, so the throw terminates the process.
+      // Parse non-throwingly and keep the printed spelling when the default
+      // is not a plain literal.
+      errno = 0;
+      char* ParseEnd = nullptr;
+      double DefaultArgValue = std::strtod(Result.c_str(), &ParseEnd);
+      if (ParseEnd != Result.c_str() && ParseEnd != nullptr &&
+          *ParseEnd == '\0' && errno != ERANGE) {
+        std::ostringstream oss;
+        oss << DefaultArgValue;
+        Result = oss.str();
+      }
     }
     return INTEROP_RETURN(Result);
   }
