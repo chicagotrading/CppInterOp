@@ -2914,6 +2914,31 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, FunctionReflection_GetFunctionArgDefault) {
   EXPECT_EQ(Cpp::GetFunctionArgDefault(fn, 1), "S()");
 }
 
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           FunctionReflection_GetFunctionArgDefaultSymbolic) {
+  std::vector<Decl*> Decls;
+  std::string code = R"(
+    constexpr double kDefaultRatio = 0.5;
+    double default_ratio();
+    double scaled(double ratio = kDefaultRatio);
+    double rescaled(double ratio = default_ratio());
+    double inverted(double ratio = 2.0 / kDefaultRatio);
+    double pi_ish(double p = 3.14);
+    )";
+
+  GetAllTopLevelDecls(code, Decls);
+
+  // A floating-typed default need not be a numeric literal. Formatting a
+  // symbolic default must not throw (std::stod would terminate the
+  // exception-free build) and must preserve the printed spelling.
+  EXPECT_EQ(Cpp::GetFunctionArgDefault(Decls[2], 0), "kDefaultRatio");
+  EXPECT_EQ(Cpp::GetFunctionArgDefault(Decls[3], 0), "default_ratio()");
+  // Starts with a valid literal but has trailing text: spelling preserved.
+  EXPECT_EQ(Cpp::GetFunctionArgDefault(Decls[4], 0), "2. / kDefaultRatio");
+  // Plain literals keep the precision normalization.
+  EXPECT_EQ(Cpp::GetFunctionArgDefault(Decls[5], 0), "3.14");
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, FunctionReflection_Construct) {
 #ifdef _WIN32
   GTEST_SKIP() << "Disabled on Windows. Needs fixing.";
