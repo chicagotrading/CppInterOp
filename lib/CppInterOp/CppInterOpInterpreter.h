@@ -421,6 +421,8 @@ public:
       if (!outOfProcess &&
           compat::redirectNativeTLSDeclarations(*PTU->TheModule))
         installNativeTLSHelperOnce();
+      if (!outOfProcess)
+        compat::bindProcessWeakGlobals(*PTU->TheModule);
 #endif
       if (llvm::Error Err = inner->Execute(*PTU))
         return Err;
@@ -529,6 +531,8 @@ public:
     if (PTUOrErr->TheModule && !outOfProcess &&
         compat::redirectNativeTLSDeclarations(*PTUOrErr->TheModule))
       installNativeTLSHelperOnce();
+    if (PTUOrErr->TheModule && !outOfProcess)
+      compat::bindProcessWeakGlobals(*PTUOrErr->TheModule);
 #endif
 
     if (auto Err = Execute(*PTUOrErr)) {
