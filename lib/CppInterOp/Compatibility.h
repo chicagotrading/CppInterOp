@@ -34,11 +34,14 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Value.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/TargetParser/Triple.h"
 
@@ -764,6 +767,105 @@ inline bool redirectNativeTLSDeclarations(llvm::Module& M) {
       GV.eraseFromParent();
   }
   return Changed;
+}
+
+// ===========================================================================
+// Bind weak globals the process already defines (in-process JIT).
+//
+// A singleton *defined* in a header -- a function-local static in an inline
+// function (Meyers) or a C++17 inline static data member -- compiles to a
+// weak/linkonce_odr global variable. When jitted code includes such a header,
+// the ORC JIT materializes its own copy: JITDylib definitions win over the
+// process-symbol generator, which is only consulted for symbols the JITDylib
+// lacks. The result is two instances of one singleton (and a double
+// destruction at teardown) where a dynamic linker would have unified them.
+//
+// Mitigation: before a module reaches the JIT, demote every mutable weak
+// global-variable definition whose symbol the dynamic linker already
+// resolves to an external declaration; the JIT then binds the process copy.
+// A dynamically initialized static's guard variable (_ZGV<...>) moves with
+// its data, and only when the process exports both: sharing the data but not
+// the guard would re-run initialization on the process copy, sharing the
+// guard but not the data would leave the jitted copy uninitialized.
+//
+// Only mutable variables are demoted: duplicated constants are harmless
+// under ODR (and folding them keeps jitted code fast); duplicated mutable
+// state is the singleton bug. thread_locals belong to the TLS passes above,
+// and functions are never demoted -- jitted code may legitimately carry its
+// own copies of inline functions. ELF and in-process only, mirroring
+// redirectNativeTLSDeclarations.
+// ===========================================================================
+inline bool bindProcessWeakGlobals(llvm::Module& M) {
+  if (!llvm::Triple(M.getTargetTriple()).isOSBinFormatELF())
+    return false;
+
+  auto ProcessHas = [](llvm::StringRef Name) {
+    return ::dlsym(RTLD_DEFAULT, Name.str().c_str()) != nullptr;
+  };
+
+  llvm::SmallVector<llvm::GlobalVariable*, 8> Demoted;
+  for (llvm::GlobalVariable& GV : M.globals()) {
+    if (GV.isDeclaration() || !GV.isWeakForLinker() || GV.isThreadLocal() ||
+        GV.isConstant())
+      continue;
+
+    llvm::StringRef Name = GV.getName();
+    // Guards are only ever demoted together with their variable, below.
+    if (Name.starts_with("_ZGV"))
+      continue;
+    if (!ProcessHas(Name))
+      continue;
+
+    llvm::GlobalVariable* Guard = nullptr;
+    if (Name.starts_with("_Z")) {
+      llvm::GlobalVariable* G =
+          M.getNamedGlobal(("_ZGV" + Name.drop_front(2)).str());
+      if (G && !G->isDeclaration()) {
+        if (!ProcessHas(G->getName()))
+          continue;
+        Guard = G;
+      }
+    }
+
+    Demoted.push_back(&GV);
+    if (Guard)
+      Demoted.push_back(Guard);
+  }
+  if (Demoted.empty())
+    return false;
+
+  for (llvm::GlobalVariable* GV : Demoted) {
+    GV->setInitializer(nullptr);
+    GV->setLinkage(llvm::GlobalValue::ExternalLinkage);
+    GV->setComdat(nullptr);
+    GV->setVisibility(llvm::GlobalValue::DefaultVisibility);
+    GV->setDSOLocal(false);
+  }
+
+  // Declarations may not appear in the used lists; drop demoted entries.
+  for (const char* ListName : {"llvm.used", "llvm.compiler.used"}) {
+    llvm::GlobalVariable* Used = M.getNamedGlobal(ListName);
+    if (!Used || !Used->hasInitializer())
+      continue;
+    auto* Init = llvm::cast<llvm::ConstantArray>(Used->getInitializer());
+    llvm::SmallVector<llvm::Constant*, 8> Kept;
+    for (llvm::Value* Op : Init->operand_values()) {
+      auto* C = llvm::cast<llvm::Constant>(Op);
+      if (!llvm::is_contained(Demoted, C->stripPointerCasts()))
+        Kept.push_back(C);
+    }
+    if (Kept.size() == Init->getNumOperands())
+      continue;
+    Used->eraseFromParent();
+    if (!Kept.empty()) {
+      auto* ATy = llvm::ArrayType::get(Kept.front()->getType(), Kept.size());
+      auto* NewUsed = new llvm::GlobalVariable(
+          M, ATy, /*isConstant=*/false, llvm::GlobalValue::AppendingLinkage,
+          llvm::ConstantArray::get(ATy, Kept), ListName);
+      NewUsed->setSection("llvm.metadata");
+    }
+  }
+  return true;
 }
 #endif
 
