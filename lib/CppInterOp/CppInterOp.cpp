@@ -9,6 +9,7 @@
 
 #include "CppInterOp/CppInterOp.h"
 #include "Unwrap.h"
+#include "CppInterOp/CppInterOpTypes.h"
 #include "CppInterOp/Error.h"
 
 // Generated at configure time; defines CPPINTEROP_BAKED_INTERPRETER_ARGS
@@ -3017,7 +3018,8 @@ BestOverloadFunctionMatch(const std::vector<FuncRef>& candidates,
   struct WrapperExpr : public OpaqueValueExpr {
     WrapperExpr() : OpaqueValueExpr(clang::Stmt::EmptyShell()) {}
   };
-  auto* Exprs = new WrapperExpr[arg_types.size()];
+  // unique_ptr: the failed-template-arg path below returns early.
+  std::unique_ptr<WrapperExpr[]> Exprs(new WrapperExpr[arg_types.size()]);
   llvm::SmallVector<Expr*> Args;
 
   Args.reserve(arg_types.size());
@@ -3110,7 +3112,6 @@ BestOverloadFunctionMatch(const std::vector<FuncRef>& candidates,
     }
   }
 
-  delete[] Exprs;
   return INTEROP_RETURN(Result);
 }
 
