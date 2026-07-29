@@ -53,9 +53,14 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 
 #if CLANG_VERSION_MAJOR < 22
 #define clang_driver_options clang::driver::options
@@ -866,6 +871,46 @@ inline bool bindProcessWeakGlobals(llvm::Module& M) {
     }
   }
   return true;
+}
+#endif
+
+// ===========================================================================
+// Resolve glibc's libc_nonshared.a symbols for the in-process JIT.
+//
+// glibc defines a few functions in libc_nonshared.a instead of libc.so --
+// at_quick_exit, atexit, pthread_atfork, __stack_chk_fail_local -- because
+// their behavior is tied to the caller's own ELF module (__dso_handle, local
+// stack-protector calls). The static linker gives every executable and DSO a
+// private, non-exported copy, so dlsym never sees them and the ORC
+// process-symbol generator cannot resolve a jitted reference: any header
+// calling std::at_quick_exit fails to JIT with
+// "Symbols not found: [ at_quick_exit ]".
+//
+// Hand out this library's own copies. They are the real glibc
+// implementations, registered against this DSO's __dso_handle -- correct for
+// jitted code, which lives and dies with the process: handlers registered
+// through them run at quick_exit/exit/fork exactly like any native caller's.
+//
+// atexit normally never reaches this table: LLJIT's platform support defines
+// a JIT-aware atexit per JITDylib, and a definition generator is only
+// consulted for symbols nothing else defines. It is listed as a fallback for
+// configurations without that platform support. The remaining
+// libc_nonshared.a members (sched_[gs]etattr, pthread_gettid_np,
+// __inet_ntop_chk...) vary by glibc build and are omitted; extend the table
+// if one ever surfaces in a JIT lookup.
+// ===========================================================================
+#if defined(__GLIBC__)
+extern "C" void __stack_chk_fail_local();
+
+inline const llvm::StringMap<void*>& glibcNonsharedSymbols() {
+  static const llvm::StringMap<void*> Symbols = {
+      {"at_quick_exit", reinterpret_cast<void*>(&::at_quick_exit)},
+      {"atexit", reinterpret_cast<void*>(&::atexit)},
+      {"pthread_atfork", reinterpret_cast<void*>(&::pthread_atfork)},
+      {"__stack_chk_fail_local",
+       reinterpret_cast<void*>(&__stack_chk_fail_local)},
+  };
+  return Symbols;
 }
 #endif
 
