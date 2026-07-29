@@ -30,9 +30,16 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ExecutionEngine/JITSymbol.h"
+#include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
+#include "llvm/ExecutionEngine/Orc/Core.h"
+#include "llvm/ExecutionEngine/Orc/CoreContainers.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
+#include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/TargetSelect.h"
@@ -44,7 +51,6 @@
 #include <unistd.h>
 #endif
 #if defined(_WIN32) && (defined(_M_IX86) || defined(__i386__))
-#include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include <deque>
 #endif
@@ -207,11 +213,11 @@ private:
 };
 #endif // _WIN32 && i386
 
-#if defined(__GLIBC__)
-/// Resolves jitted references to glibc's libc_nonshared.a functions
-/// (at_quick_exit and friends): every ELF module links a private copy that
-/// dlsym cannot see, so the process-symbol generator never finds them. Hands
-/// out this library's own copies. See compat::glibcNonsharedSymbols.
+#ifdef __GLIBC__
+/// Resolves the pure-code libc_nonshared.a symbols (per-module copies
+/// invisible to dlsym) to this library's own. The registration functions
+/// (at_quick_exit, pthread_atfork) resolve to JIT-side shims instead; see
+/// compat::glibcNonsharedSymbols and compat::addGlibcNonsharedShims.
 class GlibcNonsharedSymbolGenerator : public llvm::orc::DefinitionGenerator {
 public:
   llvm::Error
@@ -225,6 +231,7 @@ public:
       auto It = Known.find(*KV.first);
       if (It == Known.end())
         continue;
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
       NewSymbols[KV.first] = {llvm::orc::ExecutorAddr::fromPtr(It->second),
                               llvm::JITSymbolFlags::Exported |
                                   llvm::JITSymbolFlags::Callable};
@@ -234,6 +241,32 @@ public:
     return JD.define(llvm::orc::absoluteSymbols(std::move(NewSymbols)));
   }
 };
+
+/// Installs the libc_nonshared.a support on the main JITDylib: the fallback
+/// generator for pure-code symbols, the host registration entry points, and
+/// the at_quick_exit/pthread_atfork shims scoped to \p Owner (see
+/// compat::JitGlibcHandlerRegistry).
+inline void installGlibcNonsharedSupport(llvm::orc::LLJIT& J, void* Owner) {
+  J.getMainJITDylib().addGenerator(
+      std::make_unique<GlibcNonsharedSymbolGenerator>());
+
+  llvm::orc::SymbolMap Syms;
+  Syms[J.mangleAndIntern("__cppinterop_at_quick_exit")] =
+      llvm::orc::ExecutorSymbolDef(
+          llvm::orc::ExecutorAddr::fromPtr(&compat::jitAtQuickExit),
+          llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+  Syms[J.mangleAndIntern("__cppinterop_pthread_atfork")] =
+      llvm::orc::ExecutorSymbolDef(
+          llvm::orc::ExecutorAddr::fromPtr(&compat::jitPthreadAtfork),
+          llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+  llvm::Error Err =
+      J.getMainJITDylib().define(llvm::orc::absoluteSymbols(std::move(Syms)));
+  if (!Err)
+    Err = compat::addGlibcNonsharedShims(J, Owner);
+  if (Err)
+    llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),
+                                "Failed to install the glibc shims:");
+}
 #endif // __GLIBC__
 
 /// CppInterOp Interpreter
@@ -328,29 +361,6 @@ private:
   }
 #endif
 
-#if defined(__GLIBC__)
-  // Whether the libc_nonshared.a fallback generator is on the main JITDylib.
-  // See GlibcNonsharedSymbolGenerator.
-  bool GlibcNonsharedGeneratorInstalled = false;
-
-  void installGlibcNonsharedGeneratorOnce() {
-    if (GlibcNonsharedGeneratorInstalled)
-      return;
-    GlibcNonsharedGeneratorInstalled = true;
-    // Runs pre-Execute, so the executor may not exist yet on the very first
-    // input; an empty execution forces it into existence. Appending also
-    // keeps this generator behind the process-symbol one: it is only asked
-    // for symbols dlsym cannot resolve.
-    if (llvm::Error Err = inner->ParseAndExecute("")) {
-      llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),
-                                  "Failed to create the execution engine:");
-      return;
-    }
-    compat::getExecutionEngine(*inner)->getMainJITDylib().addGenerator(
-        std::make_unique<GlibcNonsharedSymbolGenerator>());
-  }
-#endif
-
 public:
   Interpreter(std::unique_ptr<clang::Interpreter> CI,
               std::unique_ptr<IOContext> ctx = nullptr, bool oop = false)
@@ -403,11 +413,26 @@ public:
         std::make_unique<COFFi386SymbolGenerator>());
 #endif
 
+#ifdef __GLIBC__
+    // In-process only (the shims and the generator hand out this process's
+    // addresses); the generator is appended last so it is consulted only
+    // when the process-symbol generator fails. The inner interpreter keys
+    // the handler registry; ~Interpreter flushes it.
+    if (!outOfProcess)
+      installGlibcNonsharedSupport(*compat::getExecutionEngine(*CI), CI.get());
+#endif
+
     return std::make_unique<Interpreter>(std::move(CI), std::move(io_ctx),
                                          outOfProcess);
   }
 
-  ~Interpreter() {}
+  ~Interpreter() {
+#ifdef __GLIBC__
+    // Run jitted quick-exit handlers while their code is still mapped and
+    // drop this interpreter's atfork entries.
+    compat::JitGlibcHandlerRegistry::instance().flushOwner(inner.get());
+#endif
+  }
 
   operator const clang::Interpreter&() const { return *inner; }
   operator clang::Interpreter&() { return *inner; }
@@ -479,10 +504,6 @@ public:
 #if CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
       if (!outOfProcess)
         compat::bindProcessWeakGlobals(*PTU->TheModule);
-#if defined(__GLIBC__)
-      if (!outOfProcess)
-        installGlibcNonsharedGeneratorOnce();
-#endif
 #endif
 #endif
       if (llvm::Error Err = inner->Execute(*PTU))
@@ -597,10 +618,6 @@ public:
 #if CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
     if (PTUOrErr->TheModule && !outOfProcess)
       compat::bindProcessWeakGlobals(*PTUOrErr->TheModule);
-#if defined(__GLIBC__)
-    if (PTUOrErr->TheModule && !outOfProcess)
-      installGlibcNonsharedGeneratorOnce();
-#endif
 #endif
 #endif
 
