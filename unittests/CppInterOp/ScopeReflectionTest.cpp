@@ -3,12 +3,11 @@
 #include "../../lib/CppInterOp/Unwrap.h"
 #include "CppInterOp/CppInterOp.h"
 
-#include "clang/AST/DeclTemplate.h"
-
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTDumper.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/GlobalDecl.h"
 #include "clang/AST/Type.h"
 #include "clang/Basic/Version.h"
@@ -1241,8 +1240,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
   ASTContext& C = Interp->getCI()->getASTContext();
   Cpp::TypeRef IntTy = C.IntTy.getAsOpaquePtr();
 
-  // A non-numeric value names a constant entity; Sema converts it like a
-  // written argument.
+  // Non-numeric values name constant entities.
   std::vector<Cpp::TemplateArgInfo> args1 = {{IntTy.data, "IntVal"}};
   Cpp::DeclRef Inst1 = Cpp::InstantiateTemplate(Decls[0], args1);
   EXPECT_TRUE(Inst1);
@@ -1261,8 +1259,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
   auto* CTSD3 = cast<ClassTemplateSpecializationDecl>(Cpp::unwrap<Decl>(Inst3));
   EXPECT_EQ(CTSD3->getTemplateArgs()[0].getAsIntegral(), 2);
 
-  // Array-to-pointer decay for a const char* parameter (m_Type is unused for
-  // named arguments).
+  // Array-to-pointer decay; m_Type is unused for named arguments.
   std::vector<Cpp::TemplateArgInfo> args4 = {{IntTy.data, "Greeting"}};
   Cpp::DeclRef Inst4 = Cpp::InstantiateTemplate(Decls[1], args4);
   EXPECT_TRUE(Inst4);

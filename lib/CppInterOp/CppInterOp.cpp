@@ -2565,8 +2565,8 @@ bool GetClassTemplatedMethods(const std::string& name, ConstDeclRef parent,
   return INTEROP_RETURN(!funcs.empty());
 }
 
-// GetNamed walk over "::" components; unlike GetScopeFromCompleteName it also
-// finds non-scope decls (variables, enum constants).
+// "::" walk via GetNamed; unlike GetScopeFromCompleteName finds non-scope
+// decls.
 static Decl* GetNamedFromCompleteName(const std::string& name) {
   DeclRef curr = nullptr;
   size_t start = 0;
@@ -2579,10 +2579,8 @@ static Decl* GetNamedFromCompleteName(const std::string& name) {
   return unwrap<Decl>(GetNamed(name.substr(start), curr));
 }
 
-// TemplateArgInfo -> TemplateArgument: a type, an integral value, or -- when
-// the value is non-numeric -- a reference to the named constant entity
-// (constexpr variable, enum constant) for Sema to convert like a written
-// argument.
+// TemplateArgInfo -> TemplateArgument; a non-numeric value names a constant
+// entity, referenced so Sema converts it like a written argument.
 static std::optional<TemplateArgument>
 InfoToTemplateArgument(Sema& S, const TemplateArgInfo& Info) {
   QualType ArgTy = QualType::getFromOpaquePtr(Info.m_Type);
@@ -2609,8 +2607,7 @@ InfoToTemplateArgument(Sema& S, const TemplateArgInfo& Info) {
   auto* VD = llvm::dyn_cast_or_null<ValueDecl>(Named);
   if (!VD)
     return std::nullopt;
-  // Enum constants are prvalues; lvalue kind breaks constant evaluation (no
-  // storage to load from).
+  // Enum constants are prvalues; lvalue kind breaks constant evaluation.
   ExprValueKind VK = llvm::isa<EnumConstantDecl>(VD) ? VK_PRValue : VK_LValue;
   Expr* Ref = S.BuildDeclRefExpr(VD, VD->getType().getNonReferenceType(), VK,
                                  GetValidSLoc(S));
@@ -2638,8 +2635,7 @@ BestOverloadFunctionMatch(const std::vector<FuncRef>& candidates,
   struct WrapperExpr : public OpaqueValueExpr {
     WrapperExpr() : OpaqueValueExpr(clang::Stmt::EmptyShell()) {}
   };
-  // unique_ptr: the failed-template-arg path below returns early.
-  std::unique_ptr<WrapperExpr[]> Exprs(new WrapperExpr[arg_types.size()]);
+  std::vector<WrapperExpr> Exprs(arg_types.size());
   llvm::SmallVector<Expr*> Args;
   Args.reserve(arg_types.size());
   size_t idx = 0;
