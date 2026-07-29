@@ -207,6 +207,35 @@ private:
 };
 #endif // _WIN32 && i386
 
+#if defined(__GLIBC__)
+/// Resolves jitted references to glibc's libc_nonshared.a functions
+/// (at_quick_exit and friends): every ELF module links a private copy that
+/// dlsym cannot see, so the process-symbol generator never finds them. Hands
+/// out this library's own copies. See compat::glibcNonsharedSymbols.
+class GlibcNonsharedSymbolGenerator : public llvm::orc::DefinitionGenerator {
+public:
+  llvm::Error
+  tryToGenerate(llvm::orc::LookupState& LS, llvm::orc::LookupKind K,
+                llvm::orc::JITDylib& JD,
+                llvm::orc::JITDylibLookupFlags JDLookupFlags,
+                const llvm::orc::SymbolLookupSet& LookupSet) override {
+    const llvm::StringMap<void*>& Known = compat::glibcNonsharedSymbols();
+    llvm::orc::SymbolMap NewSymbols;
+    for (const auto& KV : LookupSet) {
+      auto It = Known.find(*KV.first);
+      if (It == Known.end())
+        continue;
+      NewSymbols[KV.first] = {llvm::orc::ExecutorAddr::fromPtr(It->second),
+                              llvm::JITSymbolFlags::Exported |
+                                  llvm::JITSymbolFlags::Callable};
+    }
+    if (NewSymbols.empty())
+      return llvm::Error::success();
+    return JD.define(llvm::orc::absoluteSymbols(std::move(NewSymbols)));
+  }
+};
+#endif // __GLIBC__
+
 /// CppInterOp Interpreter
 ///
 class Interpreter {
@@ -296,6 +325,29 @@ private:
             llvm::orc::absoluteSymbols(std::move(Syms))))
       llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),
                                   "Failed to define the native-TLS helper:");
+  }
+#endif
+
+#if defined(__GLIBC__)
+  // Whether the libc_nonshared.a fallback generator is on the main JITDylib.
+  // See GlibcNonsharedSymbolGenerator.
+  bool GlibcNonsharedGeneratorInstalled = false;
+
+  void installGlibcNonsharedGeneratorOnce() {
+    if (GlibcNonsharedGeneratorInstalled)
+      return;
+    GlibcNonsharedGeneratorInstalled = true;
+    // Runs pre-Execute, so the executor may not exist yet on the very first
+    // input; an empty execution forces it into existence. Appending also
+    // keeps this generator behind the process-symbol one: it is only asked
+    // for symbols dlsym cannot resolve.
+    if (llvm::Error Err = inner->ParseAndExecute("")) {
+      llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),
+                                  "Failed to create the execution engine:");
+      return;
+    }
+    compat::getExecutionEngine(*inner)->getMainJITDylib().addGenerator(
+        std::make_unique<GlibcNonsharedSymbolGenerator>());
   }
 #endif
 
@@ -427,6 +479,10 @@ public:
 #if CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
       if (!outOfProcess)
         compat::bindProcessWeakGlobals(*PTU->TheModule);
+#if defined(__GLIBC__)
+      if (!outOfProcess)
+        installGlibcNonsharedGeneratorOnce();
+#endif
 #endif
 #endif
       if (llvm::Error Err = inner->Execute(*PTU))
@@ -541,6 +597,10 @@ public:
 #if CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
     if (PTUOrErr->TheModule && !outOfProcess)
       compat::bindProcessWeakGlobals(*PTUOrErr->TheModule);
+#if defined(__GLIBC__)
+    if (PTUOrErr->TheModule && !outOfProcess)
+      installGlibcNonsharedGeneratorOnce();
+#endif
 #endif
 #endif
 

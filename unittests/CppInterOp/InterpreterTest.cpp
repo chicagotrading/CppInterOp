@@ -422,6 +422,50 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_Process) {
   EXPECT_FALSE(Cpp::Process("int f(); int res = f();") == 0);
 }
 
+// glibc keeps at_quick_exit & friends in libc_nonshared.a: every ELF module
+// links a private, non-exported copy and dlsym sees none of them, so a jitted
+// call used to fail to materialize ("Symbols not found: [ at_quick_exit ]").
+// GlibcNonsharedSymbolGenerator resolves them to this library's own copies.
+TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_GlibcNonsharedSymbols) {
+#if !defined(__GLIBC__)
+  GTEST_SKIP() << "the libc_nonshared.a fallback targets glibc";
+#else
+#ifdef CPPINTEROP_USE_CLING
+  GTEST_SKIP() << "the fallback generator is wired into the clang-repl "
+                  "CppInternal::Interpreter path, not cling's interpreter";
+#endif
+  if (TypeParam::isOutOfProcess)
+    GTEST_SKIP() << "the libc_nonshared.a fallback is in-process only";
+
+  ASSERT_TRUE(TestFixture::CreateInterpreter());
+
+  // Materialization alone is not the contract -- the registration must
+  // execute: route at_quick_exit's return value back through a probe. The
+  // handler never fires (gtest exits via exit, not quick_exit).
+  ASSERT_EQ(0, Cpp::Process(R"(
+    extern "C" int at_quick_exit(void (*)(void));
+    extern "C" void __stack_chk_fail_local();
+    extern "C" void glibc_nonshared_probe_handler() {}
+    extern "C" int glibc_nonshared_probe_register() {
+      return at_quick_exit(&glibc_nonshared_probe_handler);
+    }
+    extern "C" void* glibc_nonshared_probe_sibling() {
+      return reinterpret_cast<void*>(&__stack_chk_fail_local);
+    }
+  )"));
+
+  auto* Register = reinterpret_cast<int (*)()>(
+      Cpp::GetFunctionAddress("glibc_nonshared_probe_register"));
+  ASSERT_NE(Register, nullptr);
+  EXPECT_EQ(Register(), 0);
+
+  auto* Sibling = reinterpret_cast<void* (*)()>(
+      Cpp::GetFunctionAddress("glibc_nonshared_probe_sibling"));
+  ASSERT_NE(Sibling, nullptr);
+  EXPECT_NE(Sibling(), nullptr);
+#endif
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_DeclareSilent) {
 #if CLANG_VERSION_MAJOR > 21
   GTEST_SKIP() << "Test crashes gtest for llvm 22 based build";
