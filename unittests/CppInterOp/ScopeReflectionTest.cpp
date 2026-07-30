@@ -1256,6 +1256,47 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_EnumerateAfterUndo) {
   EXPECT_FALSE(names.count("Withdrawn"));
 }
 
+TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_TemplateParameters) {
+  std::vector<Decl*> Decls;
+  std::string code = R"(
+    template <typename> struct Holder {};
+    template <typename T, int N = 4, template <typename> class C = Holder,
+              typename U = double>
+    struct Box {};
+    template <typename T> T identity(T v) { return v; }
+    struct Plain {};
+  )";
+
+  GetAllTopLevelDecls(code, Decls);
+
+  EXPECT_EQ(Cpp::GetNumTemplateParameters(Decls[1]), 4u);
+  EXPECT_EQ(Cpp::GetNumTemplateParameters(Decls[2]), 1u);
+  EXPECT_EQ(Cpp::GetNumTemplateParameters(Decls[3]), 0u);
+
+  Cpp::DeclRef T = Cpp::GetTemplateParameter(Decls[1], 0);
+  Cpp::DeclRef N = Cpp::GetTemplateParameter(Decls[1], 1);
+  Cpp::DeclRef C = Cpp::GetTemplateParameter(Decls[1], 2);
+  Cpp::DeclRef U = Cpp::GetTemplateParameter(Decls[1], 3);
+  ASSERT_TRUE(T && N && C && U);
+
+  EXPECT_EQ(Cpp::GetName(T), "T");
+  EXPECT_EQ(Cpp::GetName(N), "N");
+  EXPECT_EQ(Cpp::GetName(C), "C");
+
+  EXPECT_EQ(Cpp::GetTemplateParameterKind(T), Cpp::TemplateParamKind::Type);
+  EXPECT_EQ(Cpp::GetTemplateParameterKind(N), Cpp::TemplateParamKind::NonType);
+  EXPECT_EQ(Cpp::GetTemplateParameterKind(C), Cpp::TemplateParamKind::Template);
+  EXPECT_EQ(Cpp::GetTemplateParameterKind(Decls[3]),
+            Cpp::TemplateParamKind::Unknown);
+
+  EXPECT_EQ(Cpp::GetTemplateParameterDefault(T), "");
+  EXPECT_EQ(Cpp::GetTemplateParameterDefault(N), "4");
+  EXPECT_EQ(Cpp::GetTemplateParameterDefault(U), "double");
+
+  // Out of range yields nothing rather than faulting.
+  EXPECT_FALSE(Cpp::GetTemplateParameter(Decls[1], 4));
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_DeclSourceAttribution) {
   std::vector<Decl*> Decls;
   std::string code = "class FromBuffer { int a; };";

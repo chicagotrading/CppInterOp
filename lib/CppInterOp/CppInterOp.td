@@ -675,6 +675,47 @@ nothing to enumerate, and the name accessors are not defined on them.
   ];
 }
 
+def GetNumTemplateParameters : CppInterOpAPI {
+  let Doc = [{Number of parameters a template declares, or 0 when the
+declaration is not a template.
+
+Accepts the template itself as well as the class or function it describes, so a
+caller that walked to a CXXRecordDecl does not have to find the
+ClassTemplateDecl first.}];
+
+  let ReturnType = "unsigned";
+  let Args = [Arg<"ConstDeclRef", "DRef">];
+}
+
+def GetTemplateParameter : CppInterOpAPI {
+  let Doc = [{The template parameter at \c Index, or nullptr when out of range.
+
+The result is the parameter declaration itself, so the ordinary name accessors
+apply to it.}];
+
+  let ReturnType = "DeclRef";
+  let Args = [
+    Arg<"ConstDeclRef", "DRef">,
+    Arg<"unsigned", "Index">
+  ];
+}
+
+def GetTemplateParameterKind : CppInterOpAPI {
+  let Doc = [{Whether a template parameter stands for a type, a value or a
+template. Returns Unknown for anything that is not a template parameter.}];
+
+  let ReturnType = "TemplateParamKind";
+  let Args = [Arg<"ConstDeclRef", "DRef">];
+}
+
+def GetTemplateParameterDefault : CppInterOpAPI {
+  let Doc = [{The spelling of a template parameter's default argument, or an
+empty string when it has none.}];
+
+  let ReturnType = "std::string";
+  let Args = [Arg<"ConstDeclRef", "DRef">];
+}
+
 def GetDeclFile : CppInterOpAPI {
   let Doc = [{Gets the file a declaration was written in, or an empty string
 when it has no valid source location (compiler predefines).}];
