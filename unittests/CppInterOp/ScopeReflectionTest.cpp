@@ -1082,6 +1082,78 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_GetAllCppNames) {
   test_get_all_cpp_names(Decls[5], {});
 }
 
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           ScopeReflection_EnumerateTranslationUnitDecls) {
+  std::vector<Decl*> Decls;
+  std::string code = R"(
+    class A { int a; };
+    namespace N { class B { int b; }; }
+    void myfunc() {}
+  )";
+
+  GetAllTopLevelDecls(code, Decls);
+
+  std::vector<Cpp::DeclRef> All;
+  Cpp::EnumerateTranslationUnitDecls(All);
+
+  std::set<std::string> names;
+  for (auto D : All)
+    names.insert(Cpp::GetQualifiedName(D));
+
+  // Spans every partial translation unit, so the user declarations are found
+  // alongside the compiler predefines of the initial one.
+  EXPECT_TRUE(names.count("A"));
+  EXPECT_TRUE(names.count("N"));
+  EXPECT_TRUE(names.count("myfunc"));
+  EXPECT_TRUE(names.count("__int128_t"));
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_EnumerateAfterUndo) {
+  // Known limitation, not ours: clang-repl's Undo clears name lookup but leaves
+  // the withdrawn unit's TranslationUnitDecl and its decls in the redeclaration
+  // chain (IncrementalParser::CleanUpPTU, "FIXME: We should de-allocate
+  // MostRecentTU"), so an enumeration walking that chain still reports them.
+  GTEST_SKIP() << "blocked on clang-repl Undo not unlinking the withdrawn "
+                  "partial translation unit";
+
+  std::vector<Decl*> Decls;
+  std::string code = "class Kept { int a; };";
+
+  GetAllTopLevelDecls(code, Decls);
+  Cpp::Declare("class Withdrawn { int b; };");
+  Cpp::Undo(1);
+
+  // Does the redeclaration chain still hand back the withdrawn unit's decls?
+  std::vector<Cpp::DeclRef> All;
+  Cpp::EnumerateTranslationUnitDecls(All);
+
+  std::set<std::string> names;
+  for (auto D : All)
+    names.insert(Cpp::GetQualifiedName(D));
+
+  EXPECT_TRUE(names.count("Kept"));
+  EXPECT_FALSE(names.count("Withdrawn"));
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_DeclSourceAttribution) {
+  std::vector<Decl*> Decls;
+  std::string code = "class FromBuffer { int a; };";
+
+  GetAllTopLevelDecls(code, Decls);
+
+  // Declarations parsed from a string have no FileEntry behind them, but their
+  // location is still valid, so the line is the one inside that buffer.
+  EXPECT_EQ(Cpp::GetDeclFile(Decls[0]), "");
+  EXPECT_EQ(Cpp::GetDeclLine(Decls[0]), 1u);
+
+  // Declarations from a real header carry a path and a line.
+  Interp->process("#include <vector>");
+  Cpp::DeclRef Vector = Cpp::GetScope("vector", Cpp::GetScope("std"));
+  ASSERT_TRUE(Vector);
+  EXPECT_NE(Cpp::GetDeclFile(Vector), "");
+  EXPECT_GT(Cpp::GetDeclLine(Vector), 0u);
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_InstantiateNNTPClassTemplate) {
   std::vector<Decl *> Decls;
   std::string code = R"(
