@@ -1258,6 +1258,20 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_DeclSourceAttribution) {
   EXPECT_GT(Cpp::GetDeclLine(Vector), 0u);
 }
 
+TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_GetAllCppNamesEmptyTag) {
+  std::vector<Decl*> Decls;
+  // An enum with no enumerators is an empty context, so decls_begin() already
+  // equals decls_end() and there is no injected class name to skip.
+  std::string code = "enum class Empty {};";
+
+  GetAllTopLevelDecls(code, Decls);
+
+  std::set<std::string> names;
+  Cpp::GetAllCppNames(Decls[0], names);
+
+  EXPECT_TRUE(names.empty());
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_InstantiateNNTPClassTemplate) {
   std::vector<Decl *> Decls;
   std::string code = R"(
