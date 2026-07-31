@@ -1145,14 +1145,23 @@ static void collectNamedDecls(const clang::DeclContext* DC,
     if (llvm::isa<clang::NamespaceDecl>(D) ||
         llvm::isa<clang::LinkageSpecDecl>(D) || llvm::isa<clang::RecordDecl>(D))
       collectNamedDecls(llvm::cast<clang::DeclContext>(D), Out);
+    // A class template is not a DeclContext; its members live on the
+    // record it describes.
+    else if (const auto* CTD = llvm::dyn_cast<clang::ClassTemplateDecl>(D))
+      if (const auto* RD = CTD->getTemplatedDecl())
+        collectNamedDecls(RD, Out);
   }
 }
 
 // One TranslationUnitDecl per partial unit, so walk the whole chain.
+// redecls() yields newest-first; report declaration order instead.
 static void collectTranslationUnitDecls(std::vector<const clang::Decl*>& Out) {
   const auto* TU = getSema().getASTContext().getTranslationUnitDecl();
+  llvm::SmallVector<const clang::TranslationUnitDecl*, 32> Chain;
   for (const auto* R : TU->redecls())
-    collectNamedDecls(llvm::cast<clang::DeclContext>(R), Out);
+    Chain.push_back(llvm::cast<clang::TranslationUnitDecl>(R));
+  for (const auto* R : llvm::reverse(Chain))
+    collectNamedDecls(R, Out);
 }
 
 void EnumerateTranslationUnitDecls(std::vector<DeclRef>& Decls) {
@@ -1194,6 +1203,24 @@ bool IsParameterPack(ConstDeclRef DRef) {
   const auto* ND =
       llvm::dyn_cast_or_null<clang::NamedDecl>(unwrap<clang::Decl>(DRef));
   return INTEROP_RETURN(ND && ND->isParameterPack());
+}
+
+bool IsClassTemplate(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  return INTEROP_RETURN(llvm::isa_and_nonnull<clang::ClassTemplateDecl>(D));
+}
+
+bool IsImplicitDecl(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  return INTEROP_RETURN(D && D->isImplicit());
+}
+
+bool IsFriendDeclared(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  return INTEROP_RETURN(D && D->getFriendObjectKind() != clang::Decl::FOK_None);
 }
 
 bool IsDefinition(ConstDeclRef DRef) {
@@ -1238,6 +1265,10 @@ getTemplateParameterList(const clang::Decl* D) {
     return nullptr;
   if (const auto* TD = llvm::dyn_cast<clang::TemplateDecl>(D))
     return TD->getTemplateParameters();
+  // A partial specialization declares parameters of its own.
+  if (const auto* PSD =
+          llvm::dyn_cast<clang::ClassTemplatePartialSpecializationDecl>(D))
+    return PSD->getTemplateParameters();
   if (const auto* RD = llvm::dyn_cast<clang::CXXRecordDecl>(D))
     if (const auto* CTD = RD->getDescribedClassTemplate())
       return CTD->getTemplateParameters();
