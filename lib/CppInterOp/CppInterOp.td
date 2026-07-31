@@ -754,6 +754,19 @@ name whose overloads are templates.}];
   ];
 }
 
+def GetFailedIncludes : CppInterOpAPI {
+  let Doc = [{Every #include directive the interpreter's preprocessor could
+not resolve, in occurrence order. One entry per directive, three
+US-separated (0x1f) fields: the written spelling, the including file (empty
+at the prompt), the line. Callers report actionable include errors from
+these events; the corresponding clang diagnostics only go to stderr.}];
+
+  let ReturnType = "void";
+  let Args = [
+    OutArg<"std::vector<std::string>&", "Out">
+  ];
+}
+
 def GetNumTemplateParameters : CppInterOpAPI {
   let Doc = [{Number of parameters a template declares, or 0 when the
 declaration is not a template.

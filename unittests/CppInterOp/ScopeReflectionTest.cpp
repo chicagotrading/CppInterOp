@@ -1433,6 +1433,19 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_GetIncludeClosure) {
   Closure.clear();
   Cpp::GetIncludeClosure("/nonexistent/never-included.h", Closure);
   EXPECT_TRUE(Closure.empty());
+
+  // An unresolvable directive records its spelling, includer and line;
+  // the clang diagnostic itself only reaches stderr.
+  std::string D =
+      Write("d.h", "#pragma once\n#include \"no-such-file-anywhere.h\"\n");
+  std::vector<std::string> FailedBefore;
+  Cpp::GetFailedIncludes(FailedBefore);
+  Interp->process("#include \"" + D + "\"");
+  std::vector<std::string> FailedAfter;
+  Cpp::GetFailedIncludes(FailedAfter);
+  ASSERT_EQ(FailedAfter.size(), FailedBefore.size() + 1);
+  std::string Entry = FailedAfter.back();
+  EXPECT_EQ(Entry, "no-such-file-anywhere.h\x1f" + RealPath(D) + "\x1f" + "2");
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_EnumerationIntrospection) {
