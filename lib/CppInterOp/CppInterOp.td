@@ -792,6 +792,26 @@ one found through an -isystem path or marked with a system line directive.}];
   let Args = [Arg<"ConstDeclRef", "DRef">];
 }
 
+def GetIncludeClosure : CppInterOpAPI {
+  let Doc = [{Files transitively reachable from Path over every #include
+directive the interpreter's preprocessor has processed, Path itself included.
+
+Directives an include guard then skips are recorded too, which the
+SourceManager's include-location tree cannot represent: it keeps only a
+file's first includer, so a file first reached through an earlier include
+would never attribute to a later includer's closure. Paths are spelled the
+way GetDeclFile spells them, so the two can be joined.
+
+Empty when Path has never been seen by the preprocessor, or when the active
+interpreter was not created by CreateInterpreter.}];
+
+  let ReturnType = "void";
+  let Args = [
+    Arg<"const std::string&", "Path">,
+    OutArg<"std::vector<std::string>&", "Out">
+  ];
+}
+
 def GetUsingNamespaces : CppInterOpAPI {
   let Doc = "Gets the list of namespaces utilized in the supplied scope.";
 

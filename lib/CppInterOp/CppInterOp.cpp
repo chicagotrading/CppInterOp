@@ -70,6 +70,8 @@
 #include "clang/Basic/Version.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Interpreter/Interpreter.h"
+#include "clang/Lex/PPCallbacks.h"
+#include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Overload.h"
 #include "clang/Sema/Ownership.h"
@@ -343,6 +345,73 @@ bool ActivateInterpreter(InterpRef I) {
   return INTEROP_RETURN(true); // success
 }
 
+// Records every #include directive the preprocessor processes, including
+// re-includes an include guard then skips: the SourceManager's include-loc
+// tree keeps only a file's first includer, so a closure query over it would
+// miss any file first reached through an earlier, unrelated include.
+class IncludeGraphRecorder : public clang::PPCallbacks {
+public:
+  explicit IncludeGraphRecorder(const clang::SourceManager& SM) : SM(SM) {}
+
+  void InclusionDirective(clang::SourceLocation HashLoc,
+                          const clang::Token& /*IncludeTok*/,
+                          llvm::StringRef /*FileName*/, bool /*IsAngled*/,
+                          clang::CharSourceRange /*FilenameRange*/,
+                          clang::OptionalFileEntryRef File,
+                          llvm::StringRef /*SearchPath*/,
+                          llvm::StringRef /*RelativePath*/,
+                          const clang::Module* /*SuggestedModule*/,
+                          bool /*ModuleImported*/,
+                          clang::SrcMgr::CharacteristicKind /*FileType*/
+                          ) override {
+    if (!File)
+      return;
+    std::string To = fileKey(*File);
+    Nodes.insert(To);
+    clang::OptionalFileEntryRef Includer =
+        SM.getFileEntryRefForID(SM.getFileID(SM.getExpansionLoc(HashLoc)));
+    // A directive typed at the prompt has no file behind it; the query is
+    // rooted by path, so only file-to-file edges are needed.
+    if (Includer)
+      Edges[fileKey(*Includer)].insert(std::move(To));
+  }
+
+  void closure(const std::string& Root, std::vector<std::string>& Out) const {
+    if (!Nodes.count(Root) && !Edges.count(Root))
+      return;
+    std::set<std::string> Seen{Root};
+    std::vector<std::string> Work{Root};
+    while (!Work.empty()) {
+      std::string Cur = std::move(Work.back());
+      Work.pop_back();
+      auto It = Edges.find(Cur);
+      Out.push_back(std::move(Cur));
+      if (It == Edges.end())
+        continue;
+      for (const std::string& Next : It->second)
+        if (Seen.insert(Next).second)
+          Work.push_back(Next);
+    }
+  }
+
+private:
+  // Same spelling GetDeclFile reports, so callers can join the two.
+  static std::string fileKey(clang::FileEntryRef FE) {
+    llvm::StringRef Real = FE.getFileEntry().tryGetRealPathName();
+    return (Real.empty() ? FE.getName() : Real).str();
+  }
+
+  const clang::SourceManager& SM;
+  std::map<std::string, std::set<std::string>> Edges;
+  std::set<std::string> Nodes;
+};
+
+// Owned by each interpreter's Preprocessor; keyed here for lookup.
+static std::map<const void*, const IncludeGraphRecorder*>& getIncludeGraphs() {
+  static std::map<const void*, const IncludeGraphRecorder*> sGraphs;
+  return sGraphs;
+}
+
 bool DeleteInterpreter(InterpRef I /*=nullptr*/) {
   INTEROP_TRACE(I);
   std::deque<InterpreterInfo>& Interps = GetInterpreters();
@@ -350,6 +419,7 @@ bool DeleteInterpreter(InterpRef I /*=nullptr*/) {
     return INTEROP_RETURN(false);
 
   if (!I) {
+    getIncludeGraphs().erase(Interps.back().Interpreter);
     Interps.pop_back(); // Triggers ~InterpreterInfo() and potential delete
     return INTEROP_RETURN(true);
   }
@@ -362,6 +432,7 @@ bool DeleteInterpreter(InterpRef I /*=nullptr*/) {
   if (found == Interps.end())
     return INTEROP_RETURN(false); // failure
 
+  getIncludeGraphs().erase(Interp);
   Interps.erase(found);
   return INTEROP_RETURN(true);
 }
@@ -1306,6 +1377,15 @@ bool IsInSystemHeader(ConstDeclRef DRef) {
 
   const clang::SourceManager& SM = D->getASTContext().getSourceManager();
   return INTEROP_RETURN(SM.isInSystemHeader(D->getLocation()));
+}
+
+void GetIncludeClosure(const std::string& Path, std::vector<std::string>& Out) {
+  INTEROP_TRACE(Path, INTEROP_OUT(Out));
+  auto& Graphs = getIncludeGraphs();
+  auto It = Graphs.find(&getInterp());
+  if (It != Graphs.end())
+    It->second->closure(Path, Out);
+  return INTEROP_VOID_RETURN();
 }
 
 std::vector<DeclRef> GetUsingNamespaces(ConstDeclRef DRef) {
@@ -5706,6 +5786,15 @@ InterpRef CreateInterpreter(const std::vector<const char*>& Args /*={}*/,
   }
 
   RegisterInterpreter(I, /*Owned=*/true, std::move(ArgvStorage));
+
+  // From birth, so the graph also covers files the JIT prelude pulls in.
+  {
+    clang::Preprocessor& PP = I->getCI()->getPreprocessor();
+    auto Recorder =
+        std::make_unique<IncludeGraphRecorder>(I->getCI()->getSourceManager());
+    getIncludeGraphs()[I] = Recorder.get();
+    PP.addPPCallbacks(std::move(Recorder));
+  }
 
 // Define runtime symbols in the JIT dylib for clang-repl
 #if !defined(CPPINTEROP_USE_CLING) && !defined(EMSCRIPTEN)

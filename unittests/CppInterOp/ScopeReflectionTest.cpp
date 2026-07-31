@@ -14,6 +14,10 @@
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Sema/Sema.h"
 
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/raw_ostream.h"
+
 #include "gtest/gtest.h"
 
 #include <CppInterOp/CppInterOpTypes.h>
@@ -1377,6 +1381,58 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_DeclSourceAttribution) {
   ASSERT_TRUE(Vector);
   EXPECT_NE(Cpp::GetDeclFile(Vector), "");
   EXPECT_GT(Cpp::GetDeclLine(Vector), 0u);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_GetIncludeClosure) {
+  TestFixture::CreateInterpreter();
+
+  llvm::SmallString<128> Dir;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("closure", Dir));
+  auto Write = [&](llvm::StringRef Name, llvm::StringRef Text) {
+    llvm::SmallString<128> P(Dir);
+    llvm::sys::path::append(P, Name);
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(P, EC);
+    EXPECT_FALSE(EC);
+    OS << Text;
+    return std::string(P);
+  };
+  auto RealPath = [](const std::string& P) {
+    llvm::SmallString<256> Real;
+    EXPECT_FALSE(llvm::sys::fs::real_path(P, Real));
+    return std::string(Real);
+  };
+  std::string B = Write("b.h", "#pragma once\nstruct ClosureB {};\n");
+  std::string A =
+      Write("a.h", "#pragma once\n#include \"b.h\"\nstruct ClosureA {};\n");
+  std::string C =
+      Write("c.h", "#pragma once\n#include \"b.h\"\nstruct ClosureC {};\n");
+
+  Interp->process("#include \"" + A + "\"");
+  std::vector<std::string> Closure;
+  Cpp::GetIncludeClosure(RealPath(A), Closure);
+  std::set<std::string> Files(Closure.begin(), Closure.end());
+  EXPECT_TRUE(Files.count(RealPath(A)));
+  EXPECT_TRUE(Files.count(RealPath(B)));
+  EXPECT_FALSE(Files.count(RealPath(C)));
+
+  // The include guard skips re-entering b.h here, but its directive still
+  // fires, so c.h's closure must contain it all the same.
+  Interp->process("#include \"" + C + "\"");
+  Closure.clear();
+  Cpp::GetIncludeClosure(RealPath(C), Closure);
+  Files = {Closure.begin(), Closure.end()};
+  EXPECT_TRUE(Files.count(RealPath(C)));
+  EXPECT_TRUE(Files.count(RealPath(B)));
+  EXPECT_FALSE(Files.count(RealPath(A)));
+
+  // A leaf header has a one-file closure; an unknown path an empty one.
+  Closure.clear();
+  Cpp::GetIncludeClosure(RealPath(B), Closure);
+  EXPECT_EQ(Closure, std::vector<std::string>{RealPath(B)});
+  Closure.clear();
+  Cpp::GetIncludeClosure("/nonexistent/never-included.h", Closure);
+  EXPECT_TRUE(Closure.empty());
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, ScopeReflection_GetAllCppNamesEmptyTag) {
