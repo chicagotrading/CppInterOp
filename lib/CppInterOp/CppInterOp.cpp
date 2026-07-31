@@ -1098,9 +1098,7 @@ std::string GetDoxygenComment(ConstDeclRef DRef, bool strip_comment_markers) {
   return INTEROP_RETURN(RC->getFormattedText(SM, C.getDiagnostics()));
 }
 
-// Declarations users can name live inside namespaces, classes and language
-// linkage blocks, so descend through those. A linkage block is itself unnamed,
-// which is why it cannot simply be filtered out at the top level.
+// Descend namespaces, classes and linkage blocks; a linkage block is unnamed.
 static void collectNamedDecls(const clang::DeclContext* DC,
                               std::vector<const clang::Decl*>& Out) {
   for (const auto* D : DC->decls()) {
@@ -1112,9 +1110,7 @@ static void collectNamedDecls(const clang::DeclContext* DC,
   }
 }
 
-// Every partial translation unit the interpreter has parsed. An incremental
-// interpreter creates one TranslationUnitDecl per unit, so walk the whole
-// redeclaration chain rather than a single node.
+// One TranslationUnitDecl per partial unit, so walk the whole chain.
 static void collectTranslationUnitDecls(std::vector<const clang::Decl*>& Out) {
   const auto* TU = getSema().getASTContext().getTranslationUnitDecl();
   for (const auto* R : TU->redecls())
@@ -1135,9 +1131,69 @@ void EnumerateTranslationUnitDecls(std::vector<DeclRef>& Decls) {
   return INTEROP_VOID_RETURN();
 }
 
-// A template's parameter list, reached from either the template itself or the
-// entity it describes, so a caller holding a CXXRecordDecl does not have to
-// find the ClassTemplateDecl first.
+bool IsScopedEnum(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* ED =
+      llvm::dyn_cast_or_null<clang::EnumDecl>(unwrap<clang::Decl>(DRef));
+  return INTEROP_RETURN(ED && ED->isScoped());
+}
+
+bool IsUnion(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* RD =
+      llvm::dyn_cast_or_null<clang::RecordDecl>(unwrap<clang::Decl>(DRef));
+  return INTEROP_RETURN(RD && RD->isUnion());
+}
+
+bool IsAliasTemplate(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  return INTEROP_RETURN(llvm::isa_and_nonnull<clang::TypeAliasTemplateDecl>(D));
+}
+
+bool IsParameterPack(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* ND =
+      llvm::dyn_cast_or_null<clang::NamedDecl>(unwrap<clang::Decl>(DRef));
+  return INTEROP_RETURN(ND && ND->isParameterPack());
+}
+
+bool IsDefinition(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  if (const auto* TD = llvm::dyn_cast_or_null<clang::TemplateDecl>(D))
+    D = TD->getTemplatedDecl();
+  if (const auto* TagD = llvm::dyn_cast_or_null<clang::TagDecl>(D))
+    return INTEROP_RETURN(TagD->isCompleteDefinition());
+  if (const auto* FD = llvm::dyn_cast_or_null<clang::FunctionDecl>(D))
+    return INTEROP_RETURN(FD->isThisDeclarationADefinition());
+  if (const auto* VD = llvm::dyn_cast_or_null<clang::VarDecl>(D))
+    return INTEROP_RETURN(VD->isThisDeclarationADefinition() !=
+                          clang::VarDecl::DeclarationOnly);
+  // Anything else -- an alias, a namespace, a template parameter -- only ever
+  // appears in its defining form.
+  return INTEROP_RETURN(D != nullptr);
+}
+
+unsigned GetOverloadCount(ConstDeclRef DRef, const std::string& Name) {
+  INTEROP_TRACE(DRef, Name);
+  const auto* DC =
+      llvm::dyn_cast_or_null<clang::DeclContext>(unwrap<clang::Decl>(DRef));
+  if (!DC)
+    return INTEROP_RETURN(0);
+
+  clang::DeclarationName DN =
+      getSema().getASTContext().DeclarationNames.getIdentifier(
+          &getSema().getPreprocessor().getIdentifierTable().get(Name));
+
+  unsigned Count = 0;
+  for (const auto* R : DC->getPrimaryContext()->lookup(DN))
+    if (llvm::isa<clang::FunctionDecl, clang::FunctionTemplateDecl>(R))
+      ++Count;
+  return INTEROP_RETURN(Count);
+}
+
+// Reached from the template or the entity it describes.
 static const clang::TemplateParameterList*
 getTemplateParameterList(const clang::Decl* D) {
   if (!D)
