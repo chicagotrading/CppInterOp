@@ -355,7 +355,7 @@ public:
 
   void InclusionDirective(clang::SourceLocation HashLoc,
                           const clang::Token& /*IncludeTok*/,
-                          llvm::StringRef /*FileName*/, bool /*IsAngled*/,
+                          llvm::StringRef FileName, bool /*IsAngled*/,
                           clang::CharSourceRange /*FilenameRange*/,
                           clang::OptionalFileEntryRef File,
                           llvm::StringRef /*SearchPath*/,
@@ -364,17 +364,26 @@ public:
                           bool /*ModuleImported*/,
                           clang::SrcMgr::CharacteristicKind /*FileType*/
                           ) override {
-    if (!File)
+    clang::SourceLocation Loc = SM.getExpansionLoc(HashLoc);
+    clang::OptionalFileEntryRef Includer =
+        SM.getFileEntryRefForID(SM.getFileID(Loc));
+    if (!File) {
+      // Unresolved: the diagnostics go to stderr, so callers wanting an
+      // actionable error need the event itself.
+      Failed.push_back(FileName.str() + "\x1f" +
+                       (Includer ? fileKey(*Includer) : std::string()) +
+                       "\x1f" + std::to_string(SM.getSpellingLineNumber(Loc)));
       return;
+    }
     std::string To = fileKey(*File);
     Nodes.insert(To);
-    clang::OptionalFileEntryRef Includer =
-        SM.getFileEntryRefForID(SM.getFileID(SM.getExpansionLoc(HashLoc)));
     // A directive typed at the prompt has no file behind it; the query is
     // rooted by path, so only file-to-file edges are needed.
     if (Includer)
       Edges[fileKey(*Includer)].insert(std::move(To));
   }
+
+  const std::vector<std::string>& failedIncludes() const { return Failed; }
 
   void closure(const std::string& Root, std::vector<std::string>& Out) const {
     if (!Nodes.count(Root) && !Edges.count(Root))
@@ -404,6 +413,7 @@ private:
   const clang::SourceManager& SM;
   std::map<std::string, std::set<std::string>> Edges;
   std::set<std::string> Nodes;
+  std::vector<std::string> Failed;
 };
 
 // Owned by each interpreter's Preprocessor; keyed here for lookup.
@@ -1383,6 +1393,15 @@ void GetIncludeClosure(const std::string& Path, std::vector<std::string>& Out) {
   auto It = Graphs.find(&getInterp());
   if (It != Graphs.end())
     It->second->closure(Path, Out);
+  return INTEROP_VOID_RETURN();
+}
+
+void GetFailedIncludes(std::vector<std::string>& Out) {
+  INTEROP_TRACE(INTEROP_OUT(Out));
+  auto& Graphs = getIncludeGraphs();
+  auto It = Graphs.find(&getInterp());
+  if (It != Graphs.end())
+    Out = It->second->failedIncludes();
   return INTEROP_VOID_RETURN();
 }
 
