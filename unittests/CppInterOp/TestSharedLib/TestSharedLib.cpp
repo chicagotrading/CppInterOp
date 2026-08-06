@@ -26,3 +26,10 @@ int dynamic_singleton_value() { return DynamicInitSingleton::get().value; }
 int g_used_singleton = 0;
 void* g_used_singleton_addr() { return &g_used_singleton; }
 int g_used_singleton_value() { return g_used_singleton; }
+
+#if !defined(_WIN32) && !defined(EMSCRIPTEN)
+__thread int native_tls_slot = 0;
+
+void* native_tls_slot_addr() { return &native_tls_slot; }
+int native_tls_slot_value() { return native_tls_slot; }
+#endif

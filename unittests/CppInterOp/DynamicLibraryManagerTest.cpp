@@ -27,6 +27,7 @@
 #include "gtest/gtest.h"
 
 #include <memory>
+#include <thread>
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -51,7 +52,8 @@ std::string GetExecutablePath(const char* Argv0) {
 static std::string ResolveTestSharedLibPath() {
   std::string BinaryPath = GetExecutablePath(/*Argv0=*/nullptr);
   llvm::StringRef Dir = llvm::sys::path::parent_path(BinaryPath);
-  for (const char* Candidate : {"libTestSharedLib.so", "TestSharedLib.so"}) {
+  for (const char* Candidate :
+       {"libTestSharedLib.so", "TestSharedLib.so", "libTestSharedLib.dylib"}) {
     llvm::SmallString<256> P(Dir);
     llvm::sys::path::append(P, Candidate);
     if (llvm::sys::fs::exists(P))
@@ -206,8 +208,8 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, DynamicLibraryManager_SharedWeakGlobals) {
   GTEST_SKIP() << "bindProcessWeakGlobals is wired into the clang-repl "
                   "CppInternal::Interpreter path, not cling's interpreter";
 #endif
-#if defined(_WIN32) || defined(__APPLE__)
-  GTEST_SKIP() << "the dlsym-based weak-global binding targets ELF";
+#ifdef _WIN32
+  GTEST_SKIP() << "the dlsym-based weak-global binding targets ELF and Mach-O";
 #endif
   if (TypeParam::isOutOfProcess)
     GTEST_SKIP() << "the dlsym-based weak-global binding is in-process only";
@@ -220,7 +222,8 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, DynamicLibraryManager_SharedWeakGlobals) {
   std::string BinaryPath = GetExecutablePath(/*Argv0=*/nullptr);
   llvm::StringRef Dir = llvm::sys::path::parent_path(BinaryPath);
   std::string PathToTestSharedLib;
-  for (const char* Candidate : {"libTestSharedLib.so", "TestSharedLib.so"}) {
+  for (const char* Candidate :
+       {"libTestSharedLib.so", "TestSharedLib.so", "libTestSharedLib.dylib"}) {
     llvm::SmallString<256> P(Dir);
     llvm::sys::path::append(P, Candidate);
     if (llvm::sys::fs::exists(P)) {
@@ -626,3 +629,62 @@ TEST_F(BindProcessWeakGlobals, UsedListIsRebuiltAroundSurvivors) {
 }
 
 #endif // bindProcessWeakGlobals is declared
+
+// A thread-local a loaded library exports must be shared with jitted code
+// (compat::redirectNativeTLSDeclarations); emulated TLS would otherwise
+// lower the access to an undefined __emutls_v.* lookup. Covers dlsym's
+// per-thread address on ELF and the tlv-descriptor thunk on Mach-O.
+TYPED_TEST(CPPINTEROP_TEST_MODE, DynamicLibraryManager_SharedNativeTLS) {
+#ifdef EMSCRIPTEN
+  GTEST_SKIP() << "Test not intended for Emscripten builds";
+#endif
+#ifdef CPPINTEROP_USE_CLING
+  GTEST_SKIP() << "redirectNativeTLSDeclarations is wired into the clang-repl "
+                  "CppInternal::Interpreter path, not cling's interpreter";
+#endif
+#ifdef _WIN32
+  GTEST_SKIP() << "the native-TLS redirect targets ELF and Mach-O";
+#endif
+  if (TypeParam::isOutOfProcess)
+    GTEST_SKIP() << "the dlsym-based native-TLS redirect is in-process only";
+
+  ASSERT_TRUE(TestFixture::CreateInterpreter());
+
+  std::string PathToTestSharedLib = ResolveTestSharedLibPath();
+  ASSERT_STRNE("", PathToTestSharedLib.c_str());
+  ASSERT_TRUE(Cpp::LoadLibrary(PathToTestSharedLib.c_str()));
+  Cpp::Process(""); // force the execution engine into existence
+
+  ASSERT_FALSE(Cpp::Process(R"(
+    extern "C" __thread int native_tls_slot;
+    extern "C" void* tls_probe_jit_addr() { return &native_tls_slot; }
+    extern "C" void tls_probe_jit_set(int v) { native_tls_slot = v; }
+  )"));
+
+  auto GetFn = [](const char* Name) {
+    void* A = Cpp::GetFunctionAddress(Name);
+    EXPECT_NE(A, nullptr) << Name;
+    return A;
+  };
+  auto* JitAddr =
+      reinterpret_cast<void* (*)()>(GetFn("tls_probe_jit_addr"));
+  auto* JitSet =
+      reinterpret_cast<void (*)(int)>(GetFn("tls_probe_jit_set"));
+  auto* AotAddr = reinterpret_cast<void* (*)()>(GetFn("native_tls_slot_addr"));
+  auto* AotValue = reinterpret_cast<int (*)()>(GetFn("native_tls_slot_value"));
+
+  // One per-thread storage, not two.
+  EXPECT_EQ(JitAddr(), AotAddr());
+  JitSet(29);
+  EXPECT_EQ(AotValue(), 29);
+
+  // Still thread-local: another thread gets its own copy.
+  int OtherThreadValue = -1;
+  void* OtherThreadAddr = nullptr;
+  std::thread([&] {
+    OtherThreadValue = AotValue();
+    OtherThreadAddr = JitAddr();
+  }).join();
+  EXPECT_EQ(OtherThreadValue, 0);
+  EXPECT_NE(OtherThreadAddr, AotAddr());
+}
