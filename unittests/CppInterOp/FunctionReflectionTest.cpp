@@ -5216,6 +5216,8 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
 // to the calling thread's native copies instead, so the jitted writer and
 // libstdc++'s native reader (__once_proxy) share storage. Exercises the full
 // protocol: the callable must run exactly once and its effect be observable.
+// On macOS/libc++ call_once carries no TLS; there the test guards the
+// protocol end to end rather than the TLS hand-off.
 TYPED_TEST(CPPINTEROP_TEST_MODE, FunctionReflection_NativeTLSStdCallOnce) {
 #ifdef EMSCRIPTEN
   GTEST_SKIP() << "Test fails for Emscripten builds";
@@ -5224,8 +5226,8 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, FunctionReflection_NativeTLSStdCallOnce) {
   GTEST_SKIP() << "redirectNativeTLSDeclarations is wired into the clang-repl "
                   "CppInternal::Interpreter path, not cling's interpreter";
 #endif
-#if defined(_WIN32) || defined(__APPLE__)
-  GTEST_SKIP() << "the native-TLS redirect targets ELF emulated TLS";
+#ifdef _WIN32
+  GTEST_SKIP() << "the native-TLS redirect targets ELF and Mach-O emulated TLS";
 #endif
   if (TypeParam::isOutOfProcess)
     GTEST_SKIP() << "the dlsym-based native-TLS redirect is in-process only";

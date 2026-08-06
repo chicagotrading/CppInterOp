@@ -712,8 +712,11 @@ inline void dedupeWeakEmulatedTLS(llvm::Module& M, llvm::StringSet<>& Defined) {
 //
 // Only symbols the dynamic linker already resolves are redirected; anything
 // else keeps the emulated-TLS reference and its clear link-time error. ELF
-// and in-process only (the helper resolves through the process's own dlsym;
-// the redirect's call site is additionally gated on !outOfProcess).
+// and Mach-O, in-process only (the helper resolves through the process's own
+// dlsym; the redirect's call site is additionally gated on !outOfProcess).
+// On Mach-O dlsym returns a thread-local's tlv descriptor, not the
+// per-thread address glibc documents; the helper invokes its thunk (dyld's
+// tlv_get_addr) to reach the calling thread's copy.
 // ===========================================================================
 #ifndef _WIN32
 inline void* nativeThreadLocalAddress(const char* Name) {
@@ -721,13 +724,27 @@ inline void* nativeThreadLocalAddress(const char* Name) {
   // thread (the address is per-thread), so memoize per (thread, symbol).
   static thread_local llvm::StringMap<void*> Cache;
   auto It = Cache.try_emplace(Name, nullptr);
-  if (It.second)
-    It.first->second = ::dlsym(RTLD_DEFAULT, Name);
+  if (It.second) {
+    void* Addr = ::dlsym(RTLD_DEFAULT, Name);
+#ifdef __APPLE__
+    if (Addr) {
+      struct TLVDescriptor {
+        void* (*thunk)(TLVDescriptor*);
+        unsigned long key;
+        unsigned long offset;
+      };
+      auto* D = static_cast<TLVDescriptor*>(Addr);
+      Addr = D->thunk(D);
+    }
+#endif
+    It.first->second = Addr;
+  }
   return It.first->second;
 }
 
 inline bool redirectNativeTLSDeclarations(llvm::Module& M) {
-  if (!llvm::Triple(M.getTargetTriple()).isOSBinFormatELF())
+  llvm::Triple T(M.getTargetTriple());
+  if (!T.isOSBinFormatELF() && !T.isOSBinFormatMachO())
     return false;
 
   bool Changed = false;
@@ -815,7 +832,10 @@ inline bool redirectNativeTLSDeclarations(llvm::Module& M) {
 // state is the singleton bug. thread_locals are excluded (the JIT's
 // emulated-TLS storage regime is separate), and functions are never demoted
 // -- jitted code may legitimately carry its own copies of inline functions.
-// ELF and in-process only (the probe is the process's own dlsym).
+// ELF and Mach-O, in-process only (the probe is the process's own dlsym).
+// On Mach-O, -fvisibility-inlines-hidden also hides Meyers backing variables
+// -- unshared even natively; the dlsym probe rightly fails and the jitted
+// copy stays.
 // ===========================================================================
 //
 // Single toggle for the whole workaround (definition + call sites). Once the
@@ -825,7 +845,8 @@ inline bool redirectNativeTLSDeclarations(llvm::Module& M) {
 #define CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS 1
 #if CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
 inline bool bindProcessWeakGlobals(llvm::Module& M) {
-  if (!llvm::Triple(M.getTargetTriple()).isOSBinFormatELF())
+  llvm::Triple T(M.getTargetTriple());
+  if (!T.isOSBinFormatELF() && !T.isOSBinFormatMachO())
     return false;
 
   auto ProcessHas = [](llvm::StringRef Name) {

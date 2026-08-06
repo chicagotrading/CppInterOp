@@ -70,4 +70,15 @@ extern "C" TESTSHAREDLIB_API int g_used_singleton;
 extern "C" TESTSHAREDLIB_API void* g_used_singleton_addr();
 extern "C" TESTSHAREDLIB_API int g_used_singleton_value();
 
+// A native thread-local plus accessors compiled here: jitted redeclarations
+// must share the calling thread's storage with them
+// (compat::redirectNativeTLSDeclarations).
+#if !defined(_WIN32) && !defined(EMSCRIPTEN)
+extern "C" {
+TESTSHAREDLIB_API extern __thread int native_tls_slot;
+TESTSHAREDLIB_API void* native_tls_slot_addr();
+TESTSHAREDLIB_API int native_tls_slot_value();
+}
+#endif
+
 #endif // UNITTESTS_CPPINTEROP_TESTSHAREDLIB_TESTSHAREDLIB_H

@@ -22,4 +22,12 @@ if (EMSCRIPTEN)
   )
 endif()
 
+if (APPLE)
+  # LLVM's -fvisibility-inlines-hidden hides Meyers-singleton backing
+  # variables on Darwin; keep them exported -- the fixture models a library
+  # that exports its header-defined singletons.
+  target_compile_options(TestSharedLib PRIVATE
+    -fno-visibility-inlines-hidden-static-local-var)
+endif()
+
 set_target_properties(TestSharedLib PROPERTIES FOLDER "Tests")
