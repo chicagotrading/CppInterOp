@@ -3,6 +3,7 @@ this translates the CMake recipe to build libclangCppInterOp against a local
 LLVM tree (selected via the LLVM_DIR env var, see @cppyy_bazel//:llvm.bzl)."""
 
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
+load("@llvm//:defs.bzl", "LLVM_VERSION")
 load("@cppyy_bazel//:defs.bzl", "BASE_COPTS", "CPPINTEROP_COPTS", "DEFAULT_LTO_OPT_LEVEL", "LTO_OPT_LEVELS", "is_main_repo", "jit_cxx_interp_args", "llvm_linkopts", "llvm_lto_opt_linkopts", "llvm_system_libs", "llvm_tblgen_linkopts", "repo_rloc")
 load("@@rules_cc+//cc:defs.bzl", "cc_binary", "cc_library", "cc_shared_library", "cc_test")
 load("@@rules_shell+//shell:sh_test.bzl", "sh_test")
@@ -166,6 +167,22 @@ filegroup(
     srcs = glob(["lib/CppInterOp/*.h"]),
 )
 
+# LLVM 21.1.x mis-parses out-of-line members of private nested types under
+# -fincremental-extensions (spurious "is a private member of" errors). Compile
+# a fixed copy of the clang TU and force-load it (alwayslink) so its object
+# precedes the @llvm archives in every link; the broken libclangParse.a member
+# defines the same symbol set, so it is never fetched (drift fails the link
+# loudly). Remove this override when @llvm carries the fix.
+cc_library(
+    name = "clang_overrides",
+    srcs = [
+        "bazel-support/clang-overrides/21/ParseTentative.cpp",
+    ] if LLVM_VERSION.startswith("21.1.") else [],
+    copts = CPPINTEROP_COPTS + ["-D_GNU_SOURCE"],
+    deps = ["@llvm//:headers"],
+    alwayslink = True,
+)
+
 # lib/CppInterOp: the clangCppInterOp library (CPPINTEROP_USE_REPL backend,
 # non-EMSCRIPTEN sources from add_llvm_library(clangCppInterOp ...)).
 cc_library(
@@ -194,6 +211,7 @@ cc_library(
     # consumer swaps in shipped .so's). It rides on :lib so it propagates into
     # the solib link below and any direct cc_test linker.
     deps = [
+        ":clang_overrides",
         ":llvm_system_libs",
         "@llvm//:headers",
     ],
