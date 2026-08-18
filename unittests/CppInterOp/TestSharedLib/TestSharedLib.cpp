@@ -16,3 +16,10 @@ void* singleton_fixture_member_addr() {
 int singleton_fixture_member_value() {
   return SingletonFixture::s_inline_member;
 }
+
+#if !defined(_WIN32) && !defined(EMSCRIPTEN)
+__thread int native_tls_slot = 0;
+
+void* native_tls_slot_addr() { return &native_tls_slot; }
+int native_tls_slot_value() { return native_tls_slot; }
+#endif
