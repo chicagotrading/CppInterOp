@@ -1393,7 +1393,7 @@ static std::string ReadFileToString(const std::string& path) {
   return {std::istreambuf_iterator<char>(ifs),
           std::istreambuf_iterator<char>()};
 }
-// This test reads source files from the checkout via CPPINTEROP_SRC_DIR.
+// The tests below read source files via CPPINTEROP_SRC_DIR.
 TEST_F(TracingTest, StartStopTracingWritesToFile) {
   // StartTracing begins recording; StopTracing writes the file.
   std::string Path = CppInterOp::Tracing::StartTracing(/*WriteOnStdErr=*/false);
@@ -1549,8 +1549,7 @@ TEST(TracingCoverageTest, AllPublicAPIsAreTraced) {
   std::string Header =
       ReadFileToString(CPPINTEROP_SRC_DIR "/include/CppInterOp/CppInterOp.h");
   ASSERT_FALSE(Header.empty()) << "Could not read CppInterOp.h";
-  // Function declarations are generated into CppInterOpDecl.inc, which
-  // lives under the artifacts prefix.
+  // CppInterOpDecl.inc is generated, so it lives under the artifacts prefix.
   std::string DeclInc =
       ReadFileToString(TestUtils::GetCppInterOpDirPath() +
                        "/include/CppInterOp/CppInterOpDecl.inc");

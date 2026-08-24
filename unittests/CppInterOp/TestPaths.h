@@ -1,4 +1,4 @@
-#ifndef CPPINTEROP_UNITTESTS_LIBCPPINTEROP_TESTPATHS_H
+#ifndef CPPINTEROP_UNITTESTS_LIBCPPINTEROP_TESTPATHS_H // NOLINT(llvm-header-guard)
 #define CPPINTEROP_UNITTESTS_LIBCPPINTEROP_TESTPATHS_H
 
 #include <cstdlib>
@@ -6,10 +6,10 @@
 
 namespace TestUtils {
 
-/// CppInterOp artifacts prefix (a directory containing lib/ and include/).
+/// CppInterOp artifacts prefix: the directory that holds lib/ and include/.
 /// The CPPINTEROP_BIN_DIR environment variable overrides the compile-time
-/// default so relocated test binaries can find the library. Empty if
-/// neither is available.
+/// default, which lets a relocated test binary find the library. Empty if
+/// neither is set.
 inline std::string GetCppInterOpDirPath() {
   if (const char* env = std::getenv("CPPINTEROP_BIN_DIR"))
     return env;

@@ -331,16 +331,18 @@ cc_library(
     includes = ["include"],
 )
 
-# CPPINTEROP_DIR / CPPINTEROP_BINARY_DIR: the repo's runfiles root (the test's
-# cwd at run time). repo_rloc self-corrects between the standalone build
-# (cppinterop is the main repo -> ".") and being an external dep (-> "../<canon>").
-# This BUILD is always @cppinterop, so is_main_repo() marks the self-reference.
-# CMake defines these for every unittest; needed by CppInterOpTests
-# (FunctionReflectionTest's APINotes check) and TracingTests.
+# The tests that read repo files at runtime resolve them against
+# CPPINTEROP_SRC_DIR / CPPINTEROP_BIN_DIR, which here is the repo's runfiles
+# root (the test's cwd). repo_rloc self-corrects between the standalone build
+# (cppinterop is the main repo -> ".") and being an external dep
+# (-> "../<canon>"). This BUILD is always @cppinterop, so is_main_repo() marks
+# the self-reference. No test-source changes needed.
 _CPPINTEROP_RUNFILES_DIR = repo_rloc(
     "@cppinterop",
     is_main_repo(repository_name()),
 )
+
+_CPPINTEROP_SRC_DIR_COPT = "-DCPPINTEROP_SRC_DIR=\\\"" + _CPPINTEROP_RUNFILES_DIR + "\\\""
 
 # CppInterOpTests: the main gtest suite. Source list = CMake's
 # add_cppinterop_unittest(CppInterOpTests ...) plus the non-EMSCRIPTEN
@@ -367,18 +369,15 @@ cppinterop_cc_test(
         "unittests/CppInterOp/VariableReflectionTest.cpp",
         "unittests/CppInterOp/main.cpp",
     ],
+    # The APINotes check builds an -I into the checkout, so ship that directory.
+    # Its -fmodules .pcm cache goes to $TEST_TMPDIR, set by the test itself;
+    # the sandbox denies clang's default ~/.cache/clang.
+    data = glob(["unittests/CppInterOp/APINotes/**"]),
     # CMake sets -Wno-pedantic on VariableReflectionTest.cpp; applied suite-wide.
-    # Trailing slash: FunctionReflectionTest's APINotes check concatenates
-    # CPPINTEROP_DIR + "unittests/..." with no separator (TracingTests instead
-    # writes CPPINTEROP_DIR "/include", so its own value stays slash-free).
     extra_copts = [
         "-Wno-pedantic",
-        "-DCPPINTEROP_DIR=\\\"" + _CPPINTEROP_RUNFILES_DIR + "/\\\"",
+        _CPPINTEROP_SRC_DIR_COPT,
     ],
-    # The APINotes check #include's TestHeader.h from CPPINTEROP_DIR at run time
-    # (its -fmodules .pcm cache goes to $TEST_TMPDIR, set by the test itself; the
-    # sandbox denies clang's default ~/.cache/clang).
-    data = glob(["unittests/CppInterOp/APINotes/**"]),
     extra_deps = [":CAPITestC"],
 )
 
@@ -394,11 +393,11 @@ cppinterop_cc_test(
     ],
 )
 
-# TracingTests reads CppInterOp.h, the generated .inc, and lib/*.cpp at runtime,
-# relative to CPPINTEROP_DIR / CPPINTEROP_BINARY_DIR (shared definition above).
+# TracingTests reads CppInterOp.h, the generated .inc, and lib/*.cpp at runtime.
 cppinterop_cc_test(
     name = "TracingTests",
     srcs = [
+        "unittests/CppInterOp/TestPaths.h",
         "unittests/CppInterOp/TracingTests.cpp",
         "unittests/CppInterOp/Utils.cpp",
         "unittests/CppInterOp/Utils.h",
@@ -406,8 +405,8 @@ cppinterop_cc_test(
     ],
     data = glob(["lib/CppInterOp/*.cpp"]),
     extra_copts = [
-        "-DCPPINTEROP_DIR=\\\"" + _CPPINTEROP_RUNFILES_DIR + "\\\"",
-        "-DCPPINTEROP_BINARY_DIR=\\\"" + _CPPINTEROP_RUNFILES_DIR + "\\\"",
+        _CPPINTEROP_SRC_DIR_COPT,
+        "-DCPPINTEROP_BIN_DIR=\\\"" + _CPPINTEROP_RUNFILES_DIR + "\\\"",
     ],
 )
 
@@ -418,6 +417,7 @@ cppinterop_dispatch_cc_test(
         "unittests/CppInterOp/DispatchInit.cpp",
         "unittests/CppInterOp/DispatchSmokeTest.cpp",
         "unittests/CppInterOp/DispatchTest.cpp",
+        "unittests/CppInterOp/TestPaths.h",
         "unittests/CppInterOp/main.cpp",
     ],
 )
