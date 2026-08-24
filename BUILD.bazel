@@ -168,20 +168,31 @@ filegroup(
 )
 
 # LLVM 21.1.x mis-parses out-of-line members of private nested types under
-# -fincremental-extensions (spurious "is a private member of" errors). Compile
-# a fixed copy of the clang TU and force-load it (alwayslink) so its object
-# precedes the @llvm archives in every link; the broken libclangParse.a member
-# defines the same symbol set, so it is never fetched (drift fails the link
-# loudly). Remove this override when @llvm carries the fix.
+# -fincremental-extensions (spurious "is a private member of" errors), and
+# crashes on #pragma once in incremental input (null FileEntry deref; fixed
+# upstream by 9cc0df99de85). Compile fixed copies of the clang TUs and
+# force-load them (alwayslink) so their objects precede the @llvm archives in
+# every link; the broken archive members define the same symbol sets, so they
+# are never fetched (drift fails the link loudly). Remove these overrides when
+# @llvm carries the fixes.
+CLANG_OVERRIDES_ACTIVE = LLVM_VERSION.startswith("21.1.")
+
 cc_library(
     name = "clang_overrides",
     srcs = [
+        "bazel-support/clang-overrides/21/IncrementalParser.cpp",
+        "bazel-support/clang-overrides/21/IncrementalParser.h",
         "bazel-support/clang-overrides/21/ParseTentative.cpp",
-    ] if LLVM_VERSION.startswith("21.1.") else [],
+    ] if CLANG_OVERRIDES_ACTIVE else [],
     copts = CPPINTEROP_COPTS + ["-D_GNU_SOURCE"],
     deps = ["@llvm//:headers"],
     alwayslink = True,
 )
+
+# Tests gate on this: pre-22 clang crashes on #pragma once unless overridden.
+CLANG_OVERRIDES_DEFINES = [
+    "-DCPPINTEROP_CLANG_OVERRIDES_21",
+] if CLANG_OVERRIDES_ACTIVE else []
 
 # lib/CppInterOp: the clangCppInterOp library (CPPINTEROP_USE_REPL backend,
 # non-EMSCRIPTEN sources from add_llvm_library(clangCppInterOp ...)).
@@ -377,7 +388,7 @@ cppinterop_cc_test(
     extra_copts = [
         "-Wno-pedantic",
         _CPPINTEROP_SRC_DIR_COPT,
-    ],
+    ] + CLANG_OVERRIDES_DEFINES,
     extra_deps = [":CAPITestC"],
 )
 

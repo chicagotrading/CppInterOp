@@ -429,6 +429,26 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_Process) {
   EXPECT_FALSE(Cpp::Process("int f(); int res = f();") == 0);
 }
 
+// #pragma once in incremental input dereferenced a null FileEntry and crashed
+// before LLVM 22 (upstream fix 9cc0df99de85, carried for 21.1.x by
+// bazel-support/clang-overrides/21/IncrementalParser.cpp).
+TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_PragmaOnce) {
+#if CLANG_VERSION_MAJOR < 22 && !defined(CPPINTEROP_CLANG_OVERRIDES_21)
+  GTEST_SKIP() << "clang before LLVM 22 crashes on #pragma once in "
+                  "incremental input without the IncrementalParser override";
+#else
+  TestFixture::CreateInterpreter();
+  EXPECT_TRUE(Cpp::Declare("#pragma once") == 0);
+  EXPECT_TRUE(Cpp::Declare("#pragma once\nint pragma_once_a = 1;") == 0);
+  EXPECT_TRUE(Cpp::Declare("int pragma_once_b = pragma_once_a + 1;\n"
+                           "#pragma once\n"
+                           "int pragma_once_c = pragma_once_b + 1;") == 0);
+  // The decls around the pragma landed and stay usable.
+  EXPECT_TRUE(Cpp::Declare("int pragma_once_d = pragma_once_c + 1;") == 0);
+  EXPECT_TRUE(Cpp::Process("#pragma once") == 0);
+#endif
+}
+
 // libc_nonshared.a symbols are per-module and invisible to dlsym; jitted
 // calls resolve to this library's copy (pure code) or to the JIT-side
 // registration shims (at_quick_exit, pthread_atfork).
