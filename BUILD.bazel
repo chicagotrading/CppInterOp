@@ -1,14 +1,14 @@
 """Experimental Bazel build for CppInterOp. CMake is the supported build;
 this translates the CMake recipe to build libclangCppInterOp against a local
-LLVM tree (selected via the LLVM_DIR env var, see @cppyy_bazel//:llvm.bzl)."""
+LLVM tree (selected via the LLVM_DIR env var, see @cppjit_bazel//:llvm.bzl)."""
 
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
 load("@llvm//:defs.bzl", "LLVM_VERSION")
-load("@cppyy_bazel//:defs.bzl", "BASE_COPTS", "CPPINTEROP_COPTS", "DEFAULT_LTO_OPT_LEVEL", "LTO_OPT_LEVELS", "is_main_repo", "jit_cxx_interp_args", "llvm_linkopts", "llvm_lto_opt_linkopts", "llvm_system_libs", "llvm_tblgen_linkopts", "repo_rloc")
+load("@cppjit_bazel//:defs.bzl", "BASE_COPTS", "CPPINTEROP_COPTS", "DEFAULT_LTO_OPT_LEVEL", "LTO_OPT_LEVELS", "is_main_repo", "jit_cxx_interp_args", "llvm_linkopts", "llvm_lto_opt_linkopts", "llvm_system_libs", "llvm_tblgen_linkopts", "repo_rloc")
 load("@@rules_cc+//cc:defs.bzl", "cc_binary", "cc_library", "cc_shared_library", "cc_test")
 load("@@rules_shell+//shell:sh_test.bzl", "sh_test")
 load(
-    "@cppyy_bazel//:rules.bzl",
+    "@cppjit_bazel//:rules.bzl",
     "cppinterop_buildinfo_inc",
     "cppinterop_cc_test",
     "cppinterop_cxx_shim",
@@ -286,7 +286,7 @@ cc_shared_library(
     deps = [":test_lib"],
 )
 
-# TestDownstreamLib: mirrors libcppyy-backend's contract -- uses the inline
+# TestDownstreamLib: mirrors libcppjit's contract -- uses the inline
 # <CppInterOp/Dispatch.h> path with its own slot storage and deliberately
 # does NOT link clangCppInterOp, so any unsatisfied inline-header UND ref
 # trips here. NDEBUG/-O2/-fno-exceptions/-fno-rtti = BASE_COPTS.
@@ -297,7 +297,7 @@ cc_library(
     # NDEBUG (from BASE_COPTS) drops the JitCall asserts that call
     # AreArgumentsValid; this DSO is deliberately NOT linked against
     # clangCppInterOp, so leaving the asserts in would make that an undefined
-    # symbol. Mirrors cppyy's release backend.
+    # symbol. Mirrors cppjit's release backend.
     copts = BASE_COPTS,
     includes = [
         "include",
