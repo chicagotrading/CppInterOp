@@ -3,18 +3,22 @@ module(
     version = "0.1.0",
 )
 
-bazel_dep(name = "cppyy_bazel", version = "0.1.0")
+bazel_dep(name = "cppjit_bazel", version = "0.1.0")
 local_path_override(
-    module_name = "cppyy_bazel",
-    path = "../cppyy/bazel",
+    module_name = "cppjit_bazel",
+    path = "../cppjit/bazel",
 )
 
 bazel_dep(name = "bazel_skylib", version = "1.7.1")
 bazel_dep(name = "googletest", version = "1.15.2")
 bazel_dep(name = "google_benchmark", version = "1.9.1")
 
-llvm = use_extension("@cppyy_bazel//:llvm.bzl", "llvm")
+llvm = use_extension("@cppjit_bazel//:llvm.bzl", "llvm")
+
+# Match the CMake build's CMAKE_CXX_STANDARD. A mixed standard across the
+# libcppjit / libclangCppInterOp boundary silently changes inline bodies.
+llvm.config(cxx_std = "c++20")
 use_repo(llvm, llvm = "cppjit_llvm")
 
-# Opt in to the centralized clang toolchain from cppyy_bazel (standalone build).
+# Opt in to the centralized clang toolchain from cppjit_bazel (standalone build).
 register_toolchains("@llvm//:cc_toolchain")
