@@ -422,6 +422,12 @@ public:
       if (!outOfProcess &&
           compat::redirectNativeTLSDeclarations(*PTU->TheModule))
         installNativeTLSHelperOnce();
+      // WORKAROUND: see bindProcessWeakGlobals in Compatibility.h -- remove
+      // with the pass once the clang JIT fix lands.
+#if CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
+      if (!outOfProcess)
+        compat::bindProcessWeakGlobals(*PTU->TheModule);
+#endif
 #endif
       if (llvm::Error Err = inner->Execute(*PTU))
         return Err;
@@ -530,6 +536,12 @@ public:
     if (PTUOrErr->TheModule && !outOfProcess &&
         compat::redirectNativeTLSDeclarations(*PTUOrErr->TheModule))
       installNativeTLSHelperOnce();
+    // WORKAROUND: see bindProcessWeakGlobals in Compatibility.h -- remove
+    // with the pass once the clang JIT fix lands.
+#if CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
+    if (PTUOrErr->TheModule && !outOfProcess)
+      compat::bindProcessWeakGlobals(*PTUOrErr->TheModule);
+#endif
 #endif
 
     if (auto Err = Execute(*PTUOrErr)) {
