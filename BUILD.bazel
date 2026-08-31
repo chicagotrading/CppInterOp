@@ -459,6 +459,8 @@ cppinterop_cc_test(
         "@google_benchmark//:benchmark",
     ],
     extra_dynamic_deps = [":test_solib"],
+    # Timing-sensitive: consumers exclude it with --test_tag_filters=-benchmark.
+    extra_tags = ["benchmark"],
 )
 
 # Cross-repo test_suite can't use wildcards; list every test target.
