@@ -275,6 +275,15 @@ inline void codeComplete(std::vector<std::string>& Results,
 
 #include <algorithm>
 
+// makeSlabJITBuilder() needs the host symbol, and an extern "C" declaration
+// must not sit inside namespace compat. The guard follows the one clang uses
+// in IncrementalExecutor.cpp for the same symbol.
+#if LLVM_VERSION_MAJOR > 21 && !defined(_WIN32) && defined(LLVM_ON_UNIX) &&    \
+    !defined(__EMSCRIPTEN__) && !defined(_AIX) && !defined(__MVS__)
+#define CPPINTEROP_HAS_EMUTLS_GET_ADDRESS 1
+extern "C" void* __emutls_get_address(void*);
+#endif
+
 namespace compat {
 
 /// Detect the CUDA installation path using clang::Driver
@@ -1243,5 +1252,9 @@ inline void InstantiateClassTemplateSpecialization(
       /*PrimaryHasMatchedPackOnParmToNonPackOnArg=*/false);
 }
 } // namespace compat
+
+#ifdef CPPINTEROP_HAS_EMUTLS_GET_ADDRESS
+#undef CPPINTEROP_HAS_EMUTLS_GET_ADDRESS
+#endif
 
 #endif // CPPINTEROP_COMPATIBILITY_H
