@@ -699,6 +699,10 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
       setvbuf(fdopen(stderr_fd, "w+"), nullptr, _IONBF, 0);
     };
   }
+  // Upstream applies CM only when the builder holds no JITBuilder
+  // (IncrementalExecutor.cpp, the `if (!JITBuilder)` gate). The
+  // out-of-process path sets JITBuilder first, so CM is a no-op there, and
+  // the out-of-process JIT still runs CodeModel::Small.
   auto innerOrErr =
       CudaEnabled ? clang::Interpreter::createWithCUDA(std::move(*ciOrErr),
                                                        std::move(DeviceCI))
