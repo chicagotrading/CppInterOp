@@ -257,6 +257,7 @@ inline void codeComplete(std::vector<std::string>& Results,
 #include "clang/Interpreter/IncrementalExecutor.h"
 
 #include "llvm/ExecutionEngine/Orc/Debugging/DebuggerSupport.h"
+#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #endif
@@ -493,14 +494,23 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
       });
   // The IncrementalExecutorBuilder must outlive the IncrementalCompiler
   // it gets attached to, so it's a unique_ptr at function scope.
-  std::unique_ptr<clang::IncrementalExecutorBuilder> OutOfProcessConfig;
+  auto ExecutorConfig = std::make_unique<clang::IncrementalExecutorBuilder>();
+  // Run the JIT with the large code model, as the LLVM <= 21 path below does.
+  // With the default CodeModel::Small (LLJIT.cpp sets it when the builder
+  // leaves the code model unset), x86-64 PIC gets the personality encoding
+  // sdata4|pcrel|indirect (TargetLoweringObjectFileELF::Initialize). The
+  // .eh_frame CIE personality field is then a PC32 delta, and it must reach
+  // DW.ref.__gxx_personality_v0 in the graph that first claimed that weak
+  // hidden symbol. InProcessMemoryManager maps a fresh slab per graph, so the
+  // distance has no bound and the field overflows after enough modules. The
+  // large code model selects sdata8 instead. See
+  // ctc-llvm-toolchain notes/runs/2026-09-02-jitlink-bindweak-test.md.
+  ExecutorConfig->CM = llvm::CodeModel::Large;
   if (oopRequested) {
-    OutOfProcessConfig = std::make_unique<clang::IncrementalExecutorBuilder>();
-    OutOfProcessConfig->IsOutOfProcess = true;
-    if (configureBundledOOPRuntime(*OutOfProcessConfig)) {
+    ExecutorConfig->IsOutOfProcess = true;
+    if (configureBundledOOPRuntime(*ExecutorConfig)) {
       outOfProcess = true;
-      CB.SetDriverCompilationCallback(
-          OutOfProcessConfig->UpdateOrcRuntimePathCB);
+      CB.SetDriverCompilationCallback(ExecutorConfig->UpdateOrcRuntimePathCB);
     } else {
       llvm::errs()
           << "[CreateClangInterpreter]: --use-oop-jit requested but the "
@@ -508,7 +518,7 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
              "(<libdir>/cppinterop-rt/{liborc_rt.a,llvm-jitlink-executor}) "
              "is missing from CppInterOp's build/install tree. Falling "
              "back to in-process JIT.\n";
-      OutOfProcessConfig.reset();
+      ExecutorConfig->IsOutOfProcess = false;
     }
   }
 #endif
@@ -548,9 +558,9 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
     // configureBundledOOPRuntime() above; UpdateOrcRuntimePathCB was
     // replaced with a no-op there too, so the upstream auto-discovery
     // safety check doesn't run.
-    OutOfProcessConfig->UseSharedMemory = false;
-    OutOfProcessConfig->SlabAllocateSize = 0;
-    OutOfProcessConfig->CustomizeFork = [stdin_fd, stdout_fd, stderr_fd]() {
+    ExecutorConfig->UseSharedMemory = false;
+    ExecutorConfig->SlabAllocateSize = 0;
+    ExecutorConfig->CustomizeFork = [stdin_fd, stdout_fd, stderr_fd]() {
       dup2(stdin_fd, STDIN_FILENO);
       dup2(stdout_fd, STDOUT_FILENO);
       dup2(stderr_fd, STDERR_FILENO);
@@ -561,9 +571,8 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
   auto innerOrErr =
       CudaEnabled ? clang::Interpreter::createWithCUDA(std::move(*ciOrErr),
                                                        std::move(DeviceCI))
-                  : clang::Interpreter::create(
-                        std::move(*ciOrErr),
-                        outOfProcess ? std::move(OutOfProcessConfig) : nullptr);
+                  : clang::Interpreter::create(std::move(*ciOrErr),
+                                               std::move(ExecutorConfig));
 #else
   // FIXME: this is the simplest way to hard code large code model
   auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
