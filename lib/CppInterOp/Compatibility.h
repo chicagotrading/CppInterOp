@@ -256,7 +256,10 @@ inline void codeComplete(std::vector<std::string>& Results,
 #include "clang/Basic/Version.h"
 #include "clang/Interpreter/IncrementalExecutor.h"
 
+#include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
 #include "llvm/ExecutionEngine/Orc/Debugging/DebuggerSupport.h"
+#include "llvm/ExecutionEngine/Orc/MapperJITLinkMemoryManager.h"
+#include "llvm/ExecutionEngine/Orc/MemoryMapper.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
@@ -457,6 +460,120 @@ inline bool configureBundledOOPRuntime(clang::IncrementalExecutorBuilder& B) {
   }
   return false;
 }
+
+/// The JIT slab size in bytes, from `CPPINTEROP_JIT_SLAB_MB`. Returns 0 when
+/// the variable is absent, empty, zero, or not usable. A bad value prints a
+/// message and gives 0, which keeps the default memory manager.
+inline size_t getJITSlabBytesFromEnv() {
+  const char* Env = std::getenv("CPPINTEROP_JIT_SLAB_MB");
+  if (!Env || !*Env)
+    return 0;
+  unsigned long long MB = 0;
+  if (llvm::StringRef(Env).trim().getAsInteger(10, MB)) {
+    llvm::errs() << "[CreateClangInterpreter]: CPPINTEROP_JIT_SLAB_MB=\"" << Env
+                 << "\" is not a number. The JIT slab stays off.\n";
+    return 0;
+  }
+  if (MB == 0)
+    return 0;
+  // A PC32 fixup must reach every address in its own reservation, so a
+  // reservation of 2 GiB or more defeats the purpose of the slab.
+  if (MB >= 2048) {
+    llvm::errs() << "[CreateClangInterpreter]: CPPINTEROP_JIT_SLAB_MB=" << MB
+                 << " is too large. Use a value below 2048, because a PC32 "
+                    "fixup must reach across the slab. The JIT slab stays "
+                    "off.\n";
+    return 0;
+  }
+  return static_cast<size_t>(MB) << 20;
+}
+
+/// The JIT code model for the slab builder, from `CPPINTEROP_JIT_CODE_MODEL`.
+/// Accepts `large` (the default) and `small`. Any other value prints a
+/// message and gives `large`. The variable has an effect only when
+/// `CPPINTEROP_JIT_SLAB_MB` turns the slab on; without the slab the code
+/// model comes from `IncrementalExecutorBuilder::CM`.
+inline llvm::CodeModel::Model getJITCodeModelFromEnv() {
+  const char* Env = std::getenv("CPPINTEROP_JIT_CODE_MODEL");
+  if (!Env || !*Env)
+    return llvm::CodeModel::Large;
+  llvm::StringRef V = llvm::StringRef(Env).trim();
+  if (V.equals_insensitive("large"))
+    return llvm::CodeModel::Large;
+  if (V.equals_insensitive("small"))
+    return llvm::CodeModel::Small;
+  llvm::errs() << "[CreateClangInterpreter]: CPPINTEROP_JIT_CODE_MODEL=\""
+               << Env
+               << "\" is not \"large\" or \"small\". The JIT uses the large "
+                  "code model.\n";
+  return llvm::CodeModel::Large;
+}
+
+/// Build an LLJITBuilder that reserves JIT memory in `SlabBytes` units, not
+/// one fresh mmap per LinkGraph. This copies the `llvm-jitlink` default
+/// (`MapperJITLinkMemoryManager::CreateWithMapper<InProcessMemoryMapper>`),
+/// which is why that tool never hits the `.eh_frame` PC32 overflow: graphs
+/// that share one reservation stay inside one PC32 window.
+///
+/// This hardening is optional and off by default. The large code model set in
+/// createClangInterpreter() already removes the overflow. Keep the option to
+/// test a return to CodeModel::Small, which gives smaller and faster JIT
+/// code: set `CPPINTEROP_JIT_SLAB_MB` **and**
+/// `CPPINTEROP_JIT_CODE_MODEL=small`. Read the caution below first. One
+/// reservation bounds the delta, but a grown second reservation brings the
+/// PC32 hazard back under the small code model, so Small is a test
+/// configuration, not a supported one.
+///
+/// Caution: `SlabBytes` is a reservation *unit*, not a hard cap.
+/// MapperJITLinkMemoryManager reuses the free part of a reservation, and
+/// reserves one more unit when no free range fits. It grows; it does not
+/// fail. The next reservation can land far from the first, so a PC32 delta
+/// can still overflow after the JIT emits more than `SlabBytes` of code.
+///
+/// Returns nullptr on failure, which keeps the default JIT configuration.
+/// See ctc-llvm-toolchain notes/runs/2026-09-02-jitlink-bindweak-test.md.
+inline std::unique_ptr<llvm::orc::LLJITBuilder>
+makeSlabJITBuilder(size_t SlabBytes) {
+  auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
+  if (!JTMB) {
+    llvm::logAllUnhandledErrors(JTMB.takeError(), llvm::errs(),
+                                "[CreateClangInterpreter]: no host for the "
+                                "JIT slab, slab disabled:");
+    return nullptr;
+  }
+  JTMB->setCodeModel(getJITCodeModelFromEnv());
+
+  auto JB = std::make_unique<llvm::orc::LLJITBuilder>();
+  JB->setJITTargetMachineBuilder(std::move(*JTMB));
+  using MemMgrPtr = std::unique_ptr<llvm::jitlink::JITLinkMemoryManager>;
+  JB->setMemoryManagerCreator(
+      [SlabBytes](llvm::orc::ExecutionSession&) -> llvm::Expected<MemMgrPtr> {
+        auto MemMgr = llvm::orc::MapperJITLinkMemoryManager::CreateWithMapper<
+            llvm::orc::InProcessMemoryMapper>(SlabBytes);
+        if (!MemMgr)
+          return MemMgr.takeError();
+        return MemMgrPtr(std::move(*MemMgr));
+      });
+  // The two callbacks below repeat what clang's createDefaultJITBuilder()
+  // does. A caller-supplied LLJITBuilder replaces that function, so this code
+  // must keep JIT debugger support and the emulated-TLS symbol.
+  JB->setPrePlatformSetup([](llvm::orc::LLJIT& J) {
+    consumeError(llvm::orc::enableDebuggerSupport(J));
+    return llvm::Error::success();
+  });
+#if defined(CPPINTEROP_HAS_EMUTLS_GET_ADDRESS)
+  JB->setNotifyCreatedCallback([](llvm::orc::LLJIT& J) {
+    auto& JD = J.getProcessSymbolsJITDylib() ? *J.getProcessSymbolsJITDylib()
+                                             : J.getMainJITDylib();
+    return JD.define(llvm::orc::absoluteSymbols(
+        {{J.mangleAndIntern("__emutls_get_address"),
+          {llvm::orc::ExecutorAddr::fromPtr(
+               reinterpret_cast<void*>(&__emutls_get_address)),
+           llvm::JITSymbolFlags::Exported}}}));
+  });
+#endif
+  return JB;
+}
 #endif // LLVM_VERSION_MAJOR > 21
 
 inline std::unique_ptr<clang::Interpreter>
@@ -521,6 +638,11 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
       ExecutorConfig->IsOutOfProcess = false;
     }
   }
+  // Optional hardening, off by default. See makeSlabJITBuilder(). A JITBuilder
+  // set here replaces the out-of-process one, so keep it in-process only.
+  if (!ExecutorConfig->IsOutOfProcess)
+    if (size_t SlabBytes = getJITSlabBytesFromEnv())
+      ExecutorConfig->JITBuilder = makeSlabJITBuilder(SlabBytes);
 #endif
 
   std::unique_ptr<clang::CompilerInstance> DeviceCI;
