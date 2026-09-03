@@ -5971,6 +5971,25 @@ void GetIncludePaths(std::vector<std::string>& IncludePaths, bool withSystem,
 }
 
 namespace {
+// Clang < 23: SuppressAllDiagnostics drops the diagnostic before the engine
+// counts it, so a silent Declare that recovers from errors still parses.
+// Clang 23 short-circuits SuppressAllDiagnostics differently; swap in an
+// IgnoringDiagConsumer there instead.
+#if CLANG_VERSION_MAJOR < 23
+class clangSilent {
+public:
+  clangSilent(clang::DiagnosticsEngine& diag) : fDiagEngine(diag) {
+    fOldDiagValue = fDiagEngine.getSuppressAllDiagnostics();
+    fDiagEngine.setSuppressAllDiagnostics(true);
+  }
+
+  ~clangSilent() { fDiagEngine.setSuppressAllDiagnostics(fOldDiagValue); }
+
+protected:
+  clang::DiagnosticsEngine& fDiagEngine;
+  bool fOldDiagValue;
+};
+#else
 class clangSilent {
 public:
   clangSilent(clang::DiagnosticsEngine& diag)
@@ -5993,6 +6012,7 @@ protected:
   std::unique_ptr<clang::DiagnosticConsumer> fOldOwnedClient;
   clang::IgnoringDiagConsumer fIgnoringClient;
 };
+#endif
 } // namespace
 
 static int Declare(compat::Interpreter& I, const char* code, bool silent) {
