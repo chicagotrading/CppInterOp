@@ -50,6 +50,7 @@ jobs:
           # Ubuntu Arm
           - { name: ubu24-arm-gcc12-llvm22-vg, os: ubuntu-24.04-arm, compiler: gcc-12, clang-runtime: '22', Valgrind: On }
           # Ubuntu X86
+          - { name: ubu24-x86-gcc12-llvm23, os: ubuntu-24.04, compiler: gcc-12, clang-runtime: '23'}
           - { name: ubu24-x86-gcc12-llvm22, os: ubuntu-24.04, compiler: gcc-12, clang-runtime: '22' }
           - { name: ubu24-x86-clang22-llvm22-asan-ubsan, os: ubuntu-24.04, compiler: clang-22, clang-runtime: '22', sanitizer: "Address;Undefined", flavor: asan }
           - { name: ubu24-x86-clang22-llvm22-msan, os: ubuntu-24.04, compiler: clang-22, clang-runtime: '22', sanitizer: "Memory", flavor: msan }
