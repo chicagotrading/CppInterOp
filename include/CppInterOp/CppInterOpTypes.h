@@ -26,6 +26,17 @@
 #endif
 #endif
 
+// Friend declarations of exported functions. MSVC treats a friend without the
+// dll attribute as a different-linkage redeclaration, so it keeps
+// CPPINTEROP_API. Elsewhere the macro is empty: the declaration in
+// CppInterOpDecl.inc sets the export visibility, and a Dispatch.h consumer
+// defines the same functions as hidden inline wrappers.
+#if defined _WIN32 || defined __CYGWIN__
+#define CPPINTEROP_FRIEND_API CPPINTEROP_API
+#else
+#define CPPINTEROP_FRIEND_API
+#endif
+
 // Cross-platform deprecation attribute. Older Clang versions (Cling)
 // mis-parse C++11 `[[deprecated]]` near the return type, so we use
 // the vendor-specific spelling on each compiler.
@@ -454,8 +465,8 @@ enum class ValueKind : std::uint8_t {
 /// function, constructor or destructor.
 class JitCall {
 public:
-  friend CPPINTEROP_API JitCall MakeFunctionCallable(InterpRef I,
-                                                     ConstFuncRef func);
+  friend CPPINTEROP_FRIEND_API JitCall MakeFunctionCallable(InterpRef I,
+                                                            ConstFuncRef func);
   enum Kind : char {
     kUnknown = 0,
     kGenericCall,
@@ -496,16 +507,13 @@ private:
       : m_DestructorCall(C), m_Kind(K), m_FD(Dtor) {}
 
   // Trace-hook impls need private m_FD for the function-name lookup.
-  // CPPINTEROP_API matches the X-macro-generated decl in CppInterOpDecl.inc;
-  // MSVC treats a friend decl without the dllimport/dllexport attribute as
-  // a different-linkage redeclaration.
-  friend CPPINTEROP_API void
+  friend CPPINTEROP_FRIEND_API void
   CppInterOpTraceJitCallInvokeImpl(const JitCall*, void* result, void** args,
                                    std::size_t nargs, void* self);
-  friend CPPINTEROP_API void
+  friend CPPINTEROP_FRIEND_API void
   CppInterOpTraceJitCallInvokeDestructorImpl(const JitCall*, void* object,
                                              unsigned long nary, int withFree);
-  friend CPPINTEROP_API void
+  friend CPPINTEROP_FRIEND_API void
   CppInterOpTraceJitCallInvokeReturnImpl(const JitCall*, void* result);
 
   /// Checks if the passed arguments are valid for the given function.

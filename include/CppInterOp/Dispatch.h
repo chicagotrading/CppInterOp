@@ -119,10 +119,25 @@ using namespace Cpp;
 // exclusive (#error guard at top) so only one body of Cpp::* exists per TU.
 // CN (CppName) may differ from DN (DispatchName) for overloaded functions,
 // e.g. CN=GetFunctionAddress, DN=GetFunctionAddress_fn.
+//
+// The wrappers are hidden. A consumer DSO that emits them out of line (an -O0
+// build, or an address-taken wrapper) must not export them: loaded RTLD_GLOBAL,
+// an exported copy interposes libclangCppInterOp's own dispatch table
+// (&Cpp::X in CppGetProcAddress) and the wrapper then calls itself through the
+// slot forever.
+#if defined _WIN32 || defined __CYGWIN__
+#define CPPINTEROP_DISPATCH_HIDDEN
+#elif defined __GNUC__
+#define CPPINTEROP_DISPATCH_HIDDEN __attribute__((__visibility__("hidden")))
+#else
+#define CPPINTEROP_DISPATCH_HIDDEN
+#endif
 namespace Cpp {
 
 #define CPPINTEROP_API_FUNC(DN, CN, Ret, DeclArgs, CallArgs, RawTypes)         \
-  inline Ret CN DeclArgs { return ::CppInternal::DispatchRaw::DN CallArgs; }
+  CPPINTEROP_DISPATCH_HIDDEN inline Ret CN DeclArgs {                          \
+    return ::CppInternal::DispatchRaw::DN CallArgs;                            \
+  }
 #include "CppInterOp/CppInterOpAPI.inc"
 
 /// Initialize all CppInterOp API from the dynamically loaded library.
