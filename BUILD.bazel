@@ -194,6 +194,36 @@ CLANG_OVERRIDES_DEFINES = [
     "-DCPPINTEROP_CLANG_OVERRIDES_21",
 ] if CLANG_OVERRIDES_ACTIVE else []
 
+# tools/cppinterop-effects: the build-time memory-effect table writer for
+# Cpp::LoadMemoryEffectsSummaries. It runs the same analysis as the library,
+# so it compiles lib/CppInterOp/MemoryEffects.cpp itself.
+cc_library(
+    name = "memory_effects",
+    srcs = ["lib/CppInterOp/MemoryEffects.cpp"],
+    hdrs = [
+        "lib/CppInterOp/MemoryEffects.h",
+        ":headers",
+    ],
+    copts = CPPINTEROP_COPTS,
+    includes = ["include"],
+    deps = ["@llvm//:headers"],
+)
+
+cc_binary(
+    name = "cppinterop-effects",
+    srcs = ["tools/cppinterop-effects/cppinterop-effects.cpp"],
+    additional_linker_inputs = ["@llvm//:lib_files"],
+    copts = CPPINTEROP_COPTS,
+    data = ["@llvm//:all_files"],
+    linkopts = llvm_tblgen_linkopts(),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":llvm_system_libs",
+        ":memory_effects",
+        "@llvm//:headers",
+    ],
+)
+
 # lib/CppInterOp: the clangCppInterOp library (CPPINTEROP_USE_REPL backend,
 # non-EMSCRIPTEN sources from add_llvm_library(clangCppInterOp ...)).
 cc_library(
@@ -206,6 +236,7 @@ cc_library(
         "lib/CppInterOp/DynamicLibraryManager.cpp",
         "lib/CppInterOp/DynamicLibraryManagerSymbol.cpp",
         "lib/CppInterOp/ErrorInternal.cpp",
+        "lib/CppInterOp/MemoryEffects.cpp",
         "lib/CppInterOp/Paths.cpp",
         "lib/CppInterOp/Tracing.cpp",
     ] + glob(["lib/CppInterOp/*.h"]),
@@ -371,6 +402,7 @@ cppinterop_cc_test(
         "unittests/CppInterOp/HandleTypesTest.cpp",
         "unittests/CppInterOp/InterpreterTest.cpp",
         "unittests/CppInterOp/JitTest.cpp",
+        "unittests/CppInterOp/MemoryEffectsTest.cpp",
         "unittests/CppInterOp/ResultTest.cpp",
         "unittests/CppInterOp/ScopeReflectionTest.cpp",
         "unittests/CppInterOp/TypeReflectionTest.cpp",

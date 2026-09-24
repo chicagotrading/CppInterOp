@@ -29,6 +29,7 @@
 #include "clang/Serialization/ModuleFileExtension.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -584,17 +585,23 @@ public:
     return nullptr;
   }
 
-  CompilationResult declare(const std::string& input,
-                            clang::PartialTranslationUnit** PTU = nullptr) {
-    return process(input, /*Value=*/nullptr, PTU);
+  CompilationResult
+  declare(const std::string& input,
+          clang::PartialTranslationUnit** PTU = nullptr,
+          llvm::function_ref<void(const llvm::Module&)> OnModule = {}) {
+    return process(input, /*Value=*/nullptr, PTU,
+                   /*disableValuePrinting=*/false, OnModule);
   }
 
   ///\brief Maybe transform the input line to implement cint command line
   /// semantics (declarations are global) and compile to produce a module.
   ///
-  CompilationResult process(const std::string& input, clang::Value* V = 0,
-                            clang::PartialTranslationUnit** PTU = nullptr,
-                            bool disableValuePrinting = false) {
+  /// \p OnModule sees the module after the JIT rewrites and before it runs.
+  CompilationResult
+  process(const std::string& input, clang::Value* V = 0,
+          clang::PartialTranslationUnit** PTU = nullptr,
+          bool disableValuePrinting = false,
+          llvm::function_ref<void(const llvm::Module&)> OnModule = {}) {
     auto PTUOrErr = Parse(input);
     if (!PTUOrErr) {
       llvm::logAllUnhandledErrors(PTUOrErr.takeError(), llvm::errs(),
@@ -621,6 +628,9 @@ public:
       compat::bindProcessWeakGlobals(*PTUOrErr->TheModule);
 #endif
 #endif
+
+    if (OnModule && PTUOrErr->TheModule)
+      OnModule(*PTUOrErr->TheModule);
 
     if (auto Err = Execute(*PTUOrErr)) {
       llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),

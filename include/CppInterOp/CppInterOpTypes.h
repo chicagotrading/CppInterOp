@@ -460,6 +460,55 @@ enum class ValueKind : std::uint8_t {
   RValue,
 };
 
+/// What a function can do to one kind of memory.
+enum class ModRef : std::uint8_t {
+  None = 0,
+  Read = 1,
+  Write = 2,
+  ReadWrite = 3,
+};
+
+/// The memory effects that LLVM proves for a function from its optimized IR.
+/// Each field is an upper bound: ReadWrite means "not proven otherwise".
+struct MemoryEffects {
+  /// False when the code did not compile or does not define the function.
+  bool m_Valid = false;
+  /// Memory reached through the pointer parameters.
+  ModRef m_ArgMem = ModRef::ReadWrite;
+  /// All other memory: globals, the heap, pointees of loaded pointers.
+  ModRef m_Other = ModRef::ReadWrite;
+  /// Per parameter: None for a parameter that is not a pointer.
+  std::vector<ModRef> m_Params;
+  /// Per parameter: false when the function provably keeps no copy of the
+  /// pointer after it returns.
+  std::vector<bool> m_Captured;
+  /// Calls that are reachable and have no body or summary. An indirect call
+  /// is "<indirect>" and inline assembly is "<asm>".
+  std::vector<std::string> m_Opaque;
+  /// m_Other, m_Captured and m_Params when every opaque call is trusted to
+  /// access only memory through its arguments, to keep no copy of them, and
+  /// not to write through a const reference, a pointer to const, or `this`
+  /// of a const method. They show what the visible code does. Equal to the
+  /// untrusted fields when m_Opaque is empty.
+  ModRef m_TrustedOther = ModRef::ReadWrite;
+  std::vector<bool> m_TrustedCaptured;
+  std::vector<ModRef> m_TrustedParams;
+  /// The opaque calls whose signature does not bound m_TrustedParams: an
+  /// indirect call, inline assembly, or a declaration whose parameters do
+  /// not map one to one to the IR parameters (a class passed by value).
+  std::vector<std::string> m_Untrusted;
+  /// A function that the analyzed function calls directly, before
+  /// optimization inlines it.
+  struct Callee {
+    std::string m_Mangled;
+    std::string m_Demangled;
+  };
+  /// The direct callees in the order of their first call: the selected
+  /// overload, and also the constructors, destructors and conversions of the
+  /// temporaries of the call.
+  std::vector<Callee> m_Callees;
+};
+
 /// A class modeling function calls for functions produced by the interpreter
 /// in compiled code. It provides an information if we are calling a standard
 /// function, constructor or destructor.

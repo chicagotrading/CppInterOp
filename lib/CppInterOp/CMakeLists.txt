@@ -6,9 +6,12 @@ else()
     ${LLVM_TARGETS_TO_BUILD}
     BinaryFormat
     Core
+    Demangle
     Object
     OrcJit
+    Passes
     Support
+    TransformUtils
   )
   # FIXME: Investigate why this needs to be conditionally included.
   if ("LLVMFrontendDriver" IN_LIST LLVM_AVAILABLE_LIBS)
@@ -219,6 +222,7 @@ add_llvm_library(clangCppInterOp
   CXCppInterOp.cpp
   CXCppInterOpGenerated.cpp
   ErrorInternal.cpp
+  MemoryEffects.cpp
   Tracing.cpp
   ${DLM}
   LINK_LIBS
