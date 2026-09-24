@@ -214,7 +214,9 @@ std::string OpaqueCallee(const llvm::CallBase& CB) {
   const llvm::Function* Callee = CB.getCalledFunction();
   if (!Callee)
     return "<indirect>";
-  if (!Callee->isDeclaration() || Callee->isIntrinsic())
+  // A loaded summary states the effects, so the call is not opaque.
+  if (!Callee->isDeclaration() || Callee->isIntrinsic() ||
+      Summaries().count(Callee->getName()))
     return {};
   return llvm::demangle(Callee->getName());
 }
