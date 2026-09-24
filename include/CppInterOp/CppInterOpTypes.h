@@ -470,29 +470,56 @@ enum class ModRef : std::uint8_t {
 
 /// The memory effects that LLVM proves for a function from its optimized IR.
 /// Each field is an upper bound: ReadWrite means "not proven otherwise".
+///
+/// The memory of a pointer parameter P is its own object (the bytes P points
+/// to) and the memory reachable from it: whatever the pointers stored in that
+/// memory point to, transitively. m_ParamsDirect, m_ParamsReachable, m_Other
+/// and m_Captured attribute every access of the optimized code to one of
+/// these regions, or to other memory when its pointer has no single origin.
 struct MemoryEffects {
   /// False when the code did not compile or does not define the function.
   bool m_Valid = false;
-  /// Memory reached through the pointer parameters.
+  /// LLVM's own bound on the memory reached through the pointer parameters.
   ModRef m_ArgMem = ModRef::ReadWrite;
-  /// All other memory: globals, the heap, pointees of loaded pointers.
+  /// Memory that no parameter reaches: globals, pointers of unknown origin,
+  /// and whatever an opaque call touches. Excludes the accesses that
+  /// m_ParamsDirect and m_ParamsReachable attribute to a parameter.
   ModRef m_Other = ModRef::ReadWrite;
-  /// Per parameter: None for a parameter that is not a pointer.
+  /// Per parameter, LLVM's own bound; None for a parameter that is not a
+  /// pointer. It merges the parameter's own object with memory reachable
+  /// from it and from other pointers of unknown origin.
   std::vector<ModRef> m_Params;
-  /// Per parameter: false when the function provably keeps no copy of the
-  /// pointer after it returns.
+  /// Per parameter: accesses through pointers based on the parameter, that
+  /// is, to its own object.
+  std::vector<ModRef> m_ParamsDirect;
+  /// Per parameter: accesses through pointers loaded from its memory,
+  /// transitively. Valid as an attribution only while the parameter is not
+  /// captured (see m_Captured) and while its reachable memory is not also
+  /// reachable from another parameter: a pointer that may come from two
+  /// parameters counts for both.
+  std::vector<ModRef> m_ParamsReachable;
+  /// Per parameter: true when a pointer into the parameter's memory may
+  /// escape it: stored into memory that another parameter, a global or an
+  /// unknown pointer reaches, kept by an opaque call, or converted to an
+  /// integer. Comparing the address, or storing a pointer into fresh memory
+  /// that only this parameter's memory holds, is not a capture. A captured
+  /// parameter's reachable memory may later change through other pointers.
   std::vector<bool> m_Captured;
   /// Calls that are reachable and have no body or summary. An indirect call
-  /// is "<indirect>" and inline assembly is "<asm>".
+  /// is "<indirect>" and inline assembly is "<asm>". A reachable summary
+  /// marked incomplete contributes the opaque calls of its own body.
   std::vector<std::string> m_Opaque;
-  /// m_Other, m_Captured and m_Params when every opaque call is trusted to
-  /// access only memory through its arguments, to keep no copy of them, and
-  /// not to write through a const reference, a pointer to const, or `this`
-  /// of a const method. They show what the visible code does. Equal to the
-  /// untrusted fields when m_Opaque is empty.
+  /// m_Other, m_Captured, m_Params, m_ParamsDirect and m_ParamsReachable
+  /// when every opaque call is trusted to access only memory through its
+  /// arguments, to keep no copy of them, and not to write through a const
+  /// reference, a pointer to const, or `this` of a const method. They show
+  /// what the visible code does. Equal to the untrusted fields when m_Opaque
+  /// is empty.
   ModRef m_TrustedOther = ModRef::ReadWrite;
   std::vector<bool> m_TrustedCaptured;
   std::vector<ModRef> m_TrustedParams;
+  std::vector<ModRef> m_TrustedParamsDirect;
+  std::vector<ModRef> m_TrustedParamsReachable;
   /// The opaque calls whose signature does not bound m_TrustedParams: an
   /// indirect call, inline assembly, or a declaration whose parameters do
   /// not map one to one to the IR parameters (a class passed by value).
