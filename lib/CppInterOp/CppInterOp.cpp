@@ -4728,7 +4728,11 @@ void make_narg_call_with_return(compat::Interpreter& I, const FunctionDecl* FD,
   //
   if (const auto* CD = dyn_cast<CXXConstructorDecl>(FD)) {
     if (N <= 1 && llvm::isa<UsingShadowDecl>(FD)) {
+#if CLANG_VERSION_MAJOR >= 24
+      auto SpecMemKind = CD->getSpecialMemberKind();
+#else
       auto SpecMemKind = I.getCI()->getSema().getSpecialMember(CD);
+#endif
       if ((N == 0 && SpecMemKind == CXXSpecialMemberKind::DefaultConstructor) ||
           (N == 1 && (SpecMemKind == CXXSpecialMemberKind::CopyConstructor ||
                       SpecMemKind == CXXSpecialMemberKind::MoveConstructor))) {

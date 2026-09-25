@@ -397,7 +397,11 @@ inline bool detectNVPTXArch(std::string& Arch) {
   if (cuInit(0) || cuDeviceGet(&dev, 0) ||
       cuDeviceGetAttribute(&maj, /*MAJOR*/ 75, dev) ||
       cuDeviceGetAttribute(&min, /*MINOR*/ 76, dev)) {
+#if CLANG_VERSION_MAJOR >= 24
+    Arch = clang::OffloadArchToString(clang::OffloadArch::CudaDefault());
+#else
     Arch = clang::OffloadArchToString(clang::OffloadArch::CudaDefault);
+#endif
     return true;
   }
   Arch = "sm_" + std::to_string(maj) + std::to_string(min);
