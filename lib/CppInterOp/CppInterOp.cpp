@@ -189,15 +189,16 @@ static bool SkipShutDown = false;
 /// Constructed as a function-local static AFTER sInterpreters, so its dtor
 /// fires FIRST (reverse-of-construction); llvm_shutdown then drains the
 /// ManagedStatic registry, including sInterpreters, deterministically.
-/// The llvm_shutdown call itself is gated on LLVM 24+. Waiting for
-/// Platform::lookupResolvedInitSymbols (llvm/llvm-project#196874) which makes
-/// ~Interpreter's JIT deinit skip lazy materialization. On older LLVM
-/// the same chain SEGFAULTs in cleanUp against destroyed function-local
-/// statics, so the dtor is a no-op and sInterpreters leaks instead.
+/// The llvm_shutdown call itself is gated on LLVM 25+. Waiting for
+/// Platform::lookupResolvedInitSymbols (llvm/llvm-project#196874, not in
+/// LLVM 24 main) which makes ~Interpreter's JIT deinit skip lazy
+/// materialization. On older LLVM the same chain crashes in codegen or
+/// cleanUp against destroyed statics, so the dtor is a no-op and
+/// sInterpreters leaks instead.
 struct InterpreterShutdown {
   ~InterpreterShutdown() {
     if (!SkipShutDown) {
-#if LLVM_VERSION_MAJOR > 23
+#if LLVM_VERSION_MAJOR > 24
       llvm::llvm_shutdown();
 #endif
     }
