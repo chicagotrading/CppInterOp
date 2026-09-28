@@ -48,6 +48,7 @@ add_cppinterop_unittest(CppInterOpTests
   HandleTypesTest.cpp
   InterpreterTest.cpp
   JitTest.cpp
+  MemoryEffectsTest.cpp
   ResultTest.cpp
   ScopeReflectionTest.cpp
   TypeReflectionTest.cpp
