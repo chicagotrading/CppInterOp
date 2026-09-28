@@ -18,6 +18,7 @@
 #include "Compatibility.h"
 #include "ErrorInternal.h"
 #include "InterpreterInfo.h"
+#include "MemoryEffects.h"
 #include "Sins.h" // for access to private members
 #include "Tracing.h"
 
@@ -6539,6 +6540,80 @@ int Process(const char* code) {
   if (getInterp().process(code) != compat::Interpreter::kSuccess)
     return INTEROP_RETURN(1);
   return INTEROP_RETURN(Trap.hasErrorOccurred() ? 1 : 0);
+}
+
+#ifndef CPPINTEROP_USE_CLING
+// Declare can register more PTUs than the input (an empty unit that creates
+// the executor), so a rewind counts them instead of assuming one.
+ALLOW_ACCESS(clang::Interpreter, PTUs,
+             std::list<clang::PartialTranslationUnit>);
+
+// clang's Undo removes C++ names from the DeclContext lookup only;
+// unqualified lookup still finds them through the TU scope.
+static void CollectScopeNames(clang::Sema& S, clang::DeclContext* DC,
+                              llvm::SmallVectorImpl<clang::NamedDecl*>& Out) {
+  for (clang::Decl* D : DC->decls()) {
+    if (auto* LS = llvm::dyn_cast<clang::LinkageSpecDecl>(D))
+      CollectScopeNames(S, LS, Out);
+    else if (auto* ND = llvm::dyn_cast<clang::NamedDecl>(D))
+      if (!ND->getDeclName().isEmpty() && S.TUScope->isDeclScope(ND))
+        Out.push_back(ND);
+  }
+}
+#endif
+
+std::vector<MemoryEffects>
+GetFunctionsMemoryEffects(const char* code,
+                          const std::vector<std::string>& names, bool rewind) {
+  INTEROP_TRACE(code, names, rewind);
+  std::vector<MemoryEffects> Out(names.size());
+#ifndef CPPINTEROP_USE_CLING
+  compat::Interpreter& I = getInterp();
+  clang::Interpreter& Inner = I;
+  auto& PTUs = ACCESS(Inner, PTUs);
+  const size_t Before = PTUs.size();
+  bool Ok = false;
+  {
+    clang::DiagnosticsEngine& Diag = I.getSema().getDiagnostics();
+    clang::DiagnosticErrorTrap Trap(Diag);
+    auto Analyze = [&](const llvm::Module& M) {
+      CppInternal::AnalyzeMemoryEffects(M, names, Out);
+    };
+    Ok = I.declare(code, /*PTU=*/nullptr, Analyze) ==
+             compat::Interpreter::kSuccess &&
+         !Trap.hasErrorOccurred();
+  }
+  if (!Ok)
+    Out.assign(names.size(), MemoryEffects{});
+  const size_t Added = PTUs.size() - Before;
+  if (rewind && Added) {
+    clang::Sema& S = I.getSema();
+    llvm::SmallVector<clang::NamedDecl*, 8> Names;
+    if (S.getLangOpts().CPlusPlus && S.TUScope)
+      for (auto It = std::next(PTUs.begin(), Before); It != PTUs.end(); ++It)
+        CollectScopeNames(S, It->TUPart, Names);
+    if (I.undo(static_cast<unsigned>(Added)) != compat::Interpreter::kSuccess) {
+      Out.assign(names.size(), MemoryEffects{});
+    } else {
+      for (clang::NamedDecl* ND : Names) {
+        S.TUScope->RemoveDecl(ND);
+        S.IdResolver.RemoveDecl(ND);
+      }
+    }
+  }
+#endif
+  return INTEROP_RETURN(Out);
+}
+
+MemoryEffects GetFunctionMemoryEffects(const char* code, const char* name) {
+  INTEROP_TRACE(code, name);
+  return INTEROP_RETURN(
+      GetFunctionsMemoryEffects(code, {name}, /*rewind=*/false).front());
+}
+
+int LoadMemoryEffectsSummaries(const char* text) {
+  INTEROP_TRACE(text);
+  return INTEROP_RETURN(CppInternal::LoadMemoryEffectsSummaries(text));
 }
 
 // Classify the QualType of a successfully-evaluated value into a
