@@ -1513,6 +1513,46 @@ def IsDeallocator : CppInterOpAPI {
   ];
 }
 
+def GetFunctionMemoryEffects : CppInterOpAPI {
+  let Doc = [{Declares \c code as Declare does, and returns the memory effects
+that LLVM proves for the function \c name (a C-linkage name) after it
+optimizes a copy of the code's module. Nothing in the code is executed.}];
+  // MemoryEffects holds C++ containers; no mechanical C mapping.
+  let NoCWrapper = true;
+  let ReturnType = "MemoryEffects";
+  let Args = [
+    Arg<"const char*", "code">,
+    Arg<"const char*", "name">
+  ];
+}
+
+def GetFunctionsMemoryEffects : CppInterOpAPI {
+  let Doc = [{Declares \c code as Declare does, and returns, per name in
+\c names (C-linkage names), the memory effects that LLVM proves for that
+function after it optimizes one copy of the code's module. When \c rewind
+is true, the code is undone after the analysis, so it leaves no declaration
+and no JIT code.}];
+  // MemoryEffects holds C++ containers; no mechanical C mapping.
+  let NoCWrapper = true;
+  let ReturnType = "std::vector<MemoryEffects>";
+  let Args = [
+    Arg<"const char*", "code">,
+    Arg<"const std::vector<std::string>&", "names">,
+    Arg<"bool", "rewind">
+  ];
+}
+
+def LoadMemoryEffectsSummaries : CppInterOpAPI {
+  let Doc = [{Reads memory-effect summaries of functions whose bodies
+GetFunctionMemoryEffects cannot see (a prebuilt library), in the format of
+the cppinterop-effects tool. The analysis applies them to matching
+declarations.
+\returns the number of summaries read, or -1 when \c text is malformed or
+was written by a different LLVM major version.}];
+  let ReturnType = "int";
+  let Args = [Arg<"const char*", "text">];
+}
+
 def GetFunctionSignature : CppInterOpAPI {
   let Doc = [{\\returns a stringified version of a given function signature in the
 form: void N::f(int i, double d, long l = 0, char ch = 'a').}];
