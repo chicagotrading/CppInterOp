@@ -3812,22 +3812,22 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
   std::vector<Decl*> Decls;
   GetAllTopLevelDecls("void canary(double x = 3.14);", Decls);
 
-  // Before clang 24 the raw printer expands floats to maximum precision;
+  // Before clang 25 the raw printer expands floats to maximum precision;
   // UDL and invalid-range defaults hit it. llvm/llvm-project#218471 fixes
-  // the printer for clang 24. Each branch failing is a signal: see its
-  // message.
+  // the printer (not in clang 24 main). Each branch failing is a signal:
+  // see its message.
   const auto* PD = cast<FunctionDecl>(Decls[0])->getParamDecl(0);
   std::string Raw;
   llvm::raw_string_ostream OS(Raw);
   PD->getDefaultArg()->printPretty(OS, nullptr, PrintingPolicy(LangOptions()));
-#if CLANG_VERSION_MAJOR < 24
+#if CLANG_VERSION_MAJOR < 25
   EXPECT_EQ(Raw, "3.1400000000000001")
       << "clang's pretty-printer round-trips floating literals earlier than "
          "expected (llvm/llvm-project#218471 cherry-picked?). Re-check UDL "
          "and invalid-range defaults, then move this guard.";
 #else
   EXPECT_EQ(Raw, "3.14")
-      << "llvm/llvm-project#218471 did not land in clang 24. Raise the "
+      << "llvm/llvm-project#218471 did not land in clang 25. Raise the "
          "version in this guard.";
 #endif
 #endif // EMSCRIPTEN
