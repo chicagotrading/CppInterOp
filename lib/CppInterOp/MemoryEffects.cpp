@@ -1142,6 +1142,12 @@ OpaqueClosure(const llvm::Module& M) {
       }
     }
   }
+  // The fixpoint visits functions in pointer order; sorted names keep the
+  // tables reproducible.
+  for (auto& Entry : Out) {
+    llvm::sort(Entry.second.Opaque);
+    llvm::sort(Entry.second.Unbounded);
+  }
   return Out;
 }
 
