@@ -574,6 +574,42 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
   EXPECT_EQ(CppInternal::LoadMemoryEffectsSummaries(Table), 4);
 }
 
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummarizerSortsOpaqueNames) {
+  // The closure visits callees in pointer order; the table must not.
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare void @zeta(ptr)
+    declare void @alpha(ptr)
+    define void @me_ord_b(ptr %p) {
+      call void @zeta(ptr %p)
+      ret void
+    }
+    define void @me_ord_a(ptr %p) {
+      call void @alpha(ptr %p)
+      ret void
+    }
+    define void @me_ord_top(ptr %p) {
+      call void @me_ord_b(ptr %p)
+      call void @me_ord_a(ptr %p)
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  llvm::SmallVector<llvm::StringRef, 8> Lines;
+  llvm::StringRef(Table).split(Lines, '\n', -1, false);
+  bool Found = false;
+  for (llvm::StringRef Line : Lines) {
+    if (!Line.starts_with("me_ord_top\t"))
+      continue;
+    Found = true;
+    EXPECT_TRUE(Line.ends_with("\t!alpha\t!zeta")) << Line.str();
+  }
+  EXPECT_TRUE(Found) << Table;
+}
+
 // The out-of-line hash of the prebuilt libstdc++ sits behind a noexcept
 // std::hash: with its summary, the terminate path of the invoke adds no
 // effect.
