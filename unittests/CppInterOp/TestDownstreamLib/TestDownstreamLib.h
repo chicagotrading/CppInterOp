@@ -19,4 +19,9 @@ TESTDOWNSTREAM_EXPORT void downstream_link_probe(Cpp::JitCall* JC);
 /// failed, 2/3/4=corresponding slot still null).
 TESTDOWNSTREAM_EXPORT int downstream_verify_trace_slots(const char* libpath);
 
+/// Address of a Dispatch.h inline wrapper. Taking the address forces an
+/// out-of-line copy at any -O level; the loader checks that this copy is
+/// not exported from the DSO.
+TESTDOWNSTREAM_EXPORT void* downstream_wrapper_address();
+
 #endif // UNITTESTS_CPPINTEROP_TESTDOWNSTREAMLIB_TESTDOWNSTREAMLIB_H
