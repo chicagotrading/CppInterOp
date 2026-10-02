@@ -31,3 +31,7 @@ int downstream_verify_trace_slots(const char* libpath) {
     return 4;
   return 0;
 }
+
+void* downstream_wrapper_address() {
+  return reinterpret_cast<void*>(&Cpp::GetInterpreter);
+}
