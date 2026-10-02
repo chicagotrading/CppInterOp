@@ -36,6 +36,23 @@ int main(int argc, char** argv) {
                  lastErr());
     return 1;
   }
+#ifndef _WIN32
+  // The Dispatch.h inline Cpp::* wrappers must stay hidden. An exported copy
+  // interposes libclangCppInterOp's own dispatch table under RTLD_GLOBAL, and
+  // every Cpp:: call then recurses into itself. downstream_wrapper_address()
+  // forces an out-of-line copy, so the check holds at any -O level.
+  if (!findSym(h, "downstream_wrapper_address")) {
+    std::fprintf(stderr, "missing downstream_wrapper_address: %s\n", lastErr());
+    closeLib(h);
+    return 5;
+  }
+  if (findSym(h, "_ZN3Cpp14GetInterpreterEv")) {
+    std::fprintf(stderr, "Cpp::GetInterpreter is exported from %s\n",
+                 TEST_DOWNSTREAM_LIB_PATH);
+    closeLib(h);
+    return 6;
+  }
+#endif
   // argv[1] is the libclangCppInterOp path; verify slot population.
   int rc = 0;
   if (argc > 1) {
