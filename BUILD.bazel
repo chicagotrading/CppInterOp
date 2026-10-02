@@ -333,6 +333,7 @@ cppinterop_cc_test(
         "unittests/CppInterOp/CUDATest.cpp",
         "unittests/CppInterOp/CommentReflectionTest.cpp",
         "unittests/CppInterOp/CppInterOpThunksTest.cpp",
+        "unittests/CppInterOp/DiagnosticTest.cpp",
         "unittests/CppInterOp/EnumReflectionTest.cpp",
         "unittests/CppInterOp/FunctionReflectionTest.cpp",
         "unittests/CppInterOp/HandleTypesTest.cpp",
