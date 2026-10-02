@@ -17,6 +17,7 @@
 #include "gtest/gtest.h"
 
 #include <array>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -932,6 +933,16 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, FunctionReflection_IsAllocator) {
       "-I" + std::string(CPPINTEROP_CLING_INCLUDE_DIR);
   interpreter_args.push_back(cling_include_flag.c_str());
 #endif
+  // Implicit modules write a .pcm cache; clang defaults it under $HOME/.cache,
+  // which a hermetic sandbox (e.g. Bazel) makes read-only. When the runner
+  // provides a writable scratch dir (Bazel sets $TEST_TMPDIR), send the cache
+  // there. Absent it (e.g. CMake/ctest), keep clang's default.
+  std::string modules_cache_flag;
+  if (const char* test_tmpdir = std::getenv("TEST_TMPDIR")) {
+    modules_cache_flag =
+        "-fmodules-cache-path=" + std::string(test_tmpdir) + "/module-cache";
+    interpreter_args.push_back(modules_cache_flag.c_str());
+  }
   TestFixture::CreateInterpreter(interpreter_args);
   code = R"(
   #include "TestHeader.h"
