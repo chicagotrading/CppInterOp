@@ -722,6 +722,17 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_DeclareSilent) {
   EXPECT_EQ(0, Cpp::Declare("int y = 123;", /*silent=*/false));
 }
 
+TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_DeclareSilentNoStderr) {
+#ifdef CPPINTEROP_USE_CLING
+  GTEST_SKIP() << "cling has its own declare path";
+#endif
+  TestFixture::CreateInterpreter();
+
+  testing::internal::CaptureStderr();
+  EXPECT_NE(0, Cpp::Declare("int bad = undeclared_name;", /*silent=*/true));
+  EXPECT_EQ("", testing::internal::GetCapturedStderr());
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_DeclareReportsParseErrors) {
 #ifdef _WIN32
   // The non-silent parse-error case emits an `error: expected expression`

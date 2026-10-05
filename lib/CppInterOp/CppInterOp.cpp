@@ -6294,7 +6294,12 @@ static int Declare(compat::Interpreter& I, const char* code, bool silent) {
   clang::DiagnosticErrorTrap Trap(Diag);
   if (silent) {
     clangSilent diagSuppr(Diag);
+#ifdef CPPINTEROP_USE_CLING
     auto result = I.declare(code);
+#else
+    auto result = I.declare(code, /*PTU=*/nullptr, /*OnModule=*/{},
+                            /*silent=*/true);
+#endif
     if (Trap.hasErrorOccurred())
       return 1;
     return result;
