@@ -543,9 +543,17 @@ inline llvm::CodeModel::Model getJITCodeModelFromEnv() {
 /// fail. The next reservation can land far from the first, so a PC32 delta
 /// can still overflow after the JIT emits more than `SlabBytes` of code.
 ///
-/// Returns nullptr on failure, which keeps the default JIT configuration.
+/// Returns nullptr on failure or before LLVM 23, which keeps the default JIT
+/// configuration.
 inline std::unique_ptr<llvm::orc::LLJITBuilder>
 makeSlabJITBuilder(size_t SlabBytes) {
+#if LLVM_VERSION_MAJOR < 23
+  // LLJITBuilder::setMemoryManagerCreator is new in LLVM 23.
+  (void)SlabBytes;
+  llvm::errs() << "[CreateClangInterpreter]: CPPINTEROP_JIT_SLAB_MB needs "
+                  "LLVM 23 or later. The JIT slab stays off.\n";
+  return nullptr;
+#else
   auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
   if (!JTMB) {
     llvm::logAllUnhandledErrors(JTMB.takeError(), llvm::errs(),
@@ -585,6 +593,7 @@ makeSlabJITBuilder(size_t SlabBytes) {
   });
 #endif
   return JB;
+#endif // LLVM_VERSION_MAJOR < 23
 }
 #endif // LLVM_VERSION_MAJOR > 21
 
@@ -615,12 +624,7 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
   clang::IncrementalCompilerBuilder CB;
   CB.SetCompilerArgs(CompilerArgs);
 
-#if LLVM_VERSION_MAJOR > 21 && !defined(_WIN32)
-  bool outOfProcess = false;
-  const bool oopRequested =
-      std::any_of(args.begin(), args.end(), [](const char* arg) {
-        return llvm::StringRef(arg).trim() == "--use-oop-jit";
-      });
+#if LLVM_VERSION_MAJOR > 21
   // The IncrementalExecutorBuilder must outlive the IncrementalCompiler
   // it gets attached to, so it's a unique_ptr at function scope.
   auto ExecutorConfig = std::make_unique<clang::IncrementalExecutorBuilder>();
@@ -634,6 +638,12 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
   // distance has no bound and the field overflows after enough modules. The
   // large code model selects sdata8 instead.
   ExecutorConfig->CM = llvm::CodeModel::Large;
+#if !defined(_WIN32)
+  bool outOfProcess = false;
+  const bool oopRequested =
+      std::any_of(args.begin(), args.end(), [](const char* arg) {
+        return llvm::StringRef(arg).trim() == "--use-oop-jit";
+      });
   if (oopRequested) {
     ExecutorConfig->IsOutOfProcess = true;
     if (configureBundledOOPRuntime(*ExecutorConfig)) {
@@ -649,6 +659,7 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
       ExecutorConfig->IsOutOfProcess = false;
     }
   }
+#endif
   // Optional hardening, off by default. See makeSlabJITBuilder(). A JITBuilder
   // set here replaces the out-of-process one, so keep it in-process only.
   if (!ExecutorConfig->IsOutOfProcess)
@@ -685,7 +696,8 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
   if (CudaEnabled)
     DeviceCI->LoadRequestedPlugins();
 
-#if LLVM_VERSION_MAJOR > 21 && !defined(_WIN32)
+#if LLVM_VERSION_MAJOR > 21
+#if !defined(_WIN32)
   if (outOfProcess) {
     // OrcRuntimePath and OOPExecutor were populated by
     // configureBundledOOPRuntime() above; UpdateOrcRuntimePathCB was
@@ -701,6 +713,7 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
       setvbuf(fdopen(stderr_fd, "w+"), nullptr, _IONBF, 0);
     };
   }
+#endif
   // Upstream applies CM only when the builder holds no JITBuilder
   // (IncrementalExecutor.cpp, the `if (!JITBuilder)` gate). The
   // out-of-process path sets JITBuilder first, so CM is a no-op there, and
