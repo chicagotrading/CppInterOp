@@ -695,7 +695,9 @@ private:
     Owner W;
     if (D.unowned())
       W.K = Owner::Escaped;
-    for (unsigned I : D.params().set_bits())
+    // set_bits() refers to its vector; a temporary dies before the loop body.
+    const llvm::SmallBitVector Params = D.params();
+    for (unsigned I : Params.set_bits())
       W.join(Owner{Owner::Param, I});
     for (const llvm::Value* A : D.Objs)
       W.join(Owners[A]);
@@ -857,9 +859,11 @@ private:
   // A pointer into the memory of \p Src's parameters is copied into memory
   // of origin \p Dst (condition 2).
   void captureByCopy(const Origin& Src, const Origin& Dst) {
-    for (unsigned I : Src.params().set_bits()) {
+    const llvm::SmallBitVector SrcParams = Src.params();
+    const llvm::SmallBitVector DstParams = Dst.params();
+    for (unsigned I : SrcParams.set_bits()) {
       bool Own = !Dst.unowned();
-      for (unsigned J : Dst.params().set_bits())
+      for (unsigned J : DstParams.set_bits())
         Own &= J == I;
       for (const llvm::Value* A : Dst.Objs) {
         Owner W = Owners[A];
