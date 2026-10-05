@@ -6521,7 +6521,11 @@ static int Declare(compat::Interpreter& I, const char* code, bool silent) {
   std::optional<clangSilent> diagSuppr;
   if (silent)
     diagSuppr.emplace(Diag);
+#ifdef CPPINTEROP_USE_CLING
   auto result = I.declare(code);
+#else
+  auto result = I.declare(code, /*PTU=*/nullptr, /*OnModule=*/{}, silent);
+#endif
   return Trap.hasErrorOccurred() ? 1 : result;
 }
 

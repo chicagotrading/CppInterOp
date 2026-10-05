@@ -588,24 +588,30 @@ public:
   CompilationResult
   declare(const std::string& input,
           clang::PartialTranslationUnit** PTU = nullptr,
-          llvm::function_ref<void(const llvm::Module&)> OnModule = {}) {
+          llvm::function_ref<void(const llvm::Module&)> OnModule = {},
+          bool silent = false) {
     return process(input, /*Value=*/nullptr, PTU,
-                   /*disableValuePrinting=*/false, OnModule);
+                   /*disableValuePrinting=*/false, OnModule, silent);
   }
 
   ///\brief Maybe transform the input line to implement cint command line
   /// semantics (declarations are global) and compile to produce a module.
   ///
   /// \p OnModule sees the module after the JIT rewrites and before it runs.
+  /// \p silent drops the parse-failure log for callers that mute diagnostics.
   CompilationResult
   process(const std::string& input, clang::Value* V = 0,
           clang::PartialTranslationUnit** PTU = nullptr,
           bool disableValuePrinting = false,
-          llvm::function_ref<void(const llvm::Module&)> OnModule = {}) {
+          llvm::function_ref<void(const llvm::Module&)> OnModule = {},
+          bool silent = false) {
     auto PTUOrErr = Parse(input);
     if (!PTUOrErr) {
-      llvm::logAllUnhandledErrors(PTUOrErr.takeError(), llvm::errs(),
-                                  "Failed to parse via ::process:");
+      if (silent)
+        llvm::consumeError(PTUOrErr.takeError());
+      else
+        llvm::logAllUnhandledErrors(PTUOrErr.takeError(), llvm::errs(),
+                                    "Failed to parse via ::process:");
       return Interpreter::kFailure;
     }
 
