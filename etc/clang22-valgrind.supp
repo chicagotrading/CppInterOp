@@ -217,3 +217,9 @@
    fun:*TargetLowering*LowerCallTo*
    ...
 }
+{
+   llvm/llvm-project#194147: Sema::BuildExprRequirement
+   Memcheck:Cond
+   fun:_ZN5clang4Sema20BuildExprRequirementEPNS_4ExprEbNS_14SourceLocationENS_8concepts15ExprRequirement21ReturnTypeRequirementE
+   ...
+}
