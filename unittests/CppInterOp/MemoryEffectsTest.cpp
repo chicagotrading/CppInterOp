@@ -19,6 +19,27 @@
 using namespace TestUtils;
 using Cpp::ModRef;
 
+#ifdef CPPINTEROP_USE_CLING
+#define SKIP_WITHOUT_MEMORY_EFFECTS()                                          \
+  GTEST_SKIP() << "GetFunctionsMemoryEffects is clang-repl only; with cling "  \
+                  "it returns invalid results"
+#else
+#define SKIP_WITHOUT_MEMORY_EFFECTS() (void)0
+#endif
+
+#ifdef _WIN32
+#define SKIP_ON_MSVC_ABI(Why)                                                  \
+  GTEST_SKIP() << "expects the Itanium C++ ABI: " << Why
+#else
+#define SKIP_ON_MSVC_ABI(Why) (void)0
+#endif
+
+#ifdef _LIBCPP_VERSION
+#define SKIP_ON_LIBCXX(Why) GTEST_SKIP() << "expects libstdc++: " << Why
+#else
+#define SKIP_ON_LIBCXX(Why) (void)0
+#endif
+
 namespace {
 bool Mentions(const Cpp::MemoryEffects& ME, const std::string& Name) {
   return std::any_of(
@@ -32,6 +53,7 @@ bool Writes(ModRef MR) {
 } // namespace
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PureRead) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
     struct Box { int v; };
@@ -49,6 +71,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PureRead) {
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WritesOnlyTheWrittenParameter) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
     inline void bump(int& x) { x += 1; }
@@ -63,6 +86,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WritesOnlyTheWrittenParameter) {
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MutableMemberIsAWrite) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
     struct Counted { mutable int hits = 0; int get() const { return ++hits; } };
@@ -79,6 +103,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MutableMemberIsAWrite) {
 
 TYPED_TEST(CPPINTEROP_TEST_MODE,
            MemoryEffects_HandlePointeeWriteIsReachableFromTheParameter) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
     struct Impl { double data[4]; };
@@ -104,6 +129,11 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
 // A container's heap is memory reachable from the parameter that owns it,
 // not other memory.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ContainerHeapIsReachable) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("libc++ inlines its throws around out-of-line exception "
+                 "constructors, which are opaque calls");
   TestFixture::CreateInterpreter();
   ASSERT_EQ(Cpp::Declare("#include <vector>"), 0);
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
@@ -123,6 +153,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ContainerHeapIsReachable) {
 
 // A ring buffer over a vector, as a sliding-window state uses it.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RingBufferOverAVector) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   ASSERT_EQ(Cpp::Declare("#include <vector>\n#include <utility>"), 0);
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
@@ -157,6 +188,11 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RingBufferOverAVector) {
 
 // Comparing a parameter's address keeps no pointer and writes nothing.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressCompareIsNotACapture) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("libc++'s erase frees the node through a unique_ptr "
+                 "temporary, and a load from a local is other memory");
   TestFixture::CreateInterpreter();
   ASSERT_EQ(Cpp::Declare("#include <unordered_set>"), 0);
   std::vector<Cpp::MemoryEffects> MEs =
@@ -198,6 +234,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressCompareIsNotACapture) {
 // the function writes.
 TYPED_TEST(CPPINTEROP_TEST_MODE,
            MemoryEffects_MutableWriteNextToAWrittenParameter) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
     struct Counted { mutable int hits = 0; int get() const { return ++hits; } };
@@ -215,6 +252,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
 // written handle, the read from the other, and a pointer that may come from
 // either counts for both.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TwoHandlesToOneObject) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   std::vector<Cpp::MemoryEffects> MEs =
       Cpp::GetFunctionsMemoryEffects(R"(
@@ -249,6 +287,9 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TwoHandlesToOneObject) {
 // global keeps is a capture; one that a fresh node of the same parameter
 // keeps is not.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CaptureIsAStoreOutsideTheOwner) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
   TestFixture::CreateInterpreter();
   std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
       R"(
@@ -279,6 +320,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CaptureIsAStoreOutsideTheOwner) {
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_GlobalWriteIsOtherMemory) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
     int me_counter = 0;
@@ -293,6 +335,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_GlobalWriteIsOtherMemory) {
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ExternalCallIsOpaque) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
     int me_external(const int& x);
@@ -305,6 +348,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ExternalCallIsOpaque) {
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IndirectCallIsOpaque) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
     struct Callback { int (*fn)(int); };
@@ -316,6 +360,9 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IndirectCallIsOpaque) {
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ThrowPathIsNotAnEffect) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
   TestFixture::CreateInterpreter();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
     inline int checked(const int* p, int i) {
@@ -335,6 +382,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ThrowPathIsNotAnEffect) {
 // An inline function that an earlier input already emitted must still be
 // analyzed through its body.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_InlineBodyFromEarlierInput) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   ASSERT_EQ(Cpp::Declare(R"(
     inline void me_poke(int& x) { x = 7; }
@@ -355,10 +403,16 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_InlineBodyFromEarlierInput) {
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_InvalidCode) {
   TestFixture::CreateInterpreter();
+  // MSBuild fails a test step that prints a "file(l,c): error X:" line.
+  testing::internal::CaptureStderr();
   Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(
       R"(extern "C" int me_bad(int* p) { return no_such_function(*p); })",
       "me_bad");
+  std::string Err = testing::internal::GetCapturedStderr();
   EXPECT_FALSE(ME.m_Valid);
+#ifndef CPPINTEROP_USE_CLING
+  EXPECT_NE(Err.find("no_such_function"), std::string::npos) << Err;
+#endif
   ME = Cpp::GetFunctionMemoryEffects(
       R"(extern "C" int me_other(int) { return 0; })", "me_missing");
   EXPECT_FALSE(ME.m_Valid);
@@ -368,13 +422,15 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_InvalidCode) {
 // compared or subtracted is not.
 TYPED_TEST(CPPINTEROP_TEST_MODE,
            MemoryEffects_AddressAsIntegerCapturesOnlyWhenKept) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   std::vector<Cpp::MemoryEffects> MEs =
       Cpp::GetFunctionsMemoryEffects(R"(
-    unsigned long me_int_global = 0;
-    extern "C" void me_int_escape(const int* x) { me_int_global = (unsigned long)x; }
+    using me_uptr = __UINTPTR_TYPE__;
+    me_uptr me_int_global = 0;
+    extern "C" void me_int_escape(const int* x) { me_int_global = (me_uptr)x; }
     extern "C" int me_int_compare(const int* a, const int* b) {
-      return (unsigned long)a < (unsigned long)b ? (int)((unsigned long)b - (unsigned long)a) : 0;
+      return (me_uptr)a < (me_uptr)b ? (int)((me_uptr)b - (me_uptr)a) : 0;
     }
   )",
                                      {"me_int_escape", "me_int_compare"},
@@ -411,6 +467,8 @@ std::string Anything() {
 // A summary from a build-time table stands in for a body the module lacks.
 TYPED_TEST(CPPINTEROP_TEST_MODE,
            MemoryEffects_SummaryMakesADeclarationPrecise) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
   TestFixture::CreateInterpreter();
   std::string Table =
       SummaryHeader() + "_Z10me_summaryRKi\t" + ReadsItsParameter() + "\t.\n";
@@ -458,6 +516,8 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryTableIsValidated) {
 // An incomplete summary brings the opaque calls of its body: the untrusted
 // fields include them, the trusted fields bound them by their signatures.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IncompleteSummaryIsOpaque) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
   TestFixture::CreateInterpreter();
   std::string Table = SummaryHeader() + "_Z13me_incompleteRKi\t" + Anything() +
                       "\ti\t" + ReadsItsParameter() +
@@ -492,6 +552,8 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IncompleteSummaryIsOpaque) {
 
 // A complete summary is a proof: a write it records stays under trust.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CompleteSummaryBeatsTrust) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
   TestFixture::CreateInterpreter();
   std::string Effects = llvm::utohexstr(
       llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::ModRef).toIntValue());
@@ -615,6 +677,13 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummarizerSortsOpaqueNames) {
 // effect.
 TYPED_TEST(CPPINTEROP_TEST_MODE,
            MemoryEffects_NoexceptTerminatePathIsNotAnEffect) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+#if defined(__aarch64__) || defined(_M_ARM64)
+  GTEST_SKIP() << "AArch64 returns the one-pointer iterator as i64; the "
+                  "analysis loses its origin through inttoptr";
+#endif
+  SKIP_ON_LIBCXX("libc++ can hash with an out-of-line std::__hash_memory; "
+                 "the test has a summary only for libstdc++'s _Hash_bytes");
   // std::string_view: the extern template of std::string hides its bodies.
   TestFixture::CreateInterpreter({"-std=c++17"});
   std::string Hash = llvm::utohexstr(
@@ -644,6 +713,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SeveralFunctionsOfOneUnit) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   std::vector<Cpp::MemoryEffects> MEs =
       Cpp::GetFunctionsMemoryEffects(R"(
@@ -666,6 +736,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SeveralFunctionsOfOneUnit) {
 // The rewind undoes exactly the probe: the unit before it stays, and one
 // Undo afterwards removes that unit.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewindUndoesExactlyTheProbe) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   ASSERT_EQ(Cpp::Declare("namespace me_before_ns { int kept = 3; }"), 0);
   std::vector<Cpp::MemoryEffects> MEs =
@@ -686,9 +757,13 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewindUndoesExactlyTheProbe) {
   EXPECT_FALSE(Cpp::GetNamed("me_before_ns"));
 }
 
+#if !defined(_WIN32)
+// The braces make this a definition; `extern "C" int x = 1;` warns in gcc.
+extern "C" {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-extern "C" __attribute__((visibility("default"))) __thread int me_native_tls =
-    1;
+__attribute__((visibility("default"))) __thread int me_native_tls = 1;
+}
+#endif
 
 // A native thread-local makes the probe's Declare add a second PTU (the
 // executor's empty unit); the rewind must undo both and nothing before them.
@@ -719,6 +794,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewindCountsInternalUnits) {
 
 // Code that a rewound probe emitted first is emitted again by a later unit.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewoundProbeLeavesCodeReusable) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   ASSERT_EQ(Cpp::Declare(R"(
     template <class T> T me_thrice(T x) { return x + x + x; }
@@ -741,13 +817,18 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewoundProbeLeavesCodeReusable) {
     }
   )"),
             0);
-  auto* Fn = reinterpret_cast<float (*)(float, int)>(
-      Cpp::GetFunctionAddress("me_after_probe"));
-  ASSERT_NE(Fn, nullptr);
+  void* Addr = Cpp::GetFunctionAddress("me_after_probe");
+  ASSERT_NE(Addr, nullptr);
+  // An out-of-process address is in the executor, not in this process.
+  if (TypeParam::isOutOfProcess)
+    return;
+  auto* Fn = reinterpret_cast<float (*)(float, int)>(Addr);
   EXPECT_EQ(Fn(1.0f, 2), 7.0f);
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CalleesNameTheSelectedOverload) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the test expects Itanium mangled and demangled names");
   TestFixture::CreateInterpreter();
   std::vector<Cpp::MemoryEffects> MEs =
       Cpp::GetFunctionsMemoryEffects(R"(
@@ -774,6 +855,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CalleesNameTheSelectedOverload) {
 
 // The trusted fields show what the visible code does around opaque calls.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedFieldsIgnoreOpaqueCalls) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
   std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
       R"(
@@ -821,6 +903,8 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedFieldsIgnoreOpaqueCalls) {
 
 // The trusted parameters follow the signature of each opaque call.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedParamsFollowSignatures) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the signature parser reads Itanium demangler output");
   TestFixture::CreateInterpreter();
   std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
       R"(
