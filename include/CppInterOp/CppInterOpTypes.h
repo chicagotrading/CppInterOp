@@ -475,11 +475,67 @@ enum class ValueKind : std::uint8_t {
 };
 
 /// What a function can do to one kind of memory.
-enum class ModRef : std::uint8_t {
+enum class ModRef {
   None = 0,
   Read = 1,
   Write = 2,
   ReadWrite = 3,
+};
+
+/// How a parameter passes its argument, as the mangled name of the function
+/// shows it.
+enum class ParamKind {
+  /// A kind that the name does not show: a pointer to member or to a
+  /// function, or a type that the demangler does not classify.
+  Unknown,
+  /// A builtin type by value.
+  Scalar,
+  /// A class or enum type by value.
+  Object,
+  /// A reference to const.
+  ConstReference,
+  /// A reference to non-const.
+  MutableReference,
+  /// A pointer to const.
+  ConstPointer,
+  /// A pointer to non-const.
+  MutablePointer,
+};
+
+/// The signature of a function, read from its mangled name.
+struct FunctionSignature {
+  /// False when the name is not the mangled name of a C++ function, for
+  /// example a C function.
+  bool Known = false;
+  /// The unqualified name, without template arguments.
+  std::string BaseName;
+  std::vector<ParamKind> Params;
+  bool ConstMethod = false;
+  bool Variadic = false;
+};
+
+/// How an opaque call reaches code with no body or summary.
+enum class OpaqueKind {
+  /// A direct call to a declaration.
+  Declaration,
+  /// A call through a function pointer or a virtual call.
+  Indirect,
+  /// Inline assembly.
+  InlineAsm,
+};
+
+/// A call that is reachable and has no body or summary.
+struct OpaqueCall {
+  OpaqueKind Kind = OpaqueKind::Declaration;
+  /// The mangled and demangled names of a declaration; empty otherwise.
+  std::string Mangled;
+  std::string Demangled;
+  /// The signature of a declaration.
+  FunctionSignature Signature;
+  /// Whether the signature bounds the Trusted fields. False for an indirect
+  /// call, inline assembly, and a declaration whose parameters do not map
+  /// one to one to the IR parameters (a class passed by value).
+  bool Bounded = false;
 };
 
 /// The memory effects that LLVM proves for a function from its optimized IR.
@@ -519,10 +575,9 @@ struct MemoryEffects {
   /// that only this parameter's memory holds, is not a capture. A captured
   /// parameter's reachable memory may later change through other pointers.
   std::vector<bool> Captured;
-  /// Calls that are reachable and have no body or summary. An indirect call
-  /// is "<indirect>" and inline assembly is "<asm>". A reachable summary
-  /// marked incomplete contributes the opaque calls of its own body.
-  std::vector<std::string> Opaque;
+  /// The calls that are reachable and have no body or summary. A reachable
+  /// summary marked incomplete contributes the opaque calls of its own body.
+  std::vector<OpaqueCall> Opaque;
   /// Other, Captured, Params, ParamsDirect and ParamsReachable
   /// when every opaque call is trusted to access only memory through its
   /// arguments, to keep no copy of them, and not to write through a const
@@ -534,15 +589,12 @@ struct MemoryEffects {
   std::vector<ModRef> TrustedParams;
   std::vector<ModRef> TrustedParamsDirect;
   std::vector<ModRef> TrustedParamsReachable;
-  /// The opaque calls whose signature does not bound TrustedParams: an
-  /// indirect call, inline assembly, or a declaration whose parameters do
-  /// not map one to one to the IR parameters (a class passed by value).
-  std::vector<std::string> Untrusted;
   /// A function that the analyzed function calls directly, before
   /// optimization inlines it.
   struct Callee {
     std::string Mangled;
     std::string Demangled;
+    FunctionSignature Signature;
   };
   /// The direct callees in the order of their first call: the selected
   /// overload, and also the constructors, destructors and conversions of the
