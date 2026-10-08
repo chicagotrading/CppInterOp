@@ -42,9 +42,27 @@ using Cpp::ModRef;
 
 namespace {
 bool Mentions(const Cpp::MemoryEffects& ME, const std::string& Name) {
-  return std::any_of(
-      ME.Opaque.begin(), ME.Opaque.end(),
-      [&](const std::string& O) { return O.find(Name) != std::string::npos; });
+  return std::any_of(ME.Opaque.begin(), ME.Opaque.end(),
+                     [&](const Cpp::OpaqueCall& O) {
+                       return O.Demangled.find(Name) != std::string::npos;
+                     });
+}
+
+bool HasOpaque(const Cpp::MemoryEffects& ME, Cpp::OpaqueKind Kind) {
+  return std::any_of(ME.Opaque.begin(), ME.Opaque.end(),
+                     [&](const Cpp::OpaqueCall& O) { return O.Kind == Kind; });
+}
+
+std::string OpaqueNames(const Cpp::MemoryEffects& ME) {
+  std::string Out;
+  for (const Cpp::OpaqueCall& O : ME.Opaque)
+    Out += (Out.empty() ? "" : ", ") + O.Demangled;
+  return Out;
+}
+
+bool AllBounded(const Cpp::MemoryEffects& ME) {
+  return std::all_of(ME.Opaque.begin(), ME.Opaque.end(),
+                     [](const Cpp::OpaqueCall& O) { return O.Bounded; });
 }
 
 bool Writes(ModRef MR) {
@@ -356,7 +374,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IndirectCallIsOpaque) {
   )",
                                                         "me_indirect");
   ASSERT_TRUE(ME.Valid);
-  EXPECT_TRUE(Mentions(ME, "<indirect>"));
+  EXPECT_TRUE(HasOpaque(ME, Cpp::OpaqueKind::Indirect));
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ThrowPathIsNotAnEffect) {
@@ -446,7 +464,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
 
 namespace {
 std::string SummaryHeader() {
-  return "# cppinterop-memory-effects v2 llvm " +
+  return "# cppinterop-memory-effects v1 llvm " +
          std::to_string(LLVM_VERSION_MAJOR) + "\n";
 }
 
@@ -487,16 +505,11 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryTableIsValidated) {
   TestFixture::CreateInterpreter();
+  // A table from another LLVM major version.
   EXPECT_EQ(
       Cpp::LoadMemoryEffectsSummaries(
-          "# cppinterop-memory-effects v2 llvm 0\nf\t0\t\t\t\t\tn\t.\t.\n"),
+          "# cppinterop-memory-effects v1 llvm 0\nf\t0\t\t\t\t\tn\t.\t.\n"),
       -1);
-  // A v1 table has no reachable-memory fields.
-  EXPECT_EQ(Cpp::LoadMemoryEffectsSummaries(
-                ("# cppinterop-memory-effects v1 llvm " +
-                 std::to_string(LLVM_VERSION_MAJOR) + "\nf\t0\t\n")
-                    .c_str()),
-            -1);
   EXPECT_EQ(Cpp::LoadMemoryEffectsSummaries(
                 (SummaryHeader() + "f\tzz\t\t\t\t\tn\t.\t.\n").c_str()),
             -1);
@@ -520,9 +533,9 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IncompleteSummaryIsOpaque) {
   SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
   TestFixture::CreateInterpreter();
   std::string Table = SummaryHeader() + "_Z13me_incompleteRKi\t" + Anything() +
-                      "\ti\t" + ReadsItsParameter() +
-                      "\tme_logger(int const&)\n" + "_Z12me_unboundedRKi\t" +
-                      Anything() + "\ti\t" + Anything() + "\t!me_sink\n";
+                      "\ti\t" + ReadsItsParameter() + "\t_Z9me_loggerRKi\n" +
+                      "_Z12me_unboundedRKi\t" + Anything() + "\ti\t" +
+                      Anything() + "\t!me_sink\n";
   ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 2);
   std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
       R"(
@@ -536,8 +549,14 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IncompleteSummaryIsOpaque) {
   ASSERT_EQ(MEs.size(), 2u);
   const Cpp::MemoryEffects& Inc = MEs[0];
   ASSERT_TRUE(Inc.Valid);
-  ASSERT_EQ(Inc.Opaque, std::vector<std::string>{"me_logger(int const&)"});
-  EXPECT_TRUE(Inc.Untrusted.empty());
+  ASSERT_EQ(Inc.Opaque.size(), 1u);
+  EXPECT_EQ(Inc.Opaque[0].Kind, Cpp::OpaqueKind::Declaration);
+  EXPECT_EQ(Inc.Opaque[0].Mangled, "_Z9me_loggerRKi");
+  EXPECT_EQ(Inc.Opaque[0].Demangled, "me_logger(int const&)");
+  EXPECT_TRUE(Inc.Opaque[0].Bounded);
+  ASSERT_TRUE(Inc.Opaque[0].Signature.Known);
+  EXPECT_EQ(Inc.Opaque[0].Signature.Params,
+            std::vector<Cpp::ParamKind>{Cpp::ParamKind::ConstReference});
   EXPECT_EQ(Inc.Other, ModRef::ReadWrite);
   EXPECT_EQ(Inc.TrustedOther, ModRef::None);
   EXPECT_EQ(Inc.TrustedParamsDirect[0], ModRef::Read);
@@ -545,8 +564,10 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IncompleteSummaryIsOpaque) {
 
   const Cpp::MemoryEffects& Unb = MEs[1];
   ASSERT_TRUE(Unb.Valid);
-  ASSERT_EQ(Unb.Opaque, std::vector<std::string>{"me_sink"});
-  EXPECT_EQ(Unb.Untrusted, std::vector<std::string>{"me_sink"});
+  ASSERT_EQ(Unb.Opaque.size(), 1u);
+  EXPECT_EQ(Unb.Opaque[0].Mangled, "me_sink");
+  EXPECT_FALSE(Unb.Opaque[0].Bounded);
+  EXPECT_FALSE(Unb.Opaque[0].Signature.Known); // a C name has no parameters
   EXPECT_EQ(Unb.TrustedOther, ModRef::ReadWrite);
 }
 
@@ -627,7 +648,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
       EXPECT_EQ(Fields[8], "i");
       EXPECT_EQ(Fields[11], "m"); // the store is proven whatever the log does
       EXPECT_EQ(Fields[14], "n"); // trusted: the log touches no other memory
-      EXPECT_EQ(Fields[16], "me_sum_log(int const&)");
+      EXPECT_EQ(Fields[16], "_Z10me_sum_logRKi");
     } else if (Fields[0] == "me_sum_unbounded") {
       ASSERT_EQ(Fields.size(), 17u);
       EXPECT_EQ(Fields[16], "!me_sum_c_log");
@@ -702,7 +723,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
   )",
                                                         "me_lookup");
   ASSERT_TRUE(ME.Valid);
-  EXPECT_TRUE(ME.Opaque.empty()) << llvm::join(ME.Opaque, ", ");
+  EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
   EXPECT_EQ(ME.Other, ModRef::None);
   EXPECT_EQ(ME.ParamsDirect[0], ModRef::Read);
   EXPECT_EQ(ME.ParamsReachable[0], ModRef::Read);
@@ -848,9 +869,76 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CalleesNameTheSelectedOverload) {
   EXPECT_EQ(MEs[0].Callees[0].Mangled, "_ZN12me_callee_ns4pickERKNS_3BoxE");
   EXPECT_EQ(MEs[0].Callees[0].Demangled,
             "me_callee_ns::pick(me_callee_ns::Box const&)");
+  const Cpp::FunctionSignature& Pick = MEs[0].Callees[0].Signature;
+  ASSERT_TRUE(Pick.Known);
+  EXPECT_EQ(Pick.BaseName, "pick");
+  EXPECT_EQ(Pick.Params,
+            std::vector<Cpp::ParamKind>{Cpp::ParamKind::ConstReference});
+  EXPECT_FALSE(Pick.ConstMethod);
   ASSERT_EQ(MEs[1].Callees.size(), 1u);
   EXPECT_EQ(MEs[1].Callees[0].Demangled,
             "me_callee_ns::Holder::get(int) const");
+  const Cpp::FunctionSignature& Get = MEs[1].Callees[0].Signature;
+  EXPECT_EQ(Get.BaseName, "get");
+  EXPECT_EQ(Get.Params, std::vector<Cpp::ParamKind>{Cpp::ParamKind::Scalar});
+  EXPECT_TRUE(Get.ConstMethod);
+}
+
+// The signature of each callee comes from its mangled name, one kind per
+// parameter.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CalleeSignatureKinds) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    namespace me_kinds_ns {
+    struct Box { int v; };
+    struct C { int f; };
+    int all(const Box& a, Box& b, Box&& c, const Box* d, Box* e, int f, Box g,
+            int (*h)(int), int C::*i);
+    template <class T> int tmpl(const T& t);
+    int var(int n, ...);
+    extern "C" int me_kinds_c(int x);
+    }
+    extern "C" int me_kinds(me_kinds_ns::Box* b, int (*h)(int)) {
+      me_kinds_ns::Box g{1};
+      return me_kinds_ns::all(*b, *b, static_cast<me_kinds_ns::Box&&>(*b), b,
+                              b, 1, g, h, &me_kinds_ns::C::f) +
+             me_kinds_ns::tmpl(*b) + me_kinds_ns::var(1, 2) +
+             me_kinds_ns::me_kinds_c(3);
+    }
+  )",
+      {"me_kinds"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  auto Find = [&](const std::string& Base) -> const Cpp::FunctionSignature* {
+    for (const Cpp::MemoryEffects::Callee& C : MEs[0].Callees)
+      if (C.Signature.BaseName == Base)
+        return &C.Signature;
+    return nullptr;
+  };
+  using K = Cpp::ParamKind;
+  const Cpp::FunctionSignature* All = Find("all");
+  ASSERT_NE(All, nullptr);
+  EXPECT_EQ(All->Params, (std::vector<K>{K::ConstReference, K::MutableReference,
+                                         K::MutableReference, K::ConstPointer,
+                                         K::MutablePointer, K::Scalar,
+                                         K::Object, K::Unknown, K::Unknown}));
+  EXPECT_FALSE(All->Variadic);
+  const Cpp::FunctionSignature* Tmpl = Find("tmpl");
+  ASSERT_NE(Tmpl, nullptr);
+  EXPECT_EQ(Tmpl->Params, std::vector<K>{K::ConstReference});
+  const Cpp::FunctionSignature* Var = Find("var");
+  ASSERT_NE(Var, nullptr);
+  EXPECT_TRUE(Var->Variadic);
+  EXPECT_EQ(Var->Params, std::vector<K>{K::Scalar});
+  bool SawC = false;
+  for (const Cpp::MemoryEffects::Callee& C : MEs[0].Callees)
+    if (C.Mangled == "me_kinds_c") {
+      SawC = true;
+      EXPECT_FALSE(C.Signature.Known);
+    }
+  EXPECT_TRUE(SawC);
 }
 
 // The trusted fields show what the visible code does around opaque calls.
@@ -890,7 +978,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedFieldsIgnoreOpaqueCalls) {
 
   const Cpp::MemoryEffects& Indirect = MEs[2];
   ASSERT_TRUE(Indirect.Valid);
-  EXPECT_TRUE(Mentions(Indirect, "<indirect>"));
+  EXPECT_TRUE(HasOpaque(Indirect, Cpp::OpaqueKind::Indirect));
   EXPECT_EQ(Indirect.TrustedOther, ModRef::None);
   EXPECT_FALSE(Indirect.TrustedCaptured[1]);
 
@@ -904,7 +992,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedFieldsIgnoreOpaqueCalls) {
 // The trusted parameters follow the signature of each opaque call.
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedParamsFollowSignatures) {
   SKIP_WITHOUT_MEMORY_EFFECTS();
-  SKIP_ON_MSVC_ABI("the signature parser reads Itanium demangler output");
+  SKIP_ON_MSVC_ABI("the expected parameters follow the Itanium ABI lowering");
   TestFixture::CreateInterpreter();
   std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
       R"(
@@ -939,14 +1027,14 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedParamsFollowSignatures) {
   EXPECT_EQ(Const.TrustedParams[0], ModRef::Read);
   EXPECT_EQ(Const.TrustedParams[1], ModRef::Read);
   EXPECT_EQ(Const.TrustedOther, ModRef::None);
-  EXPECT_TRUE(Const.Untrusted.empty());
+  EXPECT_TRUE(AllBounded(Const));
 
   const Cpp::MemoryEffects& Ref = MEs[1];
   ASSERT_TRUE(Ref.Valid);
   EXPECT_NE(static_cast<unsigned>(Ref.TrustedParams[0]) &
                 static_cast<unsigned>(ModRef::Write),
             0u);
-  EXPECT_TRUE(Ref.Untrusted.empty());
+  EXPECT_TRUE(AllBounded(Ref));
 
   const Cpp::MemoryEffects& Methods = MEs[2];
   ASSERT_TRUE(Methods.Valid);
@@ -954,12 +1042,18 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedParamsFollowSignatures) {
   EXPECT_NE(static_cast<unsigned>(Methods.TrustedParams[1]) &
                 static_cast<unsigned>(ModRef::Write),
             0u);
-  EXPECT_TRUE(Methods.Untrusted.empty());
+  EXPECT_TRUE(AllBounded(Methods));
 
   const Cpp::MemoryEffects& Unmapped = MEs[3];
   ASSERT_TRUE(Unmapped.Valid);
-  ASSERT_EQ(Unmapped.Untrusted.size(), 1u);
-  EXPECT_NE(Unmapped.Untrusted[0].find("by_pair"), std::string::npos);
+  ASSERT_EQ(std::count_if(Unmapped.Opaque.begin(), Unmapped.Opaque.end(),
+                          [](const Cpp::OpaqueCall& O) { return !O.Bounded; }),
+            1);
+  EXPECT_TRUE(std::any_of(Unmapped.Opaque.begin(), Unmapped.Opaque.end(),
+                          [](const Cpp::OpaqueCall& O) {
+                            return !O.Bounded &&
+                                   O.Signature.BaseName == "by_pair";
+                          }));
   EXPECT_NE(static_cast<unsigned>(Unmapped.TrustedParams[1]) &
                 static_cast<unsigned>(ModRef::Write),
             0u);

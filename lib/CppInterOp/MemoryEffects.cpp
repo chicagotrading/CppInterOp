@@ -21,6 +21,9 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/Demangle/ItaniumDemangle.h"
+#include "llvm/Demangle/MicrosoftDemangle.h"
+#include "llvm/Demangle/MicrosoftDemangleNodes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -30,6 +33,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/Allocator.h"
 #include "llvm/Support/ModRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -37,7 +41,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace CppInternal {
@@ -282,15 +288,39 @@ struct SummaryVariant {
   Reach R;
 };
 
+// An opaque call inside the analysis: a declaration by its mangled name, an
+// indirect call, or inline assembly.
+struct OpaqueRef {
+  Cpp::OpaqueKind Kind = Cpp::OpaqueKind::Declaration;
+  std::string Mangled;
+
+  friend bool operator==(const OpaqueRef& A, const OpaqueRef& B) {
+    return A.Kind == B.Kind && A.Mangled == B.Mangled;
+  }
+  friend bool operator<(const OpaqueRef& A, const OpaqueRef& B) {
+    return std::tie(A.Kind, A.Mangled) < std::tie(B.Kind, B.Mangled);
+  }
+};
+
+void AddUnique(std::vector<OpaqueRef>& Out, const OpaqueRef& Ref) {
+  if (!llvm::is_contained(Out, Ref))
+    Out.push_back(Ref);
+}
+
+// The opaque calls a function reaches, and among them those that a table
+// marks as bounded by no signature (the caller adds its own unbounded ones).
+struct Reached {
+  std::vector<OpaqueRef> Opaque, Unbounded;
+};
+
 struct FunctionSummary {
   SummaryVariant Plain;
   // The effects when the opaque calls of the body are trusted to their
   // signatures; equal to Plain when the summary is complete.
   SummaryVariant Trusted;
   bool Incomplete = false;
-  // Demangled names of the opaque calls the body reaches; a leading '!'
-  // marks one that no signature bounds.
-  std::vector<std::string> Opaque;
+  // The opaque calls that the body reaches.
+  Reached Opaque;
 };
 
 llvm::StringMap<FunctionSummary>& Summaries() {
@@ -299,7 +329,34 @@ llvm::StringMap<FunctionSummary>& Summaries() {
 }
 
 constexpr llvm::StringLiteral SummaryHeader =
-    "# cppinterop-memory-effects v2 llvm ";
+    "# cppinterop-memory-effects v1 llvm ";
+
+// The table spells an opaque call as the mangled name of a declaration or as
+// one of these; a leading '!' marks one that no signature bounds.
+constexpr llvm::StringLiteral IndirectToken = "*indirect";
+constexpr llvm::StringLiteral InlineAsmToken = "*asm";
+
+std::string TableToken(const OpaqueRef& Ref, bool Unbounded) {
+  std::string Out = Unbounded ? "!" : "";
+  switch (Ref.Kind) {
+  case Cpp::OpaqueKind::Indirect:
+    return Out + IndirectToken.str();
+  case Cpp::OpaqueKind::InlineAsm:
+    return Out + InlineAsmToken.str();
+  case Cpp::OpaqueKind::Declaration:
+    break;
+  }
+  return Out + Ref.Mangled;
+}
+
+OpaqueRef ParseTableToken(llvm::StringRef Token, bool& Unbounded) {
+  Unbounded = Token.consume_front("!");
+  if (Token == IndirectToken)
+    return {Cpp::OpaqueKind::Indirect, {}};
+  if (Token == InlineAsmToken)
+    return {Cpp::OpaqueKind::InlineAsm, {}};
+  return {Cpp::OpaqueKind::Declaration, Token.str()};
+}
 
 void ApplySummary(llvm::Function& F, const SummaryVariant& S) {
   F.setMemoryEffects(llvm::MemoryEffects::createFromIntValue(S.Effects));
@@ -1061,32 +1118,21 @@ void Optimize(llvm::Module& M) {
 
 // A call is opaque when it has no body in the module and nothing bounds its
 // effects on memory that the caller does not pass to it.
-std::string OpaqueCallee(const llvm::CallBase& CB) {
+std::optional<OpaqueRef> OpaqueCallee(const llvm::CallBase& CB) {
   if (CB.getMemoryEffects().getModRef(llvm::IRMemLocation::Other) ==
       ModRefInfo::NoModRef)
-    return {};
+    return std::nullopt;
   if (CB.isInlineAsm())
-    return "<asm>";
+    return OpaqueRef{Cpp::OpaqueKind::InlineAsm, {}};
   const llvm::Function* Callee = CB.getCalledFunction();
   if (!Callee)
-    return "<indirect>";
+    return OpaqueRef{Cpp::OpaqueKind::Indirect, {}};
   // A loaded summary states the effects, so the call is not opaque.
   if (!Callee->isDeclaration() || Callee->isIntrinsic() ||
       Summaries().count(Callee->getName()))
-    return {};
-  return llvm::demangle(Callee->getName());
+    return std::nullopt;
+  return OpaqueRef{Cpp::OpaqueKind::Declaration, Callee->getName().str()};
 }
-
-void AddUnique(std::vector<std::string>& Out, llvm::StringRef Name) {
-  if (!llvm::is_contained(Out, Name))
-    Out.push_back(Name.str());
-}
-
-// The opaque calls a function reaches, and among them those that a table
-// marks as bounded by no signature (the caller adds its own unbounded ones).
-struct Reached {
-  std::vector<std::string> Opaque, Unbounded;
-};
 
 // Reached for every defined function of \p M, through the functions it
 // calls: a fixpoint over the call graph, so cycles need no special case.
@@ -1113,18 +1159,15 @@ OpaqueClosure(const llvm::Module& M) {
         }
         auto It = Summaries().find(Callee->getName());
         if (It != Summaries().end()) {
-          for (llvm::StringRef Name : It->second.Opaque) {
-            bool Unb = Name.consume_front("!");
-            AddUnique(R.Opaque, Name);
-            if (Unb)
-              AddUnique(R.Unbounded, Name);
-          }
+          for (const OpaqueRef& Ref : It->second.Opaque.Opaque)
+            AddUnique(R.Opaque, Ref);
+          for (const OpaqueRef& Ref : It->second.Opaque.Unbounded)
+            AddUnique(R.Unbounded, Ref);
           continue;
         }
       }
-      std::string Name = OpaqueCallee(*CB);
-      if (!Name.empty())
-        AddUnique(R.Opaque, Name);
+      if (std::optional<OpaqueRef> Ref = OpaqueCallee(*CB))
+        AddUnique(R.Opaque, *Ref);
     }
   }
   for (bool Changed = true; Changed;) {
@@ -1133,21 +1176,21 @@ OpaqueClosure(const llvm::Module& M) {
       Reached& R = Out[F];
       for (const llvm::Function* Callee : Cs) {
         const Reached& CR = Out[Callee];
-        for (const std::string& Name : CR.Opaque)
-          if (!llvm::is_contained(R.Opaque, Name)) {
-            R.Opaque.push_back(Name);
+        for (const OpaqueRef& Ref : CR.Opaque)
+          if (!llvm::is_contained(R.Opaque, Ref)) {
+            R.Opaque.push_back(Ref);
             Changed = true;
           }
-        for (const std::string& Name : CR.Unbounded)
-          if (!llvm::is_contained(R.Unbounded, Name)) {
-            R.Unbounded.push_back(Name);
+        for (const OpaqueRef& Ref : CR.Unbounded)
+          if (!llvm::is_contained(R.Unbounded, Ref)) {
+            R.Unbounded.push_back(Ref);
             Changed = true;
           }
       }
     }
   }
-  // The fixpoint visits functions in pointer order; sorted names keep the
-  // tables reproducible.
+  // The fixpoint visits functions in pointer order; sorting keeps the tables
+  // reproducible.
   for (auto& Entry : Out) {
     llvm::sort(Entry.second.Opaque);
     llvm::sort(Entry.second.Unbounded);
@@ -1155,21 +1198,28 @@ OpaqueClosure(const llvm::Module& M) {
   return Out;
 }
 
-// One parameter of a demangled signature: how it lowers to the IR.
-enum class ParamKind { Pointer, ConstPointer, Scalar, Unknown };
+namespace id = llvm::itanium_demangle;
+namespace ms = llvm::ms_demangle;
 
-ParamKind ClassifyParam(llvm::StringRef P) {
-  P = P.trim();
-  P.consume_back(" volatile");
-  if (P.contains("(&") || P.contains("(*") || P.contains("::*"))
-    return ParamKind::Unknown;
-  for (llvm::StringRef Suffix : {"&&", "&", "*"})
-    if (P.consume_back(Suffix)) {
-      P = P.rtrim();
-      P.consume_back(" volatile");
-      return P.ends_with("const") ? ParamKind::ConstPointer
-                                  : ParamKind::Pointer;
-    }
+// The node allocator of one Itanium demangler parse.
+class DemangleAllocator {
+  llvm::BumpPtrAllocator Alloc;
+
+public:
+  void reset() { Alloc.Reset(); }
+
+  template <typename T, typename... Args> T* makeNode(Args&&... A) {
+    return new (Alloc.Allocate(sizeof(T), alignof(T)))
+        T(std::forward<Args>(A)...);
+  }
+
+  void* allocateNodeArray(size_t N) {
+    return Alloc.Allocate(sizeof(id::Node*) * N, alignof(id::Node*));
+  }
+};
+
+// The demangler spells a builtin type as a name node, like a class.
+bool IsBuiltinName(std::string_view Name) {
   static constexpr llvm::StringLiteral Scalars[] = {
       "bool",    "char",           "signed char", "unsigned char",
       "wchar_t", "char8_t",        "char16_t",    "char32_t",
@@ -1177,71 +1227,157 @@ ParamKind ClassifyParam(llvm::StringRef P) {
       "long",    "unsigned long",  "long long",   "unsigned long long",
       "float",   "double",
   };
-  P.consume_back(" const");
-  if (std::find(std::begin(Scalars), std::end(Scalars), P) != std::end(Scalars))
-    return ParamKind::Scalar;
-  return ParamKind::Unknown;
+  return llvm::is_contained(Scalars, llvm::StringRef(Name));
 }
 
-// The parameters of a demangled function name and whether it is a const
-// method; false when the name is not a function or is variadic.
-bool ParseSignature(llvm::StringRef D, llvm::SmallVectorImpl<ParamKind>& Out,
-                    bool& ConstMethod) {
-  D = D.trim();
-  ConstMethod = false;
-  for (bool More = true; More;) {
-    More = false;
-    for (llvm::StringRef Q : {" const", " volatile", " &&", " &"})
-      if (D.consume_back(Q)) {
-        ConstMethod |= Q == " const";
-        More = true;
-      }
+const id::Node* StripQualifiers(const id::Node* N, bool& Const) {
+  while (N && N->getKind() == id::Node::KQualType) {
+    const auto* Q = static_cast<const id::QualType*>(N);
+    Const |= (Q->getQuals() & id::QualConst) != 0;
+    N = Q->getChild();
   }
-  if (!D.ends_with(")"))
-    return false;
-  int Depth = 0;
-  size_t Open = llvm::StringRef::npos;
-  for (size_t I = D.size(); I-- > 0;) {
-    char C = D[I];
-    if (C == ')' || C == '>' || C == ']')
-      ++Depth;
-    else if ((C == '(' || C == '<' || C == '[') && --Depth == 0) {
-      Open = I;
-      break;
+  return N;
+}
+
+Cpp::ParamKind ClassifyItanium(const id::Node* N) {
+  bool TopConst = false; // a by-value parameter's own const does not matter
+  N = StripQualifiers(N, TopConst);
+  if (!N)
+    return Cpp::ParamKind::Unknown;
+  switch (N->getKind()) {
+  case id::Node::KReferenceType:
+  case id::Node::KPointerType: {
+    bool Reference = N->getKind() == id::Node::KReferenceType;
+    const id::Node* Pointee = nullptr;
+    if (Reference)
+      static_cast<const id::ReferenceType*>(N)->match(
+          [&](const id::Node* P, id::ReferenceKind) { Pointee = P; });
+    else
+      Pointee = static_cast<const id::PointerType*>(N)->getPointee();
+    bool Const = false;
+    const id::Node* Target = StripQualifiers(Pointee, Const);
+    if (!Target || Target->getKind() == id::Node::KFunctionType)
+      return Cpp::ParamKind::Unknown;
+    if (Reference)
+      return Const ? Cpp::ParamKind::ConstReference
+                   : Cpp::ParamKind::MutableReference;
+    return Const ? Cpp::ParamKind::ConstPointer
+                 : Cpp::ParamKind::MutablePointer;
+  }
+  case id::Node::KNameType:
+    return IsBuiltinName(N->getBaseName()) ? Cpp::ParamKind::Scalar
+                                           : Cpp::ParamKind::Object;
+  case id::Node::KPointerToMemberType:
+  case id::Node::KForwardTemplateReference:
+  case id::Node::KParameterPackExpansion:
+  case id::Node::KVendorExtQualType:
+    return Cpp::ParamKind::Unknown;
+  default:
+    return Cpp::ParamKind::Object;
+  }
+}
+
+Cpp::FunctionSignature ReadItaniumSignature(llvm::StringRef Mangled) {
+  Cpp::FunctionSignature S;
+  id::ManglingParser<DemangleAllocator> Parser(Mangled.begin(), Mangled.end());
+  const id::Node* Root = Parser.parse();
+  if (!Root || Root->getKind() != id::Node::KFunctionEncoding)
+    return S;
+  const auto* FE = static_cast<const id::FunctionEncoding*>(Root);
+  S.Known = true;
+  if (const id::Node* Name = FE->getName())
+    S.BaseName = std::string(Name->getBaseName());
+  S.ConstMethod = (FE->getCVQuals() & id::QualConst) != 0;
+  for (const id::Node* Param : FE->getParams()) {
+    if (Param->getKind() == id::Node::KNameType &&
+        Param->getBaseName() == "...") {
+      S.Variadic = true;
+      continue;
     }
+    S.Params.push_back(ClassifyItanium(Param));
   }
-  if (Open == llvm::StringRef::npos || Open == 0)
-    return false;
-  llvm::StringRef Params = D.slice(Open + 1, D.size() - 1).trim();
-  if (Params.contains("..."))
-    return false;
-  Depth = 0;
-  size_t Start = 0;
-  for (size_t I = 0; I <= Params.size(); ++I) {
-    char C = I < Params.size() ? Params[I] : ',';
-    if (C == '(' || C == '<' || C == '[')
-      ++Depth;
-    else if (C == ')' || C == '>' || C == ']')
-      --Depth;
-    else if (C == ',' && Depth == 0) {
-      llvm::StringRef P = Params.slice(Start, I).trim();
-      if (!P.empty())
-        Out.push_back(ClassifyParam(P));
-      Start = I + 1;
-    }
+  return S;
+}
+
+Cpp::ParamKind ClassifyMicrosoft(const ms::Node* N) {
+  if (!N)
+    return Cpp::ParamKind::Unknown;
+  switch (N->kind()) {
+  case ms::NodeKind::PrimitiveType:
+    return Cpp::ParamKind::Scalar;
+  case ms::NodeKind::TagType:
+    return Cpp::ParamKind::Object;
+  case ms::NodeKind::PointerType: {
+    const auto* P = static_cast<const ms::PointerTypeNode*>(N);
+    if (P->ClassParent || !P->Pointee ||
+        P->Pointee->kind() == ms::NodeKind::FunctionSignature)
+      return Cpp::ParamKind::Unknown;
+    bool Const = (P->Pointee->Quals & ms::Q_Const) != 0;
+    if (P->Affinity == ms::PointerAffinity::Pointer)
+      return Const ? Cpp::ParamKind::ConstPointer
+                   : Cpp::ParamKind::MutablePointer;
+    return Const ? Cpp::ParamKind::ConstReference
+                 : Cpp::ParamKind::MutableReference;
   }
-  return true;
+  default:
+    return Cpp::ParamKind::Unknown;
+  }
+}
+
+Cpp::FunctionSignature ReadMicrosoftSignature(llvm::StringRef Mangled) {
+  Cpp::FunctionSignature S;
+  ms::Demangler D;
+  std::string_view View(Mangled.data(), Mangled.size());
+  ms::SymbolNode* Symbol = D.parse(View);
+  if (D.Error || !Symbol || Symbol->kind() != ms::NodeKind::FunctionSymbol)
+    return S;
+  const ms::FunctionSignatureNode* Sig =
+      static_cast<ms::FunctionSymbolNode*>(Symbol)->Signature;
+  if (!Sig)
+    return S;
+  S.Known = true;
+  if (Symbol->Name)
+    if (ms::IdentifierNode* Id = Symbol->Name->getUnqualifiedIdentifier())
+      if (Id->kind() == ms::NodeKind::NamedIdentifier)
+        S.BaseName =
+            std::string(static_cast<ms::NamedIdentifierNode*>(Id)->Name);
+  S.ConstMethod = (Sig->Quals & ms::Q_Const) != 0;
+  S.Variadic = Sig->IsVariadic;
+  if (Sig->Params)
+    for (size_t I = 0; I < Sig->Params->Count; ++I)
+      S.Params.push_back(ClassifyMicrosoft(Sig->Params->Nodes[I]));
+  return S;
+}
+
+// The signature that the mangled name of a function shows; not Known for a
+// C function, whose name carries no parameters.
+Cpp::FunctionSignature ReadSignature(llvm::StringRef Mangled) {
+  if (Mangled.starts_with("_Z"))
+    return ReadItaniumSignature(Mangled);
+  if (Mangled.starts_with("?"))
+    return ReadMicrosoftSignature(Mangled);
+  return {};
+}
+
+bool IsConstKind(Cpp::ParamKind K) {
+  return K == Cpp::ParamKind::ConstReference ||
+         K == Cpp::ParamKind::ConstPointer;
 }
 
 // Marks the pointer parameters of a declaration that its signature makes
 // read-only. False when the C++ parameters do not map one to one to the IR
 // parameters, so the signature cannot bound them.
 bool BoundBySignature(llvm::Function& F) {
-  llvm::SmallVector<ParamKind, 8> Kinds;
-  bool ConstMethod = false;
-  if (!ParseSignature(llvm::demangle(F.getName()), Kinds, ConstMethod) ||
-      llvm::is_contained(Kinds, ParamKind::Unknown))
+  Cpp::FunctionSignature S = ReadSignature(F.getName());
+  if (!S.Known || S.Variadic)
     return false;
+  llvm::SmallVector<Cpp::ParamKind, 8> Kinds(S.Params.begin(), S.Params.end());
+  // A class or enum by value lowers to registers or memory that the IR
+  // parameters do not show one to one.
+  for (Cpp::ParamKind K : Kinds)
+    if (K == Cpp::ParamKind::Unknown || K == Cpp::ParamKind::Object)
+      return false;
+  bool ConstMethod = S.ConstMethod;
   llvm::SmallVector<unsigned, 8> IRParams;
   for (unsigned I = 0; I < F.arg_size(); ++I)
     if (!F.hasParamAttribute(I, llvm::Attribute::StructRet))
@@ -1250,15 +1386,15 @@ bool BoundBySignature(llvm::Function& F) {
   if (!HasThis && (IRParams.size() != Kinds.size() || ConstMethod))
     return false;
   if (HasThis)
-    Kinds.insert(Kinds.begin(),
-                 ConstMethod ? ParamKind::ConstPointer : ParamKind::Pointer);
+    Kinds.insert(Kinds.begin(), ConstMethod ? Cpp::ParamKind::ConstPointer
+                                            : Cpp::ParamKind::MutablePointer);
   for (unsigned K = 0; K < Kinds.size(); ++K)
     if (F.getArg(IRParams[K])->getType()->isPointerTy() !=
-        (Kinds[K] != ParamKind::Scalar))
+        (Kinds[K] != Cpp::ParamKind::Scalar))
       return false;
   for (unsigned K = 0; K < Kinds.size(); ++K) {
     unsigned I = IRParams[K];
-    if (Kinds[K] == ParamKind::ConstPointer &&
+    if (IsConstKind(Kinds[K]) &&
         !F.hasParamAttribute(I, llvm::Attribute::WriteOnly) &&
         !F.hasParamAttribute(I, llvm::Attribute::ReadNone))
       F.addParamAttr(I, llvm::Attribute::ReadOnly);
@@ -1269,7 +1405,7 @@ bool BoundBySignature(llvm::Function& F) {
 // Every call with no body or summary is assumed to access only memory
 // through its arguments, to keep no copy of them except in a pointer
 // result, and not to write through a parameter that its signature makes
-// const. Returns the demangled names that the signature cannot bound.
+// const. Returns the mangled names that the signature cannot bound.
 llvm::StringSet<> TrustOpaqueCalls(llvm::Module& M) {
   const llvm::MemoryEffects ArgOnly =
       llvm::MemoryEffects::inaccessibleOrArgMemOnly();
@@ -1291,7 +1427,7 @@ llvm::StringSet<> TrustOpaqueCalls(llvm::Module& M) {
           !Summaries().count(F.getName())) {
         Bound(F);
         if (!BoundBySignature(F))
-          Unbounded.insert(llvm::demangle(F.getName()));
+          Unbounded.insert(F.getName());
       }
       continue;
     }
@@ -1311,8 +1447,9 @@ void CollectCallees(const llvm::Function& F, Cpp::MemoryEffects& Out) {
     const llvm::Function* Callee = CB ? CB->getCalledFunction() : nullptr;
     if (!Callee || Callee->isIntrinsic() || !Seen.insert(Callee).second)
       continue;
-    Out.Callees.push_back(
-        {Callee->getName().str(), llvm::demangle(Callee->getName())});
+    Out.Callees.push_back({Callee->getName().str(),
+                           llvm::demangle(Callee->getName()),
+                           ReadSignature(Callee->getName())});
   }
 }
 
@@ -1369,8 +1506,17 @@ void ReadMemoryEffects(const llvm::Function& F, ReachAnalysis& RA,
   Out.ParamsDirect = V.Direct;
   Out.ParamsReachable = V.Reachable;
   Out.Captured = V.Captured;
-  Out.Opaque = Opaque.Opaque;
-  Out.Untrusted = Opaque.Unbounded;
+  for (const OpaqueRef& Ref : Opaque.Opaque) {
+    Cpp::OpaqueCall Call;
+    Call.Kind = Ref.Kind;
+    if (Ref.Kind == Cpp::OpaqueKind::Declaration) {
+      Call.Mangled = Ref.Mangled;
+      Call.Demangled = llvm::demangle(Ref.Mangled);
+      Call.Signature = ReadSignature(Ref.Mangled);
+      Call.Bounded = !llvm::is_contained(Opaque.Unbounded, Ref);
+    }
+    Out.Opaque.push_back(std::move(Call));
+  }
 }
 
 char CaptureChar(const llvm::Argument& A) {
@@ -1502,9 +1648,9 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
     Out[I].TrustedParams = V.Params;
     Out[I].TrustedParamsDirect = V.Direct;
     Out[I].TrustedParamsReachable = V.Reachable;
-    for (const std::string& O : Out[I].Opaque)
-      if (O == "<indirect>" || O == "<asm>" || Unbounded.contains(O))
-        AddUnique(Out[I].Untrusted, O);
+    for (Cpp::OpaqueCall& Call : Out[I].Opaque)
+      if (Unbounded.contains(Call.Mangled))
+        Call.Bounded = false;
   }
 }
 
@@ -1536,8 +1682,15 @@ int LoadMemoryEffectsSummaries(llvm::StringRef Text) {
           !ParseVariant(llvm::ArrayRef(Fields).slice(9, 7), S.Trusted))
         return -1;
       S.Incomplete = true;
-      for (llvm::StringRef Name : llvm::ArrayRef(Fields).drop_front(16))
-        S.Opaque.push_back(Name.str());
+      for (llvm::StringRef Token : llvm::ArrayRef(Fields).drop_front(16)) {
+        bool Unbounded = false;
+        OpaqueRef Ref = ParseTableToken(Token, Unbounded);
+        if (Ref.Kind == Cpp::OpaqueKind::Declaration && Ref.Mangled.empty())
+          return -1;
+        AddUnique(S.Opaque.Opaque, Ref);
+        if (Unbounded)
+          AddUnique(S.Opaque.Unbounded, Ref);
+      }
     } else
       return -1;
     Read[Fields[0]] = std::move(S);
@@ -1589,12 +1742,11 @@ std::string SummarizeMemoryEffects(llvm::Module& M) {
     Out += "i\t";
     Out += TF && !TF->isDeclaration() ? VariantFields(*TF, *RAT)
                                       : VariantFields(F, RA);
-    for (const std::string& Name : R.Opaque) {
-      bool Unb = Name == "<indirect>" || Name == "<asm>" ||
-                 Unbounded.contains(Name) ||
-                 llvm::is_contained(R.Unbounded, Name);
-      Out += "\t";
-      Out += Unb ? "!" + Name : Name;
+    for (const OpaqueRef& Ref : R.Opaque) {
+      bool Unb = Ref.Kind != Cpp::OpaqueKind::Declaration ||
+                 Unbounded.contains(Ref.Mangled) ||
+                 llvm::is_contained(R.Unbounded, Ref);
+      Out += "\t" + TableToken(Ref, Unb);
     }
     Out += "\n";
   }

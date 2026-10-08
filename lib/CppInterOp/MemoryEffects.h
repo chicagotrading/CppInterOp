@@ -34,13 +34,14 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
 /// Read effect summaries of functions whose bodies the analysis cannot see
 /// (a prebuilt library); the analysis applies them to matching declarations.
 /// \returns the number of summaries read, or -1 when the text is malformed,
-/// is not a v2 table, or was written by a different LLVM major version.
+/// or was written by a different LLVM major version.
 ///
-/// A table starts with "# cppinterop-memory-effects v2 llvm <major>". Each
+/// A table starts with "# cppinterop-memory-effects v1 llvm <major>". Each
 /// other line is one function, tab-separated: the mangled name; seven fields
 /// of the plain variant; a flag; and for an incomplete summary the seven
-/// fields of the trusted variant followed by the demangled names of the
-/// opaque calls the body reaches ("!" before one that no signature bounds).
+/// fields of the trusted variant followed by the opaque calls the body
+/// reaches: the mangled name of a declaration, "*indirect" or "*asm", with
+/// "!" before one that no signature bounds.
 /// The seven fields: LLVM's MemoryEffects in hex; per parameter LLVM's
 /// access (n/r/w/-) and capture (c none, a address only, . provenance); per
 /// parameter the access to its own object (n/r/w/m); per parameter the
