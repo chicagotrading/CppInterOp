@@ -43,7 +43,7 @@ using Cpp::ModRef;
 namespace {
 bool Mentions(const Cpp::MemoryEffects& ME, const std::string& Name) {
   return std::any_of(
-      ME.m_Opaque.begin(), ME.m_Opaque.end(),
+      ME.Opaque.begin(), ME.Opaque.end(),
       [&](const std::string& O) { return O.find(Name) != std::string::npos; });
 }
 
@@ -61,13 +61,13 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PureRead) {
     extern "C" int me_pure(Box* b) { return twice(*b); }
   )",
                                                         "me_pure");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_EQ(ME.m_ArgMem, ModRef::Read);
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  ASSERT_EQ(ME.m_Params.size(), 1u);
-  EXPECT_EQ(ME.m_Params[0], ModRef::Read);
-  EXPECT_FALSE(ME.m_Captured[0]);
-  EXPECT_TRUE(ME.m_Opaque.empty());
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.ArgMem, ModRef::Read);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  ASSERT_EQ(ME.Params.size(), 1u);
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_TRUE(ME.Opaque.empty());
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WritesOnlyTheWrittenParameter) {
@@ -78,11 +78,11 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WritesOnlyTheWrittenParameter) {
     extern "C" void me_bump(int* a, int* b) { bump(*a); (void)*b; }
   )",
                                                         "me_bump");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  ASSERT_EQ(ME.m_Params.size(), 2u);
-  EXPECT_EQ(ME.m_Params[0], ModRef::ReadWrite);
-  EXPECT_EQ(ME.m_Params[1], ModRef::None);
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  ASSERT_EQ(ME.Params.size(), 2u);
+  EXPECT_EQ(ME.Params[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.Params[1], ModRef::None);
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MutableMemberIsAWrite) {
@@ -96,9 +96,9 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MutableMemberIsAWrite) {
     }
   )",
                                                         "me_mutable");
-  ASSERT_TRUE(ME.m_Valid);
-  ASSERT_EQ(ME.m_Params.size(), 1u);
-  EXPECT_EQ(ME.m_Params[0], ModRef::ReadWrite);
+  ASSERT_TRUE(ME.Valid);
+  ASSERT_EQ(ME.Params.size(), 1u);
+  EXPECT_EQ(ME.Params[0], ModRef::ReadWrite);
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE,
@@ -114,16 +114,16 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
     }
   )",
                                                         "me_handle");
-  ASSERT_TRUE(ME.m_Valid);
-  ASSERT_EQ(ME.m_Params.size(), 1u);
+  ASSERT_TRUE(ME.Valid);
+  ASSERT_EQ(ME.Params.size(), 1u);
   // The handle itself is only read; the write goes through the pointer it
   // holds. Whether that memory is the handle's is the caller's decision.
-  EXPECT_EQ(ME.m_Params[0], ModRef::Read);
-  EXPECT_EQ(ME.m_ParamsDirect[0], ModRef::Read);
-  EXPECT_EQ(ME.m_ParamsReachable[0], ModRef::ReadWrite);
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  EXPECT_FALSE(ME.m_Captured[0]);
-  EXPECT_TRUE(ME.m_Opaque.empty());
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::Read);
+  EXPECT_EQ(ME.ParamsReachable[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_TRUE(ME.Opaque.empty());
 }
 
 // A container's heap is memory reachable from the parameter that owns it,
@@ -140,15 +140,15 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ContainerHeapIsReachable) {
     extern "C" void me_push(std::vector<int>* v, const int* x) { v->push_back(*x); }
   )",
                                                         "me_push");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_TRUE(ME.m_Opaque.empty());
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  EXPECT_TRUE(Writes(ME.m_ParamsDirect[0]));
-  EXPECT_TRUE(Writes(ME.m_ParamsReachable[0]));
-  EXPECT_FALSE(ME.m_Captured[0]);
-  EXPECT_EQ(ME.m_ParamsDirect[1], ModRef::Read);
-  EXPECT_EQ(ME.m_ParamsReachable[1], ModRef::None);
-  EXPECT_FALSE(ME.m_Captured[1]);
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty());
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_TRUE(Writes(ME.ParamsDirect[0]));
+  EXPECT_TRUE(Writes(ME.ParamsReachable[0]));
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_EQ(ME.ParamsDirect[1], ModRef::Read);
+  EXPECT_EQ(ME.ParamsReachable[1], ModRef::None);
+  EXPECT_FALSE(ME.Captured[1]);
 }
 
 // A ring buffer over a vector, as a sliding-window state uses it.
@@ -176,14 +176,14 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RingBufferOverAVector) {
     }
   )",
                                                         "me_window");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_TRUE(ME.m_Opaque.empty());
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  EXPECT_EQ(ME.m_ParamsDirect[0], ModRef::ReadWrite);
-  EXPECT_EQ(ME.m_ParamsReachable[0], ModRef::ReadWrite);
-  EXPECT_FALSE(ME.m_Captured[0]);
-  EXPECT_EQ(ME.m_ParamsDirect[1], ModRef::Read);
-  EXPECT_EQ(ME.m_ParamsDirect[2], ModRef::Read);
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty());
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.ParamsReachable[0], ModRef::ReadWrite);
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_EQ(ME.ParamsDirect[1], ModRef::Read);
+  EXPECT_EQ(ME.ParamsDirect[2], ModRef::Read);
 }
 
 // Comparing a parameter's address keeps no pointer and writes nothing.
@@ -211,23 +211,23 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressCompareIsNotACapture) {
                                      /*rewind=*/false);
   ASSERT_EQ(MEs.size(), 2u);
   const Cpp::MemoryEffects& Find = MEs[0];
-  ASSERT_TRUE(Find.m_Valid);
-  EXPECT_EQ(Find.m_Other, ModRef::None);
-  EXPECT_EQ(Find.m_ParamsDirect[0], ModRef::Read);
-  EXPECT_EQ(Find.m_ParamsReachable[0], ModRef::Read);
-  EXPECT_EQ(Find.m_ParamsDirect[1], ModRef::None);
-  EXPECT_EQ(Find.m_ParamsReachable[1], ModRef::None);
-  EXPECT_FALSE(Find.m_Captured[1]);
+  ASSERT_TRUE(Find.Valid);
+  EXPECT_EQ(Find.Other, ModRef::None);
+  EXPECT_EQ(Find.ParamsDirect[0], ModRef::Read);
+  EXPECT_EQ(Find.ParamsReachable[0], ModRef::Read);
+  EXPECT_EQ(Find.ParamsDirect[1], ModRef::None);
+  EXPECT_EQ(Find.ParamsReachable[1], ModRef::None);
+  EXPECT_FALSE(Find.Captured[1]);
 
   const Cpp::MemoryEffects& Erase = MEs[1];
-  ASSERT_TRUE(Erase.m_Valid);
-  EXPECT_TRUE(Erase.m_Opaque.empty());
-  EXPECT_EQ(Erase.m_Other, ModRef::None);
-  EXPECT_TRUE(Writes(Erase.m_ParamsDirect[0]) ||
-              Writes(Erase.m_ParamsReachable[0]));
-  EXPECT_FALSE(Writes(Erase.m_ParamsDirect[1]));
-  EXPECT_EQ(Erase.m_ParamsReachable[1], ModRef::None);
-  EXPECT_FALSE(Erase.m_Captured[1]);
+  ASSERT_TRUE(Erase.Valid);
+  EXPECT_TRUE(Erase.Opaque.empty());
+  EXPECT_EQ(Erase.Other, ModRef::None);
+  EXPECT_TRUE(Writes(Erase.ParamsDirect[0]) ||
+              Writes(Erase.ParamsReachable[0]));
+  EXPECT_FALSE(Writes(Erase.ParamsDirect[1]));
+  EXPECT_EQ(Erase.ParamsReachable[1], ModRef::None);
+  EXPECT_FALSE(Erase.Captured[1]);
 }
 
 // A write through a const parameter shows on that parameter, whatever else
@@ -241,11 +241,11 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
     extern "C" void me_mutable_pair(int* out, const Counted* c) { *out = c->get(); }
   )",
                                                         "me_mutable_pair");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  EXPECT_EQ(ME.m_ParamsDirect[0], ModRef::Write);
-  EXPECT_EQ(ME.m_ParamsDirect[1], ModRef::ReadWrite);
-  EXPECT_EQ(ME.m_ParamsReachable[1], ModRef::None);
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::Write);
+  EXPECT_EQ(ME.ParamsDirect[1], ModRef::ReadWrite);
+  EXPECT_EQ(ME.ParamsReachable[1], ModRef::None);
 }
 
 // Two handles may point to one object: the write is reachable from the
@@ -267,20 +267,20 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TwoHandlesToOneObject) {
                                      /*rewind=*/false);
   ASSERT_EQ(MEs.size(), 2u);
   const Cpp::MemoryEffects& Two = MEs[0];
-  ASSERT_TRUE(Two.m_Valid);
-  EXPECT_EQ(Two.m_Other, ModRef::None);
-  EXPECT_EQ(Two.m_ParamsDirect[0], ModRef::Read);
-  EXPECT_EQ(Two.m_ParamsReachable[0], ModRef::Write);
-  EXPECT_EQ(Two.m_ParamsDirect[1], ModRef::Read);
-  EXPECT_EQ(Two.m_ParamsReachable[1], ModRef::Read);
-  EXPECT_FALSE(Two.m_Captured[0]);
-  EXPECT_FALSE(Two.m_Captured[1]);
+  ASSERT_TRUE(Two.Valid);
+  EXPECT_EQ(Two.Other, ModRef::None);
+  EXPECT_EQ(Two.ParamsDirect[0], ModRef::Read);
+  EXPECT_EQ(Two.ParamsReachable[0], ModRef::Write);
+  EXPECT_EQ(Two.ParamsDirect[1], ModRef::Read);
+  EXPECT_EQ(Two.ParamsReachable[1], ModRef::Read);
+  EXPECT_FALSE(Two.Captured[0]);
+  EXPECT_FALSE(Two.Captured[1]);
 
   const Cpp::MemoryEffects& Either = MEs[1];
-  ASSERT_TRUE(Either.m_Valid);
-  EXPECT_EQ(Either.m_Other, ModRef::None);
-  EXPECT_TRUE(Writes(Either.m_ParamsReachable[0]));
-  EXPECT_TRUE(Writes(Either.m_ParamsReachable[1]));
+  ASSERT_TRUE(Either.Valid);
+  EXPECT_EQ(Either.Other, ModRef::None);
+  EXPECT_TRUE(Writes(Either.ParamsReachable[0]));
+  EXPECT_TRUE(Writes(Either.ParamsReachable[1]));
 }
 
 // A pointer into a parameter's memory that another parameter's memory or a
@@ -304,19 +304,19 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CaptureIsAStoreOutsideTheOwner) {
       {"me_keep", "me_keep_in_global", "me_link"},
       /*rewind=*/false);
   ASSERT_EQ(MEs.size(), 3u);
-  ASSERT_TRUE(MEs[0].m_Valid);
-  EXPECT_FALSE(MEs[0].m_Captured[0]);
-  EXPECT_TRUE(MEs[0].m_Captured[1]);
-  EXPECT_EQ(MEs[0].m_ParamsDirect[0], ModRef::Write);
-  ASSERT_TRUE(MEs[1].m_Valid);
-  EXPECT_TRUE(MEs[1].m_Captured[0]);
-  EXPECT_EQ(MEs[1].m_Other, ModRef::Write);
-  ASSERT_TRUE(MEs[2].m_Valid);
-  EXPECT_TRUE(MEs[2].m_Opaque.empty());
-  EXPECT_EQ(MEs[2].m_Other, ModRef::None);
-  EXPECT_EQ(MEs[2].m_ParamsDirect[0], ModRef::ReadWrite);
-  EXPECT_FALSE(MEs[2].m_Captured[0]);
-  EXPECT_FALSE(MEs[2].m_Captured[1]);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_FALSE(MEs[0].Captured[0]);
+  EXPECT_TRUE(MEs[0].Captured[1]);
+  EXPECT_EQ(MEs[0].ParamsDirect[0], ModRef::Write);
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_TRUE(MEs[1].Captured[0]);
+  EXPECT_EQ(MEs[1].Other, ModRef::Write);
+  ASSERT_TRUE(MEs[2].Valid);
+  EXPECT_TRUE(MEs[2].Opaque.empty());
+  EXPECT_EQ(MEs[2].Other, ModRef::None);
+  EXPECT_EQ(MEs[2].ParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_FALSE(MEs[2].Captured[0]);
+  EXPECT_FALSE(MEs[2].Captured[1]);
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_GlobalWriteIsOtherMemory) {
@@ -327,9 +327,9 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_GlobalWriteIsOtherMemory) {
     extern "C" int me_global(const int* x) { ++me_counter; return *x; }
   )",
                                                         "me_global");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_EQ(ME.m_Params[0], ModRef::Read);
-  EXPECT_NE(static_cast<unsigned>(ME.m_Other) &
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
+  EXPECT_NE(static_cast<unsigned>(ME.Other) &
                 static_cast<unsigned>(ModRef::Write),
             0u);
 }
@@ -342,8 +342,8 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ExternalCallIsOpaque) {
     extern "C" int me_calls_external(int* x) { return me_external(*x); }
   )",
                                                         "me_calls_external");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_EQ(ME.m_Other, ModRef::ReadWrite);
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Other, ModRef::ReadWrite);
   EXPECT_TRUE(Mentions(ME, "me_external"));
 }
 
@@ -355,7 +355,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IndirectCallIsOpaque) {
     extern "C" int me_indirect(Callback* c) { return c->fn(1); }
   )",
                                                         "me_indirect");
-  ASSERT_TRUE(ME.m_Valid);
+  ASSERT_TRUE(ME.Valid);
   EXPECT_TRUE(Mentions(ME, "<indirect>"));
 }
 
@@ -373,10 +373,10 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ThrowPathIsNotAnEffect) {
     extern "C" int me_throws(int* p) { return checked(p, p[1]); }
   )",
                                                         "me_throws");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  EXPECT_EQ(ME.m_Params[0], ModRef::Read);
-  EXPECT_TRUE(ME.m_Opaque.empty());
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
+  EXPECT_TRUE(ME.Opaque.empty());
 }
 
 // An inline function that an earlier input already emitted must still be
@@ -393,12 +393,12 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_InlineBodyFromEarlierInput) {
     extern "C" void me_second_use(int* p, int* q) { me_poke(*p); (void)*q; }
   )",
                                                         "me_second_use");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_TRUE(ME.m_Opaque.empty());
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  ASSERT_EQ(ME.m_Params.size(), 2u);
-  EXPECT_EQ(ME.m_Params[0], ModRef::Write);
-  EXPECT_EQ(ME.m_Params[1], ModRef::None);
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty());
+  EXPECT_EQ(ME.Other, ModRef::None);
+  ASSERT_EQ(ME.Params.size(), 2u);
+  EXPECT_EQ(ME.Params[0], ModRef::Write);
+  EXPECT_EQ(ME.Params[1], ModRef::None);
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_InvalidCode) {
@@ -409,13 +409,13 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_InvalidCode) {
       R"(extern "C" int me_bad(int* p) { return no_such_function(*p); })",
       "me_bad");
   std::string Err = testing::internal::GetCapturedStderr();
-  EXPECT_FALSE(ME.m_Valid);
+  EXPECT_FALSE(ME.Valid);
 #ifndef CPPINTEROP_USE_CLING
   EXPECT_NE(Err.find("no_such_function"), std::string::npos) << Err;
 #endif
   ME = Cpp::GetFunctionMemoryEffects(
       R"(extern "C" int me_other(int) { return 0; })", "me_missing");
-  EXPECT_FALSE(ME.m_Valid);
+  EXPECT_FALSE(ME.Valid);
 }
 
 // An address that leaves as an integer is a capture; one that is only
@@ -436,12 +436,12 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
                                      {"me_int_escape", "me_int_compare"},
                                      /*rewind=*/false);
   ASSERT_EQ(MEs.size(), 2u);
-  ASSERT_TRUE(MEs[0].m_Valid);
-  EXPECT_TRUE(MEs[0].m_Captured[0]);
-  ASSERT_TRUE(MEs[1].m_Valid);
-  EXPECT_FALSE(MEs[1].m_Captured[0]);
-  EXPECT_FALSE(MEs[1].m_Captured[1]);
-  EXPECT_EQ(MEs[1].m_Other, ModRef::None);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(MEs[0].Captured[0]);
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_FALSE(MEs[1].Captured[0]);
+  EXPECT_FALSE(MEs[1].Captured[1]);
+  EXPECT_EQ(MEs[1].Other, ModRef::None);
 }
 
 namespace {
@@ -478,11 +478,11 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
     extern "C" int me_uses_summary(int* x) { return me_summary(*x); }
   )",
                                                         "me_uses_summary");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_TRUE(ME.m_Opaque.empty());
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  ASSERT_EQ(ME.m_Params.size(), 1u);
-  EXPECT_EQ(ME.m_Params[0], ModRef::Read);
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty());
+  EXPECT_EQ(ME.Other, ModRef::None);
+  ASSERT_EQ(ME.Params.size(), 1u);
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryTableIsValidated) {
@@ -535,19 +535,19 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IncompleteSummaryIsOpaque) {
       /*rewind=*/false);
   ASSERT_EQ(MEs.size(), 2u);
   const Cpp::MemoryEffects& Inc = MEs[0];
-  ASSERT_TRUE(Inc.m_Valid);
-  ASSERT_EQ(Inc.m_Opaque, std::vector<std::string>{"me_logger(int const&)"});
-  EXPECT_TRUE(Inc.m_Untrusted.empty());
-  EXPECT_EQ(Inc.m_Other, ModRef::ReadWrite);
-  EXPECT_EQ(Inc.m_TrustedOther, ModRef::None);
-  EXPECT_EQ(Inc.m_TrustedParamsDirect[0], ModRef::Read);
-  EXPECT_FALSE(Inc.m_TrustedCaptured[0]);
+  ASSERT_TRUE(Inc.Valid);
+  ASSERT_EQ(Inc.Opaque, std::vector<std::string>{"me_logger(int const&)"});
+  EXPECT_TRUE(Inc.Untrusted.empty());
+  EXPECT_EQ(Inc.Other, ModRef::ReadWrite);
+  EXPECT_EQ(Inc.TrustedOther, ModRef::None);
+  EXPECT_EQ(Inc.TrustedParamsDirect[0], ModRef::Read);
+  EXPECT_FALSE(Inc.TrustedCaptured[0]);
 
   const Cpp::MemoryEffects& Unb = MEs[1];
-  ASSERT_TRUE(Unb.m_Valid);
-  ASSERT_EQ(Unb.m_Opaque, std::vector<std::string>{"me_sink"});
-  EXPECT_EQ(Unb.m_Untrusted, std::vector<std::string>{"me_sink"});
-  EXPECT_EQ(Unb.m_TrustedOther, ModRef::ReadWrite);
+  ASSERT_TRUE(Unb.Valid);
+  ASSERT_EQ(Unb.Opaque, std::vector<std::string>{"me_sink"});
+  EXPECT_EQ(Unb.Untrusted, std::vector<std::string>{"me_sink"});
+  EXPECT_EQ(Unb.TrustedOther, ModRef::ReadWrite);
 }
 
 // A complete summary is a proof: a write it records stays under trust.
@@ -566,12 +566,12 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CompleteSummaryBeatsTrust) {
     extern "C" int me_uses_complete(int* x) { return me_complete(*x) + me_trust_bait(*x); }
   )",
                                                         "me_uses_complete");
-  ASSERT_TRUE(ME.m_Valid);
+  ASSERT_TRUE(ME.Valid);
   EXPECT_TRUE(Mentions(ME, "me_trust_bait"));
   EXPECT_FALSE(Mentions(ME, "me_complete"));
-  EXPECT_EQ(ME.m_ParamsDirect[0], ModRef::ReadWrite);
-  EXPECT_EQ(ME.m_TrustedParamsDirect[0], ModRef::ReadWrite);
-  EXPECT_EQ(ME.m_TrustedOther, ModRef::None);
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.TrustedParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.TrustedOther, ModRef::None);
 }
 
 // The summarizer marks a body that reaches an opaque call, records its
@@ -701,15 +701,15 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
     }
   )",
                                                         "me_lookup");
-  ASSERT_TRUE(ME.m_Valid);
-  EXPECT_TRUE(ME.m_Opaque.empty()) << llvm::join(ME.m_Opaque, ", ");
-  EXPECT_EQ(ME.m_Other, ModRef::None);
-  EXPECT_EQ(ME.m_ParamsDirect[0], ModRef::Read);
-  EXPECT_EQ(ME.m_ParamsReachable[0], ModRef::Read);
-  EXPECT_EQ(ME.m_ParamsDirect[1], ModRef::Read);
-  EXPECT_FALSE(Writes(ME.m_ParamsReachable[1]));
-  EXPECT_FALSE(ME.m_Captured[0]);
-  EXPECT_FALSE(ME.m_Captured[1]);
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty()) << llvm::join(ME.Opaque, ", ");
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::Read);
+  EXPECT_EQ(ME.ParamsReachable[0], ModRef::Read);
+  EXPECT_EQ(ME.ParamsDirect[1], ModRef::Read);
+  EXPECT_FALSE(Writes(ME.ParamsReachable[1]));
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_FALSE(ME.Captured[1]);
 }
 
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SeveralFunctionsOfOneUnit) {
@@ -724,12 +724,12 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SeveralFunctionsOfOneUnit) {
                                      {"me_first", "me_second", "me_absent"},
                                      /*rewind=*/false);
   ASSERT_EQ(MEs.size(), 3u);
-  ASSERT_TRUE(MEs[0].m_Valid);
-  EXPECT_EQ(MEs[0].m_Params[0], ModRef::Write);
-  EXPECT_EQ(MEs[0].m_Params[1], ModRef::None);
-  ASSERT_TRUE(MEs[1].m_Valid);
-  EXPECT_EQ(MEs[1].m_Params[0], ModRef::Read);
-  EXPECT_FALSE(MEs[2].m_Valid);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Params[0], ModRef::Write);
+  EXPECT_EQ(MEs[0].Params[1], ModRef::None);
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_EQ(MEs[1].Params[0], ModRef::Read);
+  EXPECT_FALSE(MEs[2].Valid);
   EXPECT_TRUE(Cpp::GetFunctionAddress("me_second"));
 }
 
@@ -748,8 +748,8 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewindUndoesExactlyTheProbe) {
   )",
                                      {"me_rewound"}, /*rewind=*/true);
   ASSERT_EQ(MEs.size(), 1u);
-  ASSERT_TRUE(MEs[0].m_Valid);
-  EXPECT_EQ(MEs[0].m_Params[0], ModRef::Read);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Params[0], ModRef::Read);
   EXPECT_FALSE(Cpp::GetNamed("me_probe_ns"));
   EXPECT_FALSE(Cpp::GetFunctionAddress("me_rewound"));
   EXPECT_TRUE(Cpp::GetNamed("me_before_ns"));
@@ -784,7 +784,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewindCountsInternalUnits) {
   )",
                                      {"me_reads_tls"}, /*rewind=*/true);
   ASSERT_EQ(MEs.size(), 1u);
-  ASSERT_TRUE(MEs[0].m_Valid);
+  ASSERT_TRUE(MEs[0].Valid);
   EXPECT_FALSE(Cpp::GetNamed("me_tls_probe_ns"));
   EXPECT_FALSE(Cpp::GetFunctionAddress("me_reads_tls"));
   EXPECT_TRUE(Cpp::GetNamed("me_tls_before_ns"));
@@ -809,7 +809,7 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewoundProbeLeavesCodeReusable) {
   )",
                                      {"me_probe_uses"}, /*rewind=*/true);
   ASSERT_EQ(MEs.size(), 1u);
-  ASSERT_TRUE(MEs[0].m_Valid);
+  ASSERT_TRUE(MEs[0].Valid);
   EXPECT_FALSE(Cpp::GetFunctionAddress("me_probe_uses"));
   ASSERT_EQ(Cpp::Declare(R"(
     extern "C" float me_after_probe(float x, int y) {
@@ -844,12 +844,12 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CalleesNameTheSelectedOverload) {
                                      {"me_callee_free", "me_callee_member"},
                                      /*rewind=*/true);
   ASSERT_EQ(MEs.size(), 2u);
-  ASSERT_EQ(MEs[0].m_Callees.size(), 1u);
-  EXPECT_EQ(MEs[0].m_Callees[0].m_Mangled, "_ZN12me_callee_ns4pickERKNS_3BoxE");
-  EXPECT_EQ(MEs[0].m_Callees[0].m_Demangled,
+  ASSERT_EQ(MEs[0].Callees.size(), 1u);
+  EXPECT_EQ(MEs[0].Callees[0].Mangled, "_ZN12me_callee_ns4pickERKNS_3BoxE");
+  EXPECT_EQ(MEs[0].Callees[0].Demangled,
             "me_callee_ns::pick(me_callee_ns::Box const&)");
-  ASSERT_EQ(MEs[1].m_Callees.size(), 1u);
-  EXPECT_EQ(MEs[1].m_Callees[0].m_Demangled,
+  ASSERT_EQ(MEs[1].Callees.size(), 1u);
+  EXPECT_EQ(MEs[1].Callees[0].Demangled,
             "me_callee_ns::Holder::get(int) const");
 }
 
@@ -875,30 +875,30 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedFieldsIgnoreOpaqueCalls) {
       /*rewind=*/true);
   ASSERT_EQ(MEs.size(), 4u);
   const Cpp::MemoryEffects& Only = MEs[0];
-  ASSERT_TRUE(Only.m_Valid);
+  ASSERT_TRUE(Only.Valid);
   EXPECT_TRUE(Mentions(Only, "me_trust_opaque"));
-  EXPECT_EQ(Only.m_Other, ModRef::ReadWrite);
-  EXPECT_TRUE(Only.m_Captured[0]);
-  EXPECT_EQ(Only.m_TrustedOther, ModRef::None);
-  EXPECT_FALSE(Only.m_TrustedCaptured[0]);
+  EXPECT_EQ(Only.Other, ModRef::ReadWrite);
+  EXPECT_TRUE(Only.Captured[0]);
+  EXPECT_EQ(Only.TrustedOther, ModRef::None);
+  EXPECT_FALSE(Only.TrustedCaptured[0]);
 
   const Cpp::MemoryEffects& Global = MEs[1];
-  ASSERT_TRUE(Global.m_Valid);
-  EXPECT_NE(static_cast<unsigned>(Global.m_TrustedOther) &
+  ASSERT_TRUE(Global.Valid);
+  EXPECT_NE(static_cast<unsigned>(Global.TrustedOther) &
                 static_cast<unsigned>(ModRef::Write),
             0u);
 
   const Cpp::MemoryEffects& Indirect = MEs[2];
-  ASSERT_TRUE(Indirect.m_Valid);
+  ASSERT_TRUE(Indirect.Valid);
   EXPECT_TRUE(Mentions(Indirect, "<indirect>"));
-  EXPECT_EQ(Indirect.m_TrustedOther, ModRef::None);
-  EXPECT_FALSE(Indirect.m_TrustedCaptured[1]);
+  EXPECT_EQ(Indirect.TrustedOther, ModRef::None);
+  EXPECT_FALSE(Indirect.TrustedCaptured[1]);
 
   const Cpp::MemoryEffects& None = MEs[3];
-  ASSERT_TRUE(None.m_Valid);
-  EXPECT_TRUE(None.m_Opaque.empty());
-  EXPECT_EQ(None.m_TrustedOther, None.m_Other);
-  EXPECT_EQ(None.m_TrustedCaptured, None.m_Captured);
+  ASSERT_TRUE(None.Valid);
+  EXPECT_TRUE(None.Opaque.empty());
+  EXPECT_EQ(None.TrustedOther, None.Other);
+  EXPECT_EQ(None.TrustedCaptured, None.Captured);
 }
 
 // The trusted parameters follow the signature of each opaque call.
@@ -934,33 +934,33 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedParamsFollowSignatures) {
       /*rewind=*/true);
   ASSERT_EQ(MEs.size(), 4u);
   const Cpp::MemoryEffects& Const = MEs[0];
-  ASSERT_TRUE(Const.m_Valid);
-  EXPECT_EQ(Const.m_Params[0], ModRef::ReadWrite);
-  EXPECT_EQ(Const.m_TrustedParams[0], ModRef::Read);
-  EXPECT_EQ(Const.m_TrustedParams[1], ModRef::Read);
-  EXPECT_EQ(Const.m_TrustedOther, ModRef::None);
-  EXPECT_TRUE(Const.m_Untrusted.empty());
+  ASSERT_TRUE(Const.Valid);
+  EXPECT_EQ(Const.Params[0], ModRef::ReadWrite);
+  EXPECT_EQ(Const.TrustedParams[0], ModRef::Read);
+  EXPECT_EQ(Const.TrustedParams[1], ModRef::Read);
+  EXPECT_EQ(Const.TrustedOther, ModRef::None);
+  EXPECT_TRUE(Const.Untrusted.empty());
 
   const Cpp::MemoryEffects& Ref = MEs[1];
-  ASSERT_TRUE(Ref.m_Valid);
-  EXPECT_NE(static_cast<unsigned>(Ref.m_TrustedParams[0]) &
+  ASSERT_TRUE(Ref.Valid);
+  EXPECT_NE(static_cast<unsigned>(Ref.TrustedParams[0]) &
                 static_cast<unsigned>(ModRef::Write),
             0u);
-  EXPECT_TRUE(Ref.m_Untrusted.empty());
+  EXPECT_TRUE(Ref.Untrusted.empty());
 
   const Cpp::MemoryEffects& Methods = MEs[2];
-  ASSERT_TRUE(Methods.m_Valid);
-  EXPECT_EQ(Methods.m_TrustedParams[0], ModRef::Read);
-  EXPECT_NE(static_cast<unsigned>(Methods.m_TrustedParams[1]) &
+  ASSERT_TRUE(Methods.Valid);
+  EXPECT_EQ(Methods.TrustedParams[0], ModRef::Read);
+  EXPECT_NE(static_cast<unsigned>(Methods.TrustedParams[1]) &
                 static_cast<unsigned>(ModRef::Write),
             0u);
-  EXPECT_TRUE(Methods.m_Untrusted.empty());
+  EXPECT_TRUE(Methods.Untrusted.empty());
 
   const Cpp::MemoryEffects& Unmapped = MEs[3];
-  ASSERT_TRUE(Unmapped.m_Valid);
-  ASSERT_EQ(Unmapped.m_Untrusted.size(), 1u);
-  EXPECT_NE(Unmapped.m_Untrusted[0].find("by_pair"), std::string::npos);
-  EXPECT_NE(static_cast<unsigned>(Unmapped.m_TrustedParams[1]) &
+  ASSERT_TRUE(Unmapped.Valid);
+  ASSERT_EQ(Unmapped.Untrusted.size(), 1u);
+  EXPECT_NE(Unmapped.Untrusted[0].find("by_pair"), std::string::npos);
+  EXPECT_NE(static_cast<unsigned>(Unmapped.TrustedParams[1]) &
                 static_cast<unsigned>(ModRef::Write),
             0u);
 }
