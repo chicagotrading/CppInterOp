@@ -1311,7 +1311,7 @@ void CollectCallees(const llvm::Function& F, Cpp::MemoryEffects& Out) {
     const llvm::Function* Callee = CB ? CB->getCalledFunction() : nullptr;
     if (!Callee || Callee->isIntrinsic() || !Seen.insert(Callee).second)
       continue;
-    Out.m_Callees.push_back(
+    Out.Callees.push_back(
         {Callee->getName().str(), llvm::demangle(Callee->getName())});
   }
 }
@@ -1358,19 +1358,19 @@ void ReadMemoryEffects(const llvm::Function& F, ReachAnalysis& RA,
                        const Reached& Opaque, Cpp::MemoryEffects& Out) {
   if (F.isDeclaration())
     return;
-  Out.m_Valid = true;
+  Out.Valid = true;
   // Memory that the program cannot name, errno and target state cannot hold
   // a value that the caller reads.
-  Out.m_ArgMem =
+  Out.ArgMem =
       ToModRef(F.getMemoryEffects().getModRef(llvm::IRMemLocation::ArgMem));
   Variant V = ReadVariant(F, RA);
-  Out.m_Other = V.Other;
-  Out.m_Params = V.Params;
-  Out.m_ParamsDirect = V.Direct;
-  Out.m_ParamsReachable = V.Reachable;
-  Out.m_Captured = V.Captured;
-  Out.m_Opaque = Opaque.Opaque;
-  Out.m_Untrusted = Opaque.Unbounded;
+  Out.Other = V.Other;
+  Out.Params = V.Params;
+  Out.ParamsDirect = V.Direct;
+  Out.ParamsReachable = V.Reachable;
+  Out.Captured = V.Captured;
+  Out.Opaque = Opaque.Opaque;
+  Out.Untrusted = Opaque.Unbounded;
 }
 
 char CaptureChar(const llvm::Argument& A) {
@@ -1476,12 +1476,12 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
     for (size_t I = 0; I < Names.size(); ++I) {
       if (const llvm::Function* F = Copy->getFunction(Names[I]))
         ReadMemoryEffects(*F, RA, Opaque[F], Out[I]);
-      Out[I].m_TrustedOther = Out[I].m_Other;
-      Out[I].m_TrustedCaptured = Out[I].m_Captured;
-      Out[I].m_TrustedParams = Out[I].m_Params;
-      Out[I].m_TrustedParamsDirect = Out[I].m_ParamsDirect;
-      Out[I].m_TrustedParamsReachable = Out[I].m_ParamsReachable;
-      AnyOpaque |= !Out[I].m_Opaque.empty();
+      Out[I].TrustedOther = Out[I].Other;
+      Out[I].TrustedCaptured = Out[I].Captured;
+      Out[I].TrustedParams = Out[I].Params;
+      Out[I].TrustedParamsDirect = Out[I].ParamsDirect;
+      Out[I].TrustedParamsReachable = Out[I].ParamsReachable;
+      AnyOpaque |= !Out[I].Opaque.empty();
     }
   }
   if (!AnyOpaque)
@@ -1494,17 +1494,17 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
   ReachAnalysis RA(/*Trusted=*/true);
   for (size_t I = 0; I < Names.size(); ++I) {
     const llvm::Function* F = Copy->getFunction(Names[I]);
-    if (Out[I].m_Opaque.empty() || !F || F->isDeclaration())
+    if (Out[I].Opaque.empty() || !F || F->isDeclaration())
       continue;
     Variant V = ReadVariant(*F, RA);
-    Out[I].m_TrustedOther = V.Other;
-    Out[I].m_TrustedCaptured = V.Captured;
-    Out[I].m_TrustedParams = V.Params;
-    Out[I].m_TrustedParamsDirect = V.Direct;
-    Out[I].m_TrustedParamsReachable = V.Reachable;
-    for (const std::string& O : Out[I].m_Opaque)
+    Out[I].TrustedOther = V.Other;
+    Out[I].TrustedCaptured = V.Captured;
+    Out[I].TrustedParams = V.Params;
+    Out[I].TrustedParamsDirect = V.Direct;
+    Out[I].TrustedParamsReachable = V.Reachable;
+    for (const std::string& O : Out[I].Opaque)
       if (O == "<indirect>" || O == "<asm>" || Unbounded.contains(O))
-        AddUnique(Out[I].m_Untrusted, O);
+        AddUnique(Out[I].Untrusted, O);
   }
 }
 
