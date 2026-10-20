@@ -354,6 +354,27 @@ enum QualKind : unsigned char {
   All = Const | Volatile | Restrict
 };
 
+/// What a template parameter stands for.
+enum class TemplateParamKind : unsigned char {
+  Unknown,
+  /// A type parameter: template <typename T>.
+  Type,
+  /// A value parameter: template <int N>.
+  NonType,
+  /// A template parameter: template <template <typename> class C>.
+  Template
+};
+
+/// An #include directive that the preprocessor could not resolve.
+struct FailedInclude {
+  /// The file name as the directive spells it.
+  std::string Spelling;
+  /// The file that holds the directive; empty for interpreter input.
+  std::string Includer;
+  /// The line of the directive in its file.
+  unsigned Line = 0;
+};
+
 /// Enum modelling programming languages.
 enum class InterpreterLanguage : unsigned char {
   Unknown,

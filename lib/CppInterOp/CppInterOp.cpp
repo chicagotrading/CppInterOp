@@ -9,6 +9,7 @@
 
 #include "CppInterOp/CppInterOp.h"
 #include "Unwrap.h"
+#include "CppInterOp/CppInterOpTypes.h"
 #include "CppInterOp/Error.h"
 
 // Generated at configure time; defines CPPINTEROP_BAKED_INTERPRETER_ARGS
@@ -62,6 +63,7 @@
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticSema.h"
+#include "clang/Basic/FileEntry.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Basic/LangStandard.h"
 #include "clang/Basic/Linkage.h"
@@ -72,6 +74,8 @@
 #include "clang/Basic/Version.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Interpreter/Interpreter.h"
+#include "clang/Lex/PPCallbacks.h"
+#include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Overload.h"
 #include "clang/Sema/Ownership.h"
@@ -348,6 +352,88 @@ bool ActivateInterpreter(InterpRef I) {
   return INTEROP_RETURN(true); // success
 }
 
+// Records every #include directive the preprocessor processes, including
+// re-includes an include guard then skips: the SourceManager's include-loc
+// tree keeps only a file's first includer, so a closure query over it would
+// miss any file first reached through an earlier, unrelated include.
+class IncludeGraphRecorder : public clang::PPCallbacks {
+public:
+  explicit IncludeGraphRecorder(const clang::SourceManager& SM) : SM(&SM) {}
+
+  void InclusionDirective(clang::SourceLocation HashLoc,
+                          const clang::Token& /*IncludeTok*/,
+                          llvm::StringRef FileName, bool /*IsAngled*/,
+                          clang::CharSourceRange /*FilenameRange*/,
+                          clang::OptionalFileEntryRef File,
+                          llvm::StringRef /*SearchPath*/,
+                          llvm::StringRef /*RelativePath*/,
+                          const clang::Module* /*SuggestedModule*/,
+                          bool /*ModuleImported*/,
+                          clang::SrcMgr::CharacteristicKind /*FileType*/
+                          ) override {
+    clang::SourceLocation Loc = SM->getExpansionLoc(HashLoc);
+    clang::OptionalFileEntryRef Includer =
+        SM->getFileEntryRefForID(SM->getFileID(Loc));
+    // Prompt input (input_line_N) is a virtual file, file-less to GetDeclFile.
+    if (Includer && SM->isFileOverridden(&Includer->getFileEntry()))
+      Includer.reset();
+    if (!File) {
+      // Unresolved: the diagnostics go to stderr, so callers wanting an
+      // actionable error need the event itself.
+      Failed.push_back({FileName.str(),
+                        Includer ? fileKey(*Includer) : std::string(),
+                        SM->getSpellingLineNumber(Loc)});
+      return;
+    }
+    std::string To = fileKey(*File);
+    Nodes.insert(To);
+    // A directive typed at the prompt has no file behind it; the query is
+    // rooted by path, so only file-to-file edges are needed.
+    if (Includer)
+      Edges[fileKey(*Includer)].insert(std::move(To));
+  }
+
+  [[nodiscard]] const std::vector<FailedInclude>& failedIncludes() const {
+    return Failed;
+  }
+
+  void closure(const std::string& Root, std::vector<std::string>& Out) const {
+    if (!Nodes.count(Root) && !Edges.count(Root))
+      return;
+    std::set<std::string> Seen{Root};
+    std::vector<std::string> Work{Root};
+    while (!Work.empty()) {
+      std::string Cur = std::move(Work.back());
+      Work.pop_back();
+      auto It = Edges.find(Cur);
+      Out.push_back(std::move(Cur));
+      if (It == Edges.end())
+        continue;
+      for (const std::string& Next : It->second)
+        if (Seen.insert(Next).second)
+          Work.push_back(Next);
+    }
+  }
+
+private:
+  // Same spelling GetDeclFile reports, so callers can join the two.
+  static std::string fileKey(clang::FileEntryRef FE) {
+    llvm::StringRef Real = FE.getFileEntry().tryGetRealPathName();
+    return (Real.empty() ? FE.getName() : Real).str();
+  }
+
+  const clang::SourceManager* SM;
+  std::map<std::string, std::set<std::string>> Edges;
+  std::set<std::string> Nodes;
+  std::vector<FailedInclude> Failed;
+};
+
+// Owned by each interpreter's Preprocessor; keyed here for lookup.
+static std::map<const void*, const IncludeGraphRecorder*>& getIncludeGraphs() {
+  static std::map<const void*, const IncludeGraphRecorder*> sGraphs;
+  return sGraphs;
+}
+
 bool DeleteInterpreter(InterpRef I /*=nullptr*/) {
   INTEROP_TRACE(I);
   std::deque<InterpreterInfo>& Interps = GetInterpreters();
@@ -355,6 +441,7 @@ bool DeleteInterpreter(InterpRef I /*=nullptr*/) {
     return INTEROP_RETURN(false);
 
   if (!I) {
+    getIncludeGraphs().erase(Interps.back().Interpreter);
     Interps.pop_back(); // Triggers ~InterpreterInfo() and potential delete
     return INTEROP_RETURN(true);
   }
@@ -367,6 +454,7 @@ bool DeleteInterpreter(InterpRef I /*=nullptr*/) {
   if (found == Interps.end())
     return INTEROP_RETURN(false); // failure
 
+  getIncludeGraphs().erase(Interp);
   Interps.erase(found);
   return INTEROP_RETURN(true);
 }
@@ -1166,6 +1254,285 @@ std::string GetDoxygenComment(ConstDeclRef DRef, bool strip_comment_markers) {
     return INTEROP_RETURN(RC->getRawText(SM).str());
 
   return INTEROP_RETURN(RC->getFormattedText(SM, C.getDiagnostics()));
+}
+
+// Declarations users can name live inside namespaces, classes and language
+// linkage blocks, so descend through those. A linkage block is itself unnamed,
+// which is why it cannot simply be filtered out at the top level.
+static void collectNamedDecls(clang::DeclContext* DC,
+                              std::vector<clang::Decl*>& Out) {
+  for (auto* D : DC->decls()) {
+    if (llvm::isa<clang::NamedDecl>(D))
+      Out.push_back(D);
+    // A friend type names no member; a friend function is the only
+    // declaration of a hidden friend.
+    else if (auto* FD = llvm::dyn_cast<clang::FriendDecl>(D)) {
+      if (auto* ND = FD->getFriendDecl())
+        Out.push_back(ND);
+    }
+    if (llvm::isa<clang::NamespaceDecl>(D) ||
+        llvm::isa<clang::LinkageSpecDecl>(D) || llvm::isa<clang::RecordDecl>(D))
+      collectNamedDecls(llvm::cast<clang::DeclContext>(D), Out);
+    // A class template is not a DeclContext; its members live on the
+    // record it describes.
+    else if (auto* CTD = llvm::dyn_cast<clang::ClassTemplateDecl>(D))
+      if (auto* RD = CTD->getTemplatedDecl())
+        collectNamedDecls(RD, Out);
+  }
+}
+
+// Every partial translation unit the interpreter has parsed. An incremental
+// interpreter creates one TranslationUnitDecl per unit, so walk the whole
+// redeclaration chain rather than a single node.
+// redecls() yields newest-first; report declaration order instead.
+static void collectTranslationUnitDecls(std::vector<clang::Decl*>& Out) {
+  auto* TU = getSema().getASTContext().getTranslationUnitDecl();
+  llvm::SmallVector<clang::TranslationUnitDecl*, 32> Chain;
+  for (auto* R : TU->redecls())
+    Chain.push_back(llvm::cast<clang::TranslationUnitDecl>(R));
+  for (auto* R : llvm::reverse(Chain))
+    collectNamedDecls(R, Out);
+}
+
+void EnumerateTranslationUnitDecls(std::vector<DeclRef>& Decls) {
+  INTEROP_TRACE(INTEROP_OUT(Decls));
+
+  compat::SynthesizingCodeRAII RAII(&getInterp());
+
+  std::vector<clang::Decl*> Found;
+  collectTranslationUnitDecls(Found);
+  Decls.reserve(Found.size());
+  for (auto* D : Found)
+    Decls.emplace_back(D);
+
+  return INTEROP_VOID_RETURN();
+}
+
+bool IsScopedEnum(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* ED =
+      llvm::dyn_cast_or_null<clang::EnumDecl>(unwrap<clang::Decl>(DRef));
+  return INTEROP_RETURN(ED && ED->isScoped());
+}
+
+bool IsUnion(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* RD =
+      llvm::dyn_cast_or_null<clang::RecordDecl>(unwrap<clang::Decl>(DRef));
+  return INTEROP_RETURN(RD && RD->isUnion());
+}
+
+bool IsAliasTemplate(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  return INTEROP_RETURN(llvm::isa_and_nonnull<clang::TypeAliasTemplateDecl>(D));
+}
+
+bool IsParameterPack(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* ND =
+      llvm::dyn_cast_or_null<clang::NamedDecl>(unwrap<clang::Decl>(DRef));
+  return INTEROP_RETURN(ND && ND->isParameterPack());
+}
+
+bool IsClassTemplate(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  return INTEROP_RETURN(llvm::isa_and_nonnull<clang::ClassTemplateDecl>(D));
+}
+
+bool IsImplicitDecl(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  return INTEROP_RETURN(D && D->isImplicit());
+}
+
+bool IsFriendDeclared(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  return INTEROP_RETURN(D && D->getFriendObjectKind() != clang::Decl::FOK_None);
+}
+
+bool IsDefinition(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  if (const auto* TD = llvm::dyn_cast_or_null<clang::TemplateDecl>(D))
+    D = TD->getTemplatedDecl();
+  if (const auto* TagD = llvm::dyn_cast_or_null<clang::TagDecl>(D))
+    return INTEROP_RETURN(TagD->isCompleteDefinition());
+  if (const auto* FD = llvm::dyn_cast_or_null<clang::FunctionDecl>(D))
+    return INTEROP_RETURN(FD->isThisDeclarationADefinition());
+  if (const auto* VD = llvm::dyn_cast_or_null<clang::VarDecl>(D))
+    return INTEROP_RETURN(VD->isThisDeclarationADefinition() !=
+                          clang::VarDecl::DeclarationOnly);
+  // Anything else -- an alias, a namespace, a template parameter -- only ever
+  // appears in its defining form.
+  return INTEROP_RETURN(D != nullptr);
+}
+
+static clang::DeclarationName getCXXOperatorDeclName(clang::ASTContext& Ctx,
+                                                     llvm::StringRef name);
+
+unsigned GetOverloadCount(ConstDeclRef DRef, const std::string& Name) {
+  INTEROP_TRACE(DRef, Name);
+  const auto* DC =
+      llvm::dyn_cast_or_null<clang::DeclContext>(unwrap<clang::Decl>(DRef));
+  if (!DC)
+    return INTEROP_RETURN(0);
+
+  // Spell operators as GetFunctionsUsingName does, so the two counts compare.
+  auto& Ctx = getSema().getASTContext();
+  clang::DeclarationName DN = getCXXOperatorDeclName(Ctx, Name);
+  if (!DN)
+    DN = Ctx.DeclarationNames.getIdentifier(&Ctx.Idents.get(Name));
+
+  unsigned Count = 0;
+  for (const auto* R : DC->getPrimaryContext()->lookup(DN))
+    if (llvm::isa<clang::FunctionDecl, clang::FunctionTemplateDecl>(R))
+      ++Count;
+  return INTEROP_RETURN(Count);
+}
+
+// A template's parameter list, reached from either the template itself or the
+// entity it describes, so a caller holding a CXXRecordDecl does not have to
+// find the ClassTemplateDecl first.
+static const clang::TemplateParameterList*
+getTemplateParameterList(const clang::Decl* D) {
+  if (!D)
+    return nullptr;
+  if (const auto* TD = llvm::dyn_cast<clang::TemplateDecl>(D))
+    return TD->getTemplateParameters();
+  // A partial specialization declares parameters of its own.
+  if (const auto* PSD =
+          llvm::dyn_cast<clang::ClassTemplatePartialSpecializationDecl>(D))
+    return PSD->getTemplateParameters();
+  if (const auto* RD = llvm::dyn_cast<clang::CXXRecordDecl>(D))
+    if (const auto* CTD = RD->getDescribedClassTemplate())
+      return CTD->getTemplateParameters();
+  if (const auto* FD = llvm::dyn_cast<clang::FunctionDecl>(D))
+    if (const auto* FTD = FD->getDescribedFunctionTemplate())
+      return FTD->getTemplateParameters();
+  return nullptr;
+}
+
+unsigned GetNumTemplateParameters(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* Params = getTemplateParameterList(unwrap<clang::Decl>(DRef));
+  return INTEROP_RETURN(Params ? Params->size() : 0);
+}
+
+DeclRef GetTemplateParameter(ConstDeclRef DRef, unsigned Index) {
+  INTEROP_TRACE(DRef, Index);
+  const auto* Params = getTemplateParameterList(unwrap<clang::Decl>(DRef));
+  if (!Params || Index >= Params->size())
+    return INTEROP_RETURN(nullptr);
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+  return INTEROP_RETURN(const_cast<clang::NamedDecl*>(Params->getParam(Index)));
+}
+
+TemplateParamKind GetTemplateParameterKind(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  if (llvm::isa_and_nonnull<clang::TemplateTypeParmDecl>(D))
+    return INTEROP_RETURN(TemplateParamKind::Type);
+  if (llvm::isa_and_nonnull<clang::NonTypeTemplateParmDecl>(D))
+    return INTEROP_RETURN(TemplateParamKind::NonType);
+  if (llvm::isa_and_nonnull<clang::TemplateTemplateParmDecl>(D))
+    return INTEROP_RETURN(TemplateParamKind::Template);
+  return INTEROP_RETURN(TemplateParamKind::Unknown);
+}
+
+std::string GetTemplateParameterDefault(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  if (!D)
+    return INTEROP_RETURN("");
+
+  const clang::TemplateArgumentLoc* Default = nullptr;
+  if (const auto* TTP = llvm::dyn_cast<clang::TemplateTypeParmDecl>(D)) {
+    if (TTP->hasDefaultArgument())
+      Default = &TTP->getDefaultArgument();
+  } else if (const auto* NTTP =
+                 llvm::dyn_cast<clang::NonTypeTemplateParmDecl>(D)) {
+    if (NTTP->hasDefaultArgument())
+      Default = &NTTP->getDefaultArgument();
+  } else if (const auto* TTPD =
+                 llvm::dyn_cast<clang::TemplateTemplateParmDecl>(D)) {
+    if (TTPD->hasDefaultArgument())
+      Default = &TTPD->getDefaultArgument();
+  }
+  if (!Default)
+    return INTEROP_RETURN("");
+
+  std::string Spelling;
+  llvm::raw_string_ostream OS(Spelling);
+  Default->getArgument().print(D->getASTContext().getPrintingPolicy(), OS,
+                               /*IncludeType=*/false);
+  return INTEROP_RETURN(Spelling);
+}
+
+std::string GetDeclFile(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  if (!D)
+    return INTEROP_RETURN("");
+
+  clang::SourceLocation Loc = D->getLocation();
+  if (Loc.isInvalid())
+    return INTEROP_RETURN("");
+
+  const clang::SourceManager& SM = D->getASTContext().getSourceManager();
+  Loc = SM.getExpansionLoc(Loc);
+  clang::OptionalFileEntryRef FE = SM.getFileEntryRefForID(SM.getFileID(Loc));
+  // Interpreter input buffers are virtual files with overridden contents
+  // (input_line_N); they name no on-disk file, so report them as file-less.
+  if (!FE || SM.isFileOverridden(&FE->getFileEntry()))
+    return INTEROP_RETURN("");
+
+  llvm::StringRef Real = FE->getFileEntry().tryGetRealPathName();
+  return INTEROP_RETURN((Real.empty() ? FE->getName() : Real).str());
+}
+
+unsigned GetDeclLine(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  if (!D)
+    return INTEROP_RETURN(0);
+
+  clang::SourceLocation Loc = D->getLocation();
+  if (Loc.isInvalid())
+    return INTEROP_RETURN(0);
+
+  const clang::SourceManager& SM = D->getASTContext().getSourceManager();
+  return INTEROP_RETURN(SM.getSpellingLineNumber(SM.getExpansionLoc(Loc)));
+}
+
+bool IsInSystemHeader(ConstDeclRef DRef) {
+  INTEROP_TRACE(DRef);
+  const auto* D = unwrap<clang::Decl>(DRef);
+  if (!D)
+    return INTEROP_RETURN(false);
+
+  const clang::SourceManager& SM = D->getASTContext().getSourceManager();
+  return INTEROP_RETURN(SM.isInSystemHeader(D->getLocation()));
+}
+
+void GetIncludeClosure(const std::string& Path, std::vector<std::string>& Out) {
+  INTEROP_TRACE(Path, INTEROP_OUT(Out));
+  auto& Graphs = getIncludeGraphs();
+  auto It = Graphs.find(&getInterp());
+  if (It != Graphs.end())
+    It->second->closure(Path, Out);
+  return INTEROP_VOID_RETURN();
+}
+
+void GetFailedIncludes(std::vector<FailedInclude>& Out) {
+  INTEROP_TRACE(INTEROP_OUT(Out));
+  auto& Graphs = getIncludeGraphs();
+  auto It = Graphs.find(&getInterp());
+  if (It != Graphs.end())
+    Out = It->second->failedIncludes();
+  return INTEROP_VOID_RETURN();
 }
 
 std::vector<DeclRef> GetUsingNamespaces(ConstDeclRef DRef) {
@@ -6000,6 +6367,15 @@ InterpRef CreateInterpreter(const std::vector<const char*>& Args /*={}*/,
   }
 
   RegisterInterpreter(I, /*Owned=*/true, std::move(ArgvStorage));
+
+  // Attach at creation, so the graph covers every include of every input.
+  {
+    clang::Preprocessor& PP = I->getCI()->getPreprocessor();
+    auto Recorder =
+        std::make_unique<IncludeGraphRecorder>(I->getCI()->getSourceManager());
+    getIncludeGraphs()[I] = Recorder.get();
+    PP.addPPCallbacks(std::move(Recorder));
+  }
 
 // Define runtime symbols in the JIT dylib for clang-repl
 #if !defined(CPPINTEROP_USE_CLING) && !defined(EMSCRIPTEN)
