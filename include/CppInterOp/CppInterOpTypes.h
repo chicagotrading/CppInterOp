@@ -463,6 +463,136 @@ enum class ValueKind : std::uint8_t {
   RValue,
 };
 
+/// What a function can do to one kind of memory.
+// Bindings read an int base type as integers, a uint8_t one as chars.
+// NOLINTNEXTLINE(performance-enum-size)
+enum class ModRef {
+  None = 0,
+  Read = 1,
+  Write = 2,
+  ReadWrite = 3,
+};
+
+/// How a parameter passes its argument, as the mangled name of the function
+/// shows it.
+enum class ParamKind { // NOLINT(performance-enum-size)
+  /// A kind that the name does not show: a pointer to member or to a
+  /// function, or a type that the demangler does not classify.
+  Unknown,
+  /// A builtin type by value.
+  Scalar,
+  /// A class or enum type by value.
+  Object,
+  /// A reference to const.
+  ConstReference,
+  /// A reference to non-const.
+  MutableReference,
+  /// A pointer to const.
+  ConstPointer,
+  /// A pointer to non-const.
+  MutablePointer,
+};
+
+/// The signature of a function, read from its mangled name.
+struct FunctionSignature {
+  /// False when the name is not the mangled name of a C++ function, for
+  /// example a C function.
+  bool Known = false;
+  /// The unqualified name, without template arguments.
+  std::string BaseName;
+  std::vector<ParamKind> Params;
+  bool ConstMethod = false;
+  bool Variadic = false;
+};
+
+/// How an opaque call reaches code with no body or summary.
+enum class OpaqueKind { // NOLINT(performance-enum-size)
+  /// A direct call to a declaration.
+  Declaration,
+  /// A call through a function pointer or a virtual call.
+  Indirect,
+  /// Inline assembly.
+  InlineAsm,
+};
+
+/// A call that is reachable and has no body or summary.
+struct OpaqueCall {
+  OpaqueKind Kind = OpaqueKind::Declaration;
+  /// The mangled and demangled names of a declaration; empty otherwise.
+  std::string Mangled;
+  std::string Demangled;
+  /// The signature of a declaration.
+  FunctionSignature Signature;
+  /// Whether the signature bounds the Trusted fields. False for an indirect
+  /// call, inline assembly, and a declaration whose parameters do not map
+  /// one to one to the IR parameters (a class passed by value).
+  bool Bounded = false;
+};
+
+/// The memory effects that LLVM proves for a function from its optimized IR.
+/// Each field is an upper bound: ReadWrite means "not proven otherwise".
+///
+/// The memory of a pointer parameter P is its own object (the bytes P points
+/// to) and the memory reachable from it: whatever the pointers stored in that
+/// memory point to, transitively. ParamsDirect, ParamsReachable, Other
+/// and Captured attribute every access of the optimized code to one of
+/// these regions, or to other memory when its pointer has no single origin.
+struct MemoryEffects {
+  /// False when the code did not compile or does not define the function.
+  bool Valid = false;
+  /// LLVM's own bound on the memory reached through the pointer parameters.
+  ModRef ArgMem = ModRef::ReadWrite;
+  /// Memory that no parameter reaches: globals, pointers of unknown origin,
+  /// and whatever an opaque call touches. Excludes the accesses that
+  /// ParamsDirect and ParamsReachable attribute to a parameter.
+  ModRef Other = ModRef::ReadWrite;
+  /// Per parameter, LLVM's own bound; None for a parameter that is not a
+  /// pointer. It merges the parameter's own object with memory reachable
+  /// from it and from other pointers of unknown origin.
+  std::vector<ModRef> Params;
+  /// Per parameter: accesses through pointers based on the parameter, that
+  /// is, to its own object.
+  std::vector<ModRef> ParamsDirect;
+  /// Per parameter: accesses through pointers loaded from its memory,
+  /// transitively. Valid as an attribution only while the parameter is not
+  /// captured (see Captured) and while its reachable memory is not also
+  /// reachable from another parameter: a pointer that may come from two
+  /// parameters counts for both.
+  std::vector<ModRef> ParamsReachable;
+  /// Per parameter: true when a pointer into the parameter's memory may
+  /// escape it: stored into memory that another parameter, a global or an
+  /// unknown pointer reaches, kept by an opaque call, or converted to an
+  /// integer. Comparing the address, or storing a pointer into fresh memory
+  /// that only this parameter's memory holds, is not a capture. A captured
+  /// parameter's reachable memory may later change through other pointers.
+  std::vector<bool> Captured;
+  /// The calls that are reachable and have no body or summary. A reachable
+  /// summary marked incomplete contributes the opaque calls of its own body.
+  std::vector<OpaqueCall> Opaque;
+  /// Other, Captured, Params, ParamsDirect and ParamsReachable
+  /// when every opaque call is trusted to access only memory through its
+  /// arguments, to keep no copy of them, and not to write through a const
+  /// reference, a pointer to const, or `this` of a const method. They show
+  /// what the visible code does. Equal to the untrusted fields when Opaque
+  /// is empty.
+  ModRef TrustedOther = ModRef::ReadWrite;
+  std::vector<bool> TrustedCaptured;
+  std::vector<ModRef> TrustedParams;
+  std::vector<ModRef> TrustedParamsDirect;
+  std::vector<ModRef> TrustedParamsReachable;
+  /// A function that the analyzed function calls directly, before
+  /// optimization inlines it.
+  struct Callee {
+    std::string Mangled;
+    std::string Demangled;
+    FunctionSignature Signature;
+  };
+  /// The direct callees in the order of their first call: the selected
+  /// overload, and also the constructors, destructors and conversions of the
+  /// temporaries of the call.
+  std::vector<Callee> Callees;
+};
+
 /// A class modeling function calls for functions produced by the interpreter
 /// in compiled code. It provides an information if we are calling a standard
 /// function, constructor or destructor.

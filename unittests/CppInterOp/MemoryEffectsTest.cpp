@@ -1,0 +1,1065 @@
+#include "Utils.h"
+
+#include "../../lib/CppInterOp/MemoryEffects.h"
+#include "CppInterOp/CppInterOp.h"
+#include "CppInterOp/CppInterOpTypes.h"
+
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/AsmParser/Parser.h"
+#include "llvm/Config/llvm-config.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/ModRef.h"
+#include "llvm/Support/SourceMgr.h"
+
+#include "gtest/gtest.h"
+
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <vector>
+
+using namespace TestUtils;
+using Cpp::ModRef;
+
+#ifdef CPPINTEROP_USE_CLING
+#define SKIP_WITHOUT_MEMORY_EFFECTS()                                          \
+  GTEST_SKIP() << "GetFunctionsMemoryEffects is clang-repl only; with cling "  \
+                  "it returns invalid results"
+#else
+#define SKIP_WITHOUT_MEMORY_EFFECTS() (void)0
+#endif
+
+#ifdef _WIN32
+#define SKIP_ON_MSVC_ABI(Why)                                                  \
+  GTEST_SKIP() << "expects the Itanium C++ ABI: " << Why
+#else
+#define SKIP_ON_MSVC_ABI(Why) (void)0
+#endif
+
+#ifdef _LIBCPP_VERSION
+#define SKIP_ON_LIBCXX(Why) GTEST_SKIP() << "expects libstdc++: " << Why
+#else
+#define SKIP_ON_LIBCXX(Why) (void)0
+#endif
+
+namespace {
+bool Mentions(const Cpp::MemoryEffects& ME, const std::string& Name) {
+  return std::any_of(ME.Opaque.begin(), ME.Opaque.end(),
+                     [&](const Cpp::OpaqueCall& O) {
+                       return O.Demangled.find(Name) != std::string::npos;
+                     });
+}
+
+bool HasOpaque(const Cpp::MemoryEffects& ME, Cpp::OpaqueKind Kind) {
+  return std::any_of(ME.Opaque.begin(), ME.Opaque.end(),
+                     [&](const Cpp::OpaqueCall& O) { return O.Kind == Kind; });
+}
+
+std::string OpaqueNames(const Cpp::MemoryEffects& ME) {
+  std::string Out;
+  for (const Cpp::OpaqueCall& O : ME.Opaque)
+    Out += (Out.empty() ? "" : ", ") + O.Demangled;
+  return Out;
+}
+
+bool AllBounded(const Cpp::MemoryEffects& ME) {
+  return std::all_of(ME.Opaque.begin(), ME.Opaque.end(),
+                     [](const Cpp::OpaqueCall& O) { return O.Bounded; });
+}
+
+bool Writes(ModRef MR) {
+  return static_cast<unsigned>(MR) & static_cast<unsigned>(ModRef::Write);
+}
+} // namespace
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PureRead) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct Box { int v; };
+    inline int twice(const Box& b) { return 2 * b.v; }
+    extern "C" int me_pure(Box* b) { return twice(*b); }
+  )",
+                                                        "me_pure");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.ArgMem, ModRef::Read);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  ASSERT_EQ(ME.Params.size(), 1U);
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_TRUE(ME.Opaque.empty());
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WritesOnlyTheWrittenParameter) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    inline void bump(int& x) { x += 1; }
+    extern "C" void me_bump(int* a, int* b) { bump(*a); (void)*b; }
+  )",
+                                                        "me_bump");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  ASSERT_EQ(ME.Params.size(), 2U);
+  EXPECT_EQ(ME.Params[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.Params[1], ModRef::None);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MutableMemberIsAWrite) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct Counted { mutable int hits = 0; int get() const { return ++hits; } };
+    extern "C" int me_mutable(Counted* c) {
+      const Counted& view = *c;
+      return view.get();
+    }
+  )",
+                                                        "me_mutable");
+  ASSERT_TRUE(ME.Valid);
+  ASSERT_EQ(ME.Params.size(), 1U);
+  EXPECT_EQ(ME.Params[0], ModRef::ReadWrite);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           MemoryEffects_HandlePointeeWriteIsReachableFromTheParameter) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct Impl { double data[4]; };
+    struct Tensor { Impl* impl; void add(double x) const { impl->data[0] += x; } };
+    extern "C" void me_handle(Tensor* t) {
+      const Tensor& view = *t;
+      view.add(1.0);
+    }
+  )",
+                                                        "me_handle");
+  ASSERT_TRUE(ME.Valid);
+  ASSERT_EQ(ME.Params.size(), 1U);
+  // The handle itself is only read; the write goes through the pointer it
+  // holds. Whether that memory is the handle's is the caller's decision.
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::Read);
+  EXPECT_EQ(ME.ParamsReachable[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_TRUE(ME.Opaque.empty());
+}
+
+// A container's heap is memory reachable from the parameter that owns it,
+// not other memory.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ContainerHeapIsReachable) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("libc++ inlines its throws around out-of-line exception "
+                 "constructors, which are opaque calls");
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("#include <vector>"), 0);
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    extern "C" void me_push(std::vector<int>* v, const int* x) { v->push_back(*x); }
+  )",
+                                                        "me_push");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty());
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_TRUE(Writes(ME.ParamsDirect[0]));
+  EXPECT_TRUE(Writes(ME.ParamsReachable[0]));
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_EQ(ME.ParamsDirect[1], ModRef::Read);
+  EXPECT_EQ(ME.ParamsReachable[1], ModRef::None);
+  EXPECT_FALSE(ME.Captured[1]);
+}
+
+// A ring buffer over a vector, as a sliding-window state uses it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RingBufferOverAVector) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("#include <vector>\n#include <utility>"), 0);
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct Window {
+      std::vector<std::pair<double, long>> s{8};
+      unsigned long head = 0, tail = 0;
+      std::pair<double, long>& at(unsigned long i) { return s[i & (s.size() - 1)]; }
+      void push(double v, long i) {
+        while (head > tail && !(at(head - 1).first > v)) --head;
+        head -= (head - tail == s.size());
+        at(head++) = {v, i};
+      }
+      void purge(long i) { while (tail < head && i >= at(tail).second) ++tail; }
+      double peek() const { return s[tail & (s.size() - 1)].first; }
+    };
+    extern "C" double me_window(Window* w, const double* v, const long* t) {
+      w->push(*v, *t);
+      w->purge(*t - 5);
+      return w->peek();
+    }
+  )",
+                                                        "me_window");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty());
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.ParamsReachable[0], ModRef::ReadWrite);
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_EQ(ME.ParamsDirect[1], ModRef::Read);
+  EXPECT_EQ(ME.ParamsDirect[2], ModRef::Read);
+}
+
+// Comparing a parameter's address keeps no pointer and writes nothing.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressCompareIsNotACapture) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("libc++'s erase frees the node through a unique_ptr "
+                 "temporary, and a load from a local is other memory");
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("#include <unordered_set>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::GetFunctionsMemoryEffects(R"(
+    struct Node { int v; Node* next; };
+    struct List { Node* head; };
+    extern "C" int me_find_addr(const List* l, const int* key) {
+      for (Node* n = l->head; n; n = n->next)
+        if (&n->v == key)
+          return 1;
+      return 0;
+    }
+    extern "C" void me_erase(std::unordered_set<int>* s, const int* key) { s->erase(*key); }
+  )",
+                                     {"me_find_addr", "me_erase"},
+                                     /*rewind=*/false);
+  ASSERT_EQ(MEs.size(), 2U);
+  const Cpp::MemoryEffects& Find = MEs[0];
+  ASSERT_TRUE(Find.Valid);
+  EXPECT_EQ(Find.Other, ModRef::None);
+  EXPECT_EQ(Find.ParamsDirect[0], ModRef::Read);
+  EXPECT_EQ(Find.ParamsReachable[0], ModRef::Read);
+  EXPECT_EQ(Find.ParamsDirect[1], ModRef::None);
+  EXPECT_EQ(Find.ParamsReachable[1], ModRef::None);
+  EXPECT_FALSE(Find.Captured[1]);
+
+  const Cpp::MemoryEffects& Erase = MEs[1];
+  ASSERT_TRUE(Erase.Valid);
+  EXPECT_TRUE(Erase.Opaque.empty());
+  EXPECT_EQ(Erase.Other, ModRef::None);
+  EXPECT_TRUE(Writes(Erase.ParamsDirect[0]) ||
+              Writes(Erase.ParamsReachable[0]));
+  EXPECT_FALSE(Writes(Erase.ParamsDirect[1]));
+  EXPECT_EQ(Erase.ParamsReachable[1], ModRef::None);
+  EXPECT_FALSE(Erase.Captured[1]);
+}
+
+// A write through a const parameter shows on that parameter, whatever else
+// the function writes.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           MemoryEffects_MutableWriteNextToAWrittenParameter) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct Counted { mutable int hits = 0; int get() const { return ++hits; } };
+    extern "C" void me_mutable_pair(int* out, const Counted* c) { *out = c->get(); }
+  )",
+                                                        "me_mutable_pair");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::Write);
+  EXPECT_EQ(ME.ParamsDirect[1], ModRef::ReadWrite);
+  EXPECT_EQ(ME.ParamsReachable[1], ModRef::None);
+}
+
+// Two handles may point to one object: the write is reachable from the
+// written handle, the read from the other, and a pointer that may come from
+// either counts for both.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TwoHandlesToOneObject) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::GetFunctionsMemoryEffects(R"(
+    struct Impl { int v; };
+    struct H { Impl* p; };
+    extern "C" void me_two_handles(const H* a, const H* b) { a->p->v = b->p->v + 1; }
+    extern "C" void me_either_handle(const H* a, const H* b, int pick) {
+      (pick ? a->p : b->p)->v = 1;
+    }
+  )",
+                                     {"me_two_handles", "me_either_handle"},
+                                     /*rewind=*/false);
+  ASSERT_EQ(MEs.size(), 2U);
+  const Cpp::MemoryEffects& Two = MEs[0];
+  ASSERT_TRUE(Two.Valid);
+  EXPECT_EQ(Two.Other, ModRef::None);
+  EXPECT_EQ(Two.ParamsDirect[0], ModRef::Read);
+  EXPECT_EQ(Two.ParamsReachable[0], ModRef::Write);
+  EXPECT_EQ(Two.ParamsDirect[1], ModRef::Read);
+  EXPECT_EQ(Two.ParamsReachable[1], ModRef::Read);
+  EXPECT_FALSE(Two.Captured[0]);
+  EXPECT_FALSE(Two.Captured[1]);
+
+  const Cpp::MemoryEffects& Either = MEs[1];
+  ASSERT_TRUE(Either.Valid);
+  EXPECT_EQ(Either.Other, ModRef::None);
+  EXPECT_TRUE(Writes(Either.ParamsReachable[0]));
+  EXPECT_TRUE(Writes(Either.ParamsReachable[1]));
+}
+
+// A pointer into a parameter's memory that another parameter's memory or a
+// global keeps is a capture; one that a fresh node of the same parameter
+// keeps is not.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CaptureIsAStoreOutsideTheOwner) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct Slot { const int* p; };
+    const int* me_keep_global = nullptr;
+    extern "C" void me_keep(Slot* s, const int* x) { s->p = x; }
+    extern "C" void me_keep_in_global(const int* x) { me_keep_global = x; }
+    struct N { N* next; int v; };
+    struct L { N* head; };
+    extern "C" void me_link(L* l, const int* x) { l->head = new N{l->head, *x}; }
+  )",
+      {"me_keep", "me_keep_in_global", "me_link"},
+      /*rewind=*/false);
+  ASSERT_EQ(MEs.size(), 3U);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_FALSE(MEs[0].Captured[0]);
+  EXPECT_TRUE(MEs[0].Captured[1]);
+  EXPECT_EQ(MEs[0].ParamsDirect[0], ModRef::Write);
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_TRUE(MEs[1].Captured[0]);
+  EXPECT_EQ(MEs[1].Other, ModRef::Write);
+  ASSERT_TRUE(MEs[2].Valid);
+  EXPECT_TRUE(MEs[2].Opaque.empty());
+  EXPECT_EQ(MEs[2].Other, ModRef::None);
+  EXPECT_EQ(MEs[2].ParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_FALSE(MEs[2].Captured[0]);
+  EXPECT_FALSE(MEs[2].Captured[1]);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_GlobalWriteIsOtherMemory) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    int me_counter = 0;
+    extern "C" int me_global(const int* x) { ++me_counter; return *x; }
+  )",
+                                                        "me_global");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
+  EXPECT_NE(static_cast<unsigned>(ME.Other) &
+                static_cast<unsigned>(ModRef::Write),
+            0U);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ExternalCallIsOpaque) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    int me_external(const int& x);
+    extern "C" int me_calls_external(int* x) { return me_external(*x); }
+  )",
+                                                        "me_calls_external");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Other, ModRef::ReadWrite);
+  EXPECT_TRUE(Mentions(ME, "me_external"));
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IndirectCallIsOpaque) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct Callback { int (*fn)(int); };
+    extern "C" int me_indirect(Callback* c) { return c->fn(1); }
+  )",
+                                                        "me_indirect");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(HasOpaque(ME, Cpp::OpaqueKind::Indirect));
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ThrowPathIsNotAnEffect) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    inline int checked(const int* p, int i) {
+      if (i < 0)
+        throw 1;
+      return p[i];
+    }
+    extern "C" int me_throws(int* p) { return checked(p, p[1]); }
+  )",
+                                                        "me_throws");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
+  EXPECT_TRUE(ME.Opaque.empty());
+}
+
+// An inline function that an earlier input already emitted must still be
+// analyzed through its body.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_InlineBodyFromEarlierInput) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare(R"(
+    inline void me_poke(int& x) { x = 7; }
+    extern "C" void me_first_use(int* p) { me_poke(*p); }
+  )"),
+            0);
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    extern "C" void me_second_use(int* p, int* q) { me_poke(*p); (void)*q; }
+  )",
+                                                        "me_second_use");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty());
+  EXPECT_EQ(ME.Other, ModRef::None);
+  ASSERT_EQ(ME.Params.size(), 2U);
+  EXPECT_EQ(ME.Params[0], ModRef::Write);
+  EXPECT_EQ(ME.Params[1], ModRef::None);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_InvalidCode) {
+  TestFixture::CreateInterpreter();
+  // MSBuild fails a test step that prints a "file(l,c): error X:" line.
+  testing::internal::CaptureStderr();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(
+      R"(extern "C" int me_bad(int* p) { return no_such_function(*p); })",
+      "me_bad");
+  std::string Err = testing::internal::GetCapturedStderr();
+  EXPECT_FALSE(ME.Valid);
+#ifndef CPPINTEROP_USE_CLING
+  EXPECT_NE(Err.find("no_such_function"), std::string::npos) << Err;
+#endif
+  ME = Cpp::GetFunctionMemoryEffects(
+      R"(extern "C" int me_other(int) { return 0; })", "me_missing");
+  EXPECT_FALSE(ME.Valid);
+}
+
+// An address that leaves as an integer is a capture; one that is only
+// compared or subtracted is not.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           MemoryEffects_AddressAsIntegerCapturesOnlyWhenKept) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::GetFunctionsMemoryEffects(R"(
+    using me_uptr = __UINTPTR_TYPE__;
+    me_uptr me_int_global = 0;
+    extern "C" void me_int_escape(const int* x) { me_int_global = (me_uptr)x; }
+    extern "C" int me_int_compare(const int* a, const int* b) {
+      return (me_uptr)a < (me_uptr)b ? (int)((me_uptr)b - (me_uptr)a) : 0;
+    }
+  )",
+                                     {"me_int_escape", "me_int_compare"},
+                                     /*rewind=*/false);
+  ASSERT_EQ(MEs.size(), 2U);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(MEs[0].Captured[0]);
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_FALSE(MEs[1].Captured[0]);
+  EXPECT_FALSE(MEs[1].Captured[1]);
+  EXPECT_EQ(MEs[1].Other, ModRef::None);
+}
+
+namespace {
+std::string SummaryHeader() {
+  return "# cppinterop-memory-effects v1 llvm " +
+         std::to_string(LLVM_VERSION_MAJOR) + "\n";
+}
+
+// The seven fields of a variant that reads one const-reference parameter.
+std::string ReadsItsParameter() {
+  return llvm::utohexstr(llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::Ref)
+                             .toIntValue()) +
+         "\trc\tr\tn\t.\tn\t..";
+}
+
+// The seven fields of a variant bounded by nothing.
+std::string Anything() {
+  return llvm::utohexstr(llvm::MemoryEffects::unknown().toIntValue()) +
+         "\t-.\tm\tm\tc\tm\tu.";
+}
+} // namespace
+
+// A summary from a build-time table stands in for a body the module lacks.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           MemoryEffects_SummaryMakesADeclarationPrecise) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  TestFixture::CreateInterpreter();
+  std::string Table =
+      SummaryHeader() + "_Z10me_summaryRKi\t" + ReadsItsParameter() + "\t.\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    int me_summary(const int& x);
+    extern "C" int me_uses_summary(int* x) { return me_summary(*x); }
+  )",
+                                                        "me_uses_summary");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty());
+  EXPECT_EQ(ME.Other, ModRef::None);
+  ASSERT_EQ(ME.Params.size(), 1U);
+  EXPECT_EQ(ME.Params[0], ModRef::Read);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryTableIsValidated) {
+  TestFixture::CreateInterpreter();
+  // A table from another LLVM major version.
+  EXPECT_EQ(
+      Cpp::LoadMemoryEffectsSummaries(
+          "# cppinterop-memory-effects v1 llvm 0\nf\t0\t\t\t\t\tn\t.\t.\n"),
+      -1);
+  EXPECT_EQ(Cpp::LoadMemoryEffectsSummaries(
+                (SummaryHeader() + "f\tzz\t\t\t\t\tn\t.\t.\n").c_str()),
+            -1);
+  EXPECT_EQ(Cpp::LoadMemoryEffectsSummaries(
+                (SummaryHeader() + "f\t0\tr\tr\tn\t.\tn\t..\t.\n").c_str()),
+            -1);
+  // An incomplete summary carries its trusted variant.
+  EXPECT_EQ(Cpp::LoadMemoryEffectsSummaries(
+                (SummaryHeader() + "f\t" + Anything() + "\ti\n").c_str()),
+            -1);
+  EXPECT_EQ(Cpp::LoadMemoryEffectsSummaries(
+                (SummaryHeader() + "f\t" + Anything() + "\t.\n").c_str()),
+            1);
+  EXPECT_EQ(Cpp::LoadMemoryEffectsSummaries(SummaryHeader().c_str()), 0);
+}
+
+// An incomplete summary brings the opaque calls of its body: the untrusted
+// fields include them, the trusted fields bound them by their signatures.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IncompleteSummaryIsOpaque) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  TestFixture::CreateInterpreter();
+  std::string Table = SummaryHeader() + "_Z13me_incompleteRKi\t" + Anything() +
+                      "\ti\t" + ReadsItsParameter() + "\t_Z9me_loggerRKi\n" +
+                      "_Z12me_unboundedRKi\t" + Anything() + "\ti\t" +
+                      Anything() + "\t!me_sink\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 2);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    int me_incomplete(const int& x);
+    int me_unbounded(const int& x);
+    extern "C" int me_uses_incomplete(int* x) { return me_incomplete(*x); }
+    extern "C" int me_uses_unbounded(int* x) { return me_unbounded(*x); }
+  )",
+      {"me_uses_incomplete", "me_uses_unbounded"},
+      /*rewind=*/false);
+  ASSERT_EQ(MEs.size(), 2U);
+  const Cpp::MemoryEffects& Inc = MEs[0];
+  ASSERT_TRUE(Inc.Valid);
+  ASSERT_EQ(Inc.Opaque.size(), 1U);
+  EXPECT_EQ(Inc.Opaque[0].Kind, Cpp::OpaqueKind::Declaration);
+  EXPECT_EQ(Inc.Opaque[0].Mangled, "_Z9me_loggerRKi");
+  EXPECT_EQ(Inc.Opaque[0].Demangled, "me_logger(int const&)");
+  EXPECT_TRUE(Inc.Opaque[0].Bounded);
+  ASSERT_TRUE(Inc.Opaque[0].Signature.Known);
+  EXPECT_EQ(Inc.Opaque[0].Signature.Params,
+            std::vector<Cpp::ParamKind>{Cpp::ParamKind::ConstReference});
+  EXPECT_EQ(Inc.Other, ModRef::ReadWrite);
+  EXPECT_EQ(Inc.TrustedOther, ModRef::None);
+  EXPECT_EQ(Inc.TrustedParamsDirect[0], ModRef::Read);
+  EXPECT_FALSE(Inc.TrustedCaptured[0]);
+
+  const Cpp::MemoryEffects& Unb = MEs[1];
+  ASSERT_TRUE(Unb.Valid);
+  ASSERT_EQ(Unb.Opaque.size(), 1U);
+  EXPECT_EQ(Unb.Opaque[0].Mangled, "me_sink");
+  EXPECT_FALSE(Unb.Opaque[0].Bounded);
+  EXPECT_FALSE(Unb.Opaque[0].Signature.Known); // a C name has no parameters
+  EXPECT_EQ(Unb.TrustedOther, ModRef::ReadWrite);
+}
+
+// A complete summary is a proof: a write it records stays under trust.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CompleteSummaryBeatsTrust) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  TestFixture::CreateInterpreter();
+  std::string Effects = llvm::utohexstr(
+      llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::ModRef).toIntValue());
+  std::string Table = SummaryHeader() + "_Z11me_completeRKi\t" + Effects +
+                      "\t-c\tm\tn\t.\tn\t..\t.\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    int me_complete(const int& x);
+    int me_trust_bait(const int& x);
+    extern "C" int me_uses_complete(int* x) { return me_complete(*x) + me_trust_bait(*x); }
+  )",
+                                                        "me_uses_complete");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Mentions(ME, "me_trust_bait"));
+  EXPECT_FALSE(Mentions(ME, "me_complete"));
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.TrustedParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_EQ(ME.TrustedOther, ModRef::None);
+}
+
+// The summarizer marks a body that reaches an opaque call, records its
+// trusted variant and the call, and skips what the JIT sees from headers.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           MemoryEffects_SummarizerMarksIncompleteBodies) {
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare void @_Z10me_sum_logRKi(ptr)
+    declare void @me_sum_c_log(ptr)
+    define i32 @me_sum_complete(ptr %p) {
+      %v = load i32, ptr %p
+      ret i32 %v
+    }
+    define void @me_sum_incomplete(ptr %p) {
+      call void @_Z10me_sum_logRKi(ptr %p)
+      store i32 1, ptr %p
+      ret void
+    }
+    define void @me_sum_unbounded(ptr %p) {
+      call void @me_sum_c_log(ptr %p)
+      ret void
+    }
+    define linkonce_odr void @me_sum_inline(ptr %p) {
+      store i32 1, ptr %p
+      ret void
+    }
+    define weak_odr void @me_sum_explicit(ptr %p) {
+      store i32 1, ptr %p
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  EXPECT_EQ(Table.find("me_sum_inline"), std::string::npos);
+  EXPECT_NE(Table.find("\nme_sum_explicit\t"), std::string::npos);
+  llvm::SmallVector<llvm::StringRef, 8> Lines;
+  llvm::StringRef(Table).split(Lines, '\n', -1, false);
+  for (llvm::StringRef Line : Lines) {
+    llvm::SmallVector<llvm::StringRef, 20> Fields;
+    Line.split(Fields, '\t');
+    if (Fields[0] == "me_sum_complete") {
+      ASSERT_EQ(Fields.size(), 9U);
+      EXPECT_EQ(Fields[3], "r"); // reads its own object
+      EXPECT_EQ(Fields[6], "n");
+      EXPECT_EQ(Fields[8], ".");
+    } else if (Fields[0] == "me_sum_incomplete") {
+      ASSERT_EQ(Fields.size(), 17U);
+      EXPECT_EQ(Fields[3], "m");
+      EXPECT_EQ(Fields[6], "m");
+      EXPECT_EQ(Fields[8], "i");
+      EXPECT_EQ(Fields[11], "m"); // the store is proven whatever the log does
+      EXPECT_EQ(Fields[14], "n"); // trusted: the log touches no other memory
+      EXPECT_EQ(Fields[16], "_Z10me_sum_logRKi");
+    } else if (Fields[0] == "me_sum_unbounded") {
+      ASSERT_EQ(Fields.size(), 17U);
+      EXPECT_EQ(Fields[16], "!me_sum_c_log");
+    }
+  }
+  EXPECT_EQ(CppInternal::LoadMemoryEffectsSummaries(Table), 4);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummarizerSortsOpaqueNames) {
+  // The closure visits callees in pointer order; the table must not.
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare void @zeta(ptr)
+    declare void @alpha(ptr)
+    define void @me_ord_b(ptr %p) {
+      call void @zeta(ptr %p)
+      ret void
+    }
+    define void @me_ord_a(ptr %p) {
+      call void @alpha(ptr %p)
+      ret void
+    }
+    define void @me_ord_top(ptr %p) {
+      call void @me_ord_b(ptr %p)
+      call void @me_ord_a(ptr %p)
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  llvm::SmallVector<llvm::StringRef, 8> Lines;
+  llvm::StringRef(Table).split(Lines, '\n', -1, false);
+  bool Found = false;
+  for (llvm::StringRef Line : Lines) {
+    if (!Line.starts_with("me_ord_top\t"))
+      continue;
+    Found = true;
+    EXPECT_TRUE(Line.ends_with("\t!alpha\t!zeta")) << Line.str();
+  }
+  EXPECT_TRUE(Found) << Table;
+}
+
+// The out-of-line hash of the prebuilt libstdc++ sits behind a noexcept
+// std::hash: with its summary, the terminate path of the invoke adds no
+// effect.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           MemoryEffects_NoexceptTerminatePathIsNotAnEffect) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+#if defined(__aarch64__) || defined(_M_ARM64)
+  GTEST_SKIP() << "AArch64 returns the one-pointer iterator as i64; the "
+                  "analysis loses its origin through inttoptr";
+#endif
+  SKIP_ON_LIBCXX("libc++ can hash with an out-of-line std::__hash_memory; "
+                 "the test has a summary only for libstdc++'s _Hash_bytes");
+  // std::string_view: the extern template of std::string hides its bodies.
+  TestFixture::CreateInterpreter({"-std=c++17"});
+  std::string Hash = llvm::utohexstr(
+      llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::Ref).toIntValue());
+  std::string Table = SummaryHeader() + "_ZSt11_Hash_bytesPKvmm\t" + Hash +
+                      "\trc-.-.\trnn\tnnn\t...\tn\t....\t.\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+  ASSERT_EQ(Cpp::Declare("#include <string_view>\n#include <unordered_map>"),
+            0);
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct Table { std::unordered_map<std::string_view, int> m; };
+    extern "C" int me_lookup(const Table* t, const std::string_view* k) {
+      auto it = t->m.find(*k);
+      return it == t->m.end() ? -1 : it->second;
+    }
+  )",
+                                                        "me_lookup");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_EQ(ME.ParamsDirect[0], ModRef::Read);
+  EXPECT_EQ(ME.ParamsReachable[0], ModRef::Read);
+  EXPECT_EQ(ME.ParamsDirect[1], ModRef::Read);
+  EXPECT_FALSE(Writes(ME.ParamsReachable[1]));
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_FALSE(ME.Captured[1]);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SeveralFunctionsOfOneUnit) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::GetFunctionsMemoryEffects(R"(
+    inline void me_set(int& x) { x = 1; }
+    extern "C" void me_first(int* a, int* b) { me_set(*a); (void)*b; }
+    extern "C" int me_second(int* a) { return *a; }
+  )",
+                                     {"me_first", "me_second", "me_absent"},
+                                     /*rewind=*/false);
+  ASSERT_EQ(MEs.size(), 3U);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Params[0], ModRef::Write);
+  EXPECT_EQ(MEs[0].Params[1], ModRef::None);
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_EQ(MEs[1].Params[0], ModRef::Read);
+  EXPECT_FALSE(MEs[2].Valid);
+  EXPECT_TRUE(Cpp::GetFunctionAddress("me_second"));
+}
+
+// The rewind undoes exactly the probe: the unit before it stays, and one
+// Undo afterwards removes that unit.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewindUndoesExactlyTheProbe) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("namespace me_before_ns { int kept = 3; }"), 0);
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::GetFunctionsMemoryEffects(R"(
+    namespace me_probe_ns {
+    struct Box { int v; };
+    extern "C" int me_rewound(Box* b) { return b->v; }
+    }
+  )",
+                                     {"me_rewound"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1U);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Params[0], ModRef::Read);
+  EXPECT_FALSE(Cpp::GetNamed("me_probe_ns"));
+  EXPECT_FALSE(Cpp::GetFunctionAddress("me_rewound"));
+  EXPECT_TRUE(Cpp::GetNamed("me_before_ns"));
+  ASSERT_EQ(Cpp::Undo(1), 0);
+  EXPECT_FALSE(Cpp::GetNamed("me_before_ns"));
+}
+
+#if !defined(_WIN32)
+// The braces make this a definition; `extern "C" int x = 1;` warns in gcc.
+extern "C" {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+__attribute__((visibility("default"))) __thread int me_native_tls = 1;
+}
+#endif
+
+// A native thread-local makes the probe's Declare add a second PTU (the
+// executor's empty unit); the rewind must undo both and nothing before them.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewindCountsInternalUnits) {
+#if defined(_WIN32) || defined(EMSCRIPTEN) || defined(CPPINTEROP_USE_CLING)
+  GTEST_SKIP() << "the native-TLS redirect is clang-repl on ELF and Mach-O";
+#endif
+  if (TypeParam::isOutOfProcess)
+    GTEST_SKIP() << "the dlsym-based native-TLS redirect is in-process only";
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("namespace me_tls_before_ns { int kept = 3; }"), 0);
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::GetFunctionsMemoryEffects(R"(
+    namespace me_tls_probe_ns {
+    extern "C" __thread int me_native_tls;
+    extern "C" int me_reads_tls(int* p) { return *p + me_native_tls; }
+    }
+  )",
+                                     {"me_reads_tls"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1U);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_FALSE(Cpp::GetNamed("me_tls_probe_ns"));
+  EXPECT_FALSE(Cpp::GetFunctionAddress("me_reads_tls"));
+  EXPECT_TRUE(Cpp::GetNamed("me_tls_before_ns"));
+  ASSERT_EQ(Cpp::Undo(1), 0);
+  EXPECT_FALSE(Cpp::GetNamed("me_tls_before_ns"));
+}
+
+// Code that a rewound probe emitted first is emitted again by a later unit.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewoundProbeLeavesCodeReusable) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare(R"(
+    template <class T> T me_thrice(T x) { return x + x + x; }
+    inline int me_inline_twice(int x) { return 2 * x; }
+  )"),
+            0);
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::GetFunctionsMemoryEffects(R"(
+    extern "C" float me_probe_uses(float* p, int* q) {
+      return me_thrice(*p) + me_inline_twice(*q);
+    }
+  )",
+                                     {"me_probe_uses"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1U);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_FALSE(Cpp::GetFunctionAddress("me_probe_uses"));
+  ASSERT_EQ(Cpp::Declare(R"(
+    extern "C" float me_after_probe(float x, int y) {
+      return me_thrice(x) + me_inline_twice(y);
+    }
+  )"),
+            0);
+  void* Addr = Cpp::GetFunctionAddress("me_after_probe");
+  ASSERT_NE(Addr, nullptr);
+  // An out-of-process address is in the executor, not in this process.
+  if (TypeParam::isOutOfProcess)
+    return;
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+  auto* Fn = reinterpret_cast<float (*)(float, int)>(Addr);
+  EXPECT_EQ(Fn(1.0F, 2), 7.0F);
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CalleesNameTheSelectedOverload) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the test expects Itanium mangled and demangled names");
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::GetFunctionsMemoryEffects(R"(
+    namespace me_callee_ns {
+    struct Box { int v; };
+    inline int pick(const Box& b) { return b.v; }
+    inline int pick(Box& b) { return -b.v; }
+    struct Holder { int get(int x) const { return x; } int get(int x) { return -x; } };
+    extern "C" void me_callee_free(const Box* b) { (void)pick(*b); }
+    extern "C" void me_callee_member(const Holder* h, int* x) { (void)(*h).get(*x); }
+    }
+  )",
+                                     {"me_callee_free", "me_callee_member"},
+                                     /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2U);
+  ASSERT_EQ(MEs[0].Callees.size(), 1U);
+  EXPECT_EQ(MEs[0].Callees[0].Mangled, "_ZN12me_callee_ns4pickERKNS_3BoxE");
+  EXPECT_EQ(MEs[0].Callees[0].Demangled,
+            "me_callee_ns::pick(me_callee_ns::Box const&)");
+  const Cpp::FunctionSignature& Pick = MEs[0].Callees[0].Signature;
+  ASSERT_TRUE(Pick.Known);
+  EXPECT_EQ(Pick.BaseName, "pick");
+  EXPECT_EQ(Pick.Params,
+            std::vector<Cpp::ParamKind>{Cpp::ParamKind::ConstReference});
+  EXPECT_FALSE(Pick.ConstMethod);
+  ASSERT_EQ(MEs[1].Callees.size(), 1U);
+  EXPECT_EQ(MEs[1].Callees[0].Demangled,
+            "me_callee_ns::Holder::get(int) const");
+  const Cpp::FunctionSignature& Get = MEs[1].Callees[0].Signature;
+  EXPECT_EQ(Get.BaseName, "get");
+  EXPECT_EQ(Get.Params, std::vector<Cpp::ParamKind>{Cpp::ParamKind::Scalar});
+  EXPECT_TRUE(Get.ConstMethod);
+}
+
+// The signature of each callee comes from its mangled name, one kind per
+// parameter.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CalleeSignatureKinds) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    namespace me_kinds_ns {
+    struct Box { int v; };
+    struct C { int f; };
+    int all(const Box& a, Box& b, Box&& c, const Box* d, Box* e, int f, Box g,
+            int (*h)(int), int C::*i);
+    template <class T> int tmpl(const T& t);
+    int var(int n, ...);
+    extern "C" int me_kinds_c(int x);
+    }
+    extern "C" int me_kinds(me_kinds_ns::Box* b, int (*h)(int)) {
+      me_kinds_ns::Box g{1};
+      return me_kinds_ns::all(*b, *b, static_cast<me_kinds_ns::Box&&>(*b), b,
+                              b, 1, g, h, &me_kinds_ns::C::f) +
+             me_kinds_ns::tmpl(*b) + me_kinds_ns::var(1, 2) +
+             me_kinds_ns::me_kinds_c(3);
+    }
+  )",
+      {"me_kinds"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1U);
+  ASSERT_TRUE(MEs[0].Valid);
+  auto Find = [&](const std::string& Base) -> const Cpp::FunctionSignature* {
+    for (const Cpp::MemoryEffects::Callee& C : MEs[0].Callees)
+      if (C.Signature.BaseName == Base)
+        return &C.Signature;
+    return nullptr;
+  };
+  using K = Cpp::ParamKind;
+  const Cpp::FunctionSignature* All = Find("all");
+  ASSERT_NE(All, nullptr);
+  EXPECT_EQ(All->Params, (std::vector<K>{K::ConstReference, K::MutableReference,
+                                         K::MutableReference, K::ConstPointer,
+                                         K::MutablePointer, K::Scalar,
+                                         K::Object, K::Unknown, K::Unknown}));
+  EXPECT_FALSE(All->Variadic);
+  const Cpp::FunctionSignature* Tmpl = Find("tmpl");
+  ASSERT_NE(Tmpl, nullptr);
+  EXPECT_EQ(Tmpl->Params, std::vector<K>{K::ConstReference});
+  const Cpp::FunctionSignature* Var = Find("var");
+  ASSERT_NE(Var, nullptr);
+  EXPECT_TRUE(Var->Variadic);
+  EXPECT_EQ(Var->Params, std::vector<K>{K::Scalar});
+  bool SawC = false;
+  for (const Cpp::MemoryEffects::Callee& C : MEs[0].Callees)
+    if (C.Mangled == "me_kinds_c") {
+      SawC = true;
+      EXPECT_FALSE(C.Signature.Known);
+    }
+  EXPECT_TRUE(SawC);
+}
+
+// The trusted fields show what the visible code does around opaque calls.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedFieldsIgnoreOpaqueCalls) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct Box { int v; };
+    int me_trust_opaque(const Box& b);
+    int me_trust_counter = 0;
+    extern "C" int me_trust_only(Box* b) { return me_trust_opaque(*b); }
+    extern "C" int me_trust_global(Box* b) {
+      ++me_trust_counter;
+      return me_trust_opaque(*b);
+    }
+    extern "C" int me_trust_indirect(int (*fn)(int*), int* x) { return fn(x); }
+    extern "C" int me_trust_none(Box* b) { return b->v; }
+  )",
+      {"me_trust_only", "me_trust_global", "me_trust_indirect",
+       "me_trust_none"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4U);
+  const Cpp::MemoryEffects& Only = MEs[0];
+  ASSERT_TRUE(Only.Valid);
+  EXPECT_TRUE(Mentions(Only, "me_trust_opaque"));
+  EXPECT_EQ(Only.Other, ModRef::ReadWrite);
+  EXPECT_TRUE(Only.Captured[0]);
+  EXPECT_EQ(Only.TrustedOther, ModRef::None);
+  EXPECT_FALSE(Only.TrustedCaptured[0]);
+
+  const Cpp::MemoryEffects& Global = MEs[1];
+  ASSERT_TRUE(Global.Valid);
+  EXPECT_NE(static_cast<unsigned>(Global.TrustedOther) &
+                static_cast<unsigned>(ModRef::Write),
+            0U);
+
+  const Cpp::MemoryEffects& Indirect = MEs[2];
+  ASSERT_TRUE(Indirect.Valid);
+  EXPECT_TRUE(HasOpaque(Indirect, Cpp::OpaqueKind::Indirect));
+  EXPECT_EQ(Indirect.TrustedOther, ModRef::None);
+  EXPECT_FALSE(Indirect.TrustedCaptured[1]);
+
+  const Cpp::MemoryEffects& None = MEs[3];
+  ASSERT_TRUE(None.Valid);
+  EXPECT_TRUE(None.Opaque.empty());
+  EXPECT_EQ(None.TrustedOther, None.Other);
+  EXPECT_EQ(None.TrustedCaptured, None.Captured);
+}
+
+// The trusted parameters follow the signature of each opaque call.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedParamsFollowSignatures) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the expected parameters follow the Itanium ABI lowering");
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    namespace me_sig_ns {
+    struct Box { int v; };
+    struct Pair { long a; long b; };
+    int by_const_ref(const Box& b);
+    void by_ref(Box& b);
+    int by_const_ptr(const Box* b, int n);
+    void by_pair(Pair p, const Box& b);
+    struct Holder {
+      int peek() const;
+      void poke();
+    };
+    extern "C" int me_sig_const(Box* b, Box* c, int* n) {
+      return by_const_ref(*b) + by_const_ptr(c, *n);
+    }
+    extern "C" void me_sig_ref(Box* b) { by_ref(*b); }
+    extern "C" int me_sig_methods(Holder* h, Holder* g) {
+      g->poke();
+      return h->peek();
+    }
+    extern "C" void me_sig_unmapped(Pair* p, Box* b) { by_pair(*p, *b); }
+    }
+  )",
+      {"me_sig_const", "me_sig_ref", "me_sig_methods", "me_sig_unmapped"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4U);
+  const Cpp::MemoryEffects& Const = MEs[0];
+  ASSERT_TRUE(Const.Valid);
+  EXPECT_EQ(Const.Params[0], ModRef::ReadWrite);
+  EXPECT_EQ(Const.TrustedParams[0], ModRef::Read);
+  EXPECT_EQ(Const.TrustedParams[1], ModRef::Read);
+  EXPECT_EQ(Const.TrustedOther, ModRef::None);
+  EXPECT_TRUE(AllBounded(Const));
+
+  const Cpp::MemoryEffects& Ref = MEs[1];
+  ASSERT_TRUE(Ref.Valid);
+  EXPECT_NE(static_cast<unsigned>(Ref.TrustedParams[0]) &
+                static_cast<unsigned>(ModRef::Write),
+            0U);
+  EXPECT_TRUE(AllBounded(Ref));
+
+  const Cpp::MemoryEffects& Methods = MEs[2];
+  ASSERT_TRUE(Methods.Valid);
+  EXPECT_EQ(Methods.TrustedParams[0], ModRef::Read);
+  EXPECT_NE(static_cast<unsigned>(Methods.TrustedParams[1]) &
+                static_cast<unsigned>(ModRef::Write),
+            0U);
+  EXPECT_TRUE(AllBounded(Methods));
+
+  const Cpp::MemoryEffects& Unmapped = MEs[3];
+  ASSERT_TRUE(Unmapped.Valid);
+  ASSERT_EQ(std::count_if(Unmapped.Opaque.begin(), Unmapped.Opaque.end(),
+                          [](const Cpp::OpaqueCall& O) { return !O.Bounded; }),
+            1);
+  EXPECT_TRUE(std::any_of(Unmapped.Opaque.begin(), Unmapped.Opaque.end(),
+                          [](const Cpp::OpaqueCall& O) {
+                            return !O.Bounded &&
+                                   O.Signature.BaseName == "by_pair";
+                          }));
+  EXPECT_NE(static_cast<unsigned>(Unmapped.TrustedParams[1]) &
+                static_cast<unsigned>(ModRef::Write),
+            0U);
+}
