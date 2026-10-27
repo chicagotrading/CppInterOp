@@ -1058,3 +1058,273 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedParamsFollowSignatures) {
                 static_cast<unsigned>(ModRef::Write),
             0u);
 }
+
+// The exception object of a throw is fresh memory, also when an opaque
+// constructor fills it and the runtime destroys it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ThrowOfAClassObjectIsLocal) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  TestFixture::CreateInterpreter();
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct me_error {
+      me_error(const char* what);
+      ~me_error();
+      const char* what;
+    };
+    extern "C" int me_throw_object(int* p) {
+      if (p[0] < 0)
+        throw me_error("negative");
+      p[1] = p[0];
+      return p[0];
+    }
+  )",
+                                                        "me_throw_object");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Mentions(ME, "me_error"));
+  EXPECT_TRUE(AllBounded(ME));
+  EXPECT_EQ(ME.TrustedOther, ModRef::None);
+  EXPECT_EQ(ME.TrustedParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_FALSE(ME.TrustedCaptured[0]);
+}
+
+// A load from a fresh allocation yields the pointers stored into it, until
+// a write that the analysis does not see may change it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_FreshAllocationContent) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_table { int** slots; int own; };
+    extern "C" void me_rebuild(me_table* t, int n) {
+      int** fresh = new int*[n];
+      for (int i = 0; i < n; ++i)
+        fresh[i] = i ? t->slots[i] : &t->own;
+      for (int i = 0; i < n; ++i)
+        *fresh[i] += 1;
+      delete[] t->slots;
+      t->slots = fresh;
+    }
+    void me_fill(int** slots);
+    extern "C" void me_rebuild_opaque(me_table* t) {
+      int** fresh = new int*[2];
+      fresh[0] = &t->own;
+      me_fill(fresh);
+      *fresh[1] = 1;
+      t->slots = fresh;
+    }
+  )",
+      {"me_rebuild", "me_rebuild_opaque"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  const Cpp::MemoryEffects& Known = MEs[0];
+  ASSERT_TRUE(Known.Valid);
+  EXPECT_TRUE(Known.Opaque.empty());
+  EXPECT_EQ(Known.Other, ModRef::None);
+  EXPECT_TRUE(Writes(Known.ParamsDirect[0]));
+  EXPECT_TRUE(Writes(Known.ParamsReachable[0]));
+  EXPECT_FALSE(Known.Captured[0]);
+
+  // The callee may store any pointer into the allocation.
+  const Cpp::MemoryEffects& Filled = MEs[1];
+  ASSERT_TRUE(Filled.Valid);
+  EXPECT_TRUE(Mentions(Filled, "me_fill"));
+  EXPECT_TRUE(Writes(Filled.TrustedOther));
+}
+
+// A pointer into a parameter's memory that leaves in an aggregate result,
+// like the iterator of an insert, is a result and not a capture. A fresh
+// object that only the result holds exposes what it points to.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PointerInAnAggregateResult) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_node { me_node* next; int v; };
+    struct me_list { me_node* head; };
+    struct me_hit { me_node* node; bool added; };
+    extern "C" me_hit me_insert(me_list* l, const int* v) {
+      for (me_node* n = l->head; n; n = n->next)
+        if (n->v == *v)
+          return {n, false};
+      me_node* n = new me_node{l->head, *v};
+      l->head = n;
+      return {n, true};
+    }
+    extern "C" me_hit me_wrap(me_list* l) {
+      return {new me_node{l->head, 0}, true};
+    }
+    extern "C" me_node* me_wrap_ptr(me_list* l) {
+      return new me_node{l->head, 0};
+    }
+  )",
+      {"me_insert", "me_wrap", "me_wrap_ptr"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 3u);
+  const Cpp::MemoryEffects& Insert = MEs[0];
+  ASSERT_TRUE(Insert.Valid);
+  EXPECT_TRUE(Insert.Opaque.empty());
+  EXPECT_EQ(Insert.Other, ModRef::None);
+  EXPECT_TRUE(Writes(Insert.ParamsDirect[0]));
+  EXPECT_FALSE(Insert.Captured[0]);
+  EXPECT_FALSE(Insert.Captured[1]);
+
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_TRUE(MEs[1].Captured[0]);
+  ASSERT_TRUE(MEs[2].Valid);
+  EXPECT_TRUE(MEs[2].Captured[0]);
+}
+
+// Hash containers rebuild their bucket arrays, link nodes out of line and
+// return iterators in a pair. With the rehash policy trusted to its
+// signature, the container's memory stays its own.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_HashContainerInsert) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("expects the out-of-line rehash policy of libstdc++");
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(
+      Cpp::Declare("#include <unordered_map>\n#include <unordered_set>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    extern "C" void me_set_insert(std::unordered_set<long>* s, const long* k) {
+      s->insert(*k);
+    }
+    extern "C" void me_map_assign(std::unordered_map<int, double>* m,
+                                  const int* k, const double* v) {
+      (*m)[*k] = *v;
+    }
+  )",
+      {"me_set_insert", "me_map_assign"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(AllBounded(ME)) << OpaqueNames(ME);
+    EXPECT_EQ(ME.TrustedOther, ModRef::None) << OpaqueNames(ME);
+    EXPECT_TRUE(Writes(ME.TrustedParamsDirect[0]));
+    EXPECT_FALSE(ME.TrustedCaptured[0]);
+    // The node keeps a copy of the key's bytes, not its address.
+    EXPECT_FALSE(ME.TrustedAddressCaptured[1]);
+  }
+}
+
+// A copy of a parameter's bytes may copy the pointers that its memory holds,
+// but not its address; storing the pointer itself keeps the address.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CopyIsNotAnAddressCapture) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_info { double price; bool bid; };
+    struct me_cell { me_cell* next; me_info info; const me_info* ref; };
+    struct me_cells { me_cell* head; };
+    extern "C" void me_add_copy(me_cells* c, const me_info* i) {
+      c->head = new me_cell{c->head, *i, nullptr};
+    }
+    extern "C" void me_add_ref(me_cells* c, const me_info* i) {
+      c->head = new me_cell{c->head, {}, i};
+    }
+  )",
+      {"me_add_copy", "me_add_ref"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Other, ModRef::None);
+  EXPECT_FALSE(MEs[0].Captured[0]);
+  EXPECT_FALSE(MEs[0].AddressCaptured[1]);
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_TRUE(MEs[1].Captured[1]);
+  EXPECT_TRUE(MEs[1].AddressCaptured[1]);
+}
+
+// Ways a pointer reaches memory that the analysis must keep following.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PointersThatLeaveTheOrigins) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_h { int* p; };
+    extern "C" void me_compact(me_h* src, unsigned long n) {
+      me_h* tmp = new me_h[n];
+      unsigned long k = 0;
+      for (unsigned long i = 0; i < n; ++i)
+        if (src[i].p)
+          tmp[k++] = src[i];
+      for (unsigned long i = 0; i < k; ++i)
+        ++*tmp[i].p;
+      delete[] tmp;
+    }
+    struct me_exc { bool handled; };
+    extern "C" void me_handle() {
+      try {
+        throw;
+      } catch (me_exc& e) {
+        e.handled = true;
+      }
+    }
+    struct me_box { int* v; };
+    struct me_boxes { me_box* head; };
+    __attribute__((noinline)) me_box* me_push(me_boxes* l) {
+      me_box* b = new me_box{};
+      if (l)
+        l->head = b;
+      return b;
+    }
+    extern "C" me_box* me_push_null(int* q) {
+      me_box* b = me_push(nullptr);
+      b->v = q;
+      return b;
+    }
+    extern "C" unsigned long me_hide(int* p) {
+      return reinterpret_cast<unsigned long>(new me_box{p});
+    }
+  )",
+      {"me_compact", "me_handle", "me_push_null", "me_hide"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  // An 8-byte struct copy becomes an integer load and store.
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].ParamsReachable[0]) || Writes(MEs[0].Other));
+  // The caught object is shared with the handlers that rethrow it.
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_TRUE(Writes(MEs[1].TrustedOther));
+  ASSERT_TRUE(MEs[2].Valid);
+  EXPECT_TRUE(MEs[2].Captured[0]);
+  ASSERT_TRUE(MEs[3].Valid);
+  EXPECT_TRUE(MEs[3].Captured[0]);
+}
+
+// A vector compares and subtracts the addresses of the buffer it allocates;
+// the address leaves nothing as an integer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressArithmeticOfAFreshBuffer) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("libc++ inlines its throws around out-of-line exception "
+                 "constructors, which are opaque calls");
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("#include <vector>"), 0);
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    extern "C" unsigned long me_push_size(std::vector<long>* v, const long* x) {
+      v->push_back(*x);
+      return v->size();
+    }
+  )",
+                                                        "me_push_size");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_FALSE(ME.Captured[0]);
+  EXPECT_FALSE(ME.AddressCaptured[1]);
+}
