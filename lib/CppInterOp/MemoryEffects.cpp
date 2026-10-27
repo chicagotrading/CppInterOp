@@ -32,6 +32,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/ModRef.h"
@@ -255,6 +256,14 @@ void LocalizeTerminate(llvm::Module& M) {
 //    in an aggregate or an integer, or reach a callee that writes it. A load
 //    from an allocation that a parameter owns also yields that parameter's
 //    reachable memory. Any other load from an object is Unknown.
+// 6. A callee may store into an argument's memory only pointers into that
+//    memory or into fresh memory that only that memory holds. If it also
+//    keeps no pointer to that memory and returns no fresh pointer, the
+//    caller keeps the content of its objects known. One new object per call
+//    stands for the fresh memory. Its content is known only if the callee
+//    stores such pointers into it too. Here an integer that code loads from
+//    a typed integer object, and a character copy, hold no address: code
+//    that reads such bytes as a pointer does not follow the C++ object model.
 //===----------------------------------------------------------------------===//
 
 // What a callee does through one pointer parameter.
@@ -265,6 +274,12 @@ struct ParamReach {
   // The pointer to the parameter's own object escapes, not only pointers
   // that its memory holds.
   bool AddressCaptured = false;
+  // Condition 6: every address that the callee stores into the memory that
+  // the parameter reaches at the call points into that memory, or into fresh
+  // memory that only the parameter holds.
+  bool StoresOwn = false;
+  // Also every address that it stores into that fresh memory.
+  bool StoresOwnDeep = false;
 };
 
 // The reachable-memory summary of a function.
@@ -343,6 +358,11 @@ llvm::StringMap<FunctionSummary>& Summaries() {
 
 constexpr llvm::StringLiteral SummaryHeader =
     "# cppinterop-memory-effects v1 llvm ";
+
+// The metadata of a load that reads an integer object (MarkIntegerLoads).
+constexpr llvm::StringLiteral IntegerLoadKind = "cppinterop.integer";
+// The metadata of a copy of characters (MarkCharacterCopies).
+constexpr llvm::StringLiteral CharacterCopyKind = "cppinterop.characters";
 
 // The table spells an opaque call as the mangled name of a declaration or as
 // one of these; a leading '!' marks one that no signature bounds.
@@ -557,7 +577,7 @@ private:
 class FunctionReach {
 public:
   FunctionReach(ReachAnalysis& RA, const llvm::Function& F)
-      : RA(RA), F(F), N(F.arg_size()), R(N) {}
+      : RA(RA), F(F), N(F.arg_size()), R(N), ForeignOld(N), ForeignNew(N) {}
 
   Reach run() {
     // A load from a fresh allocation depends on the stores into it.
@@ -589,6 +609,12 @@ private:
       HoldsObjs;
   // Objects that a write the analysis does not see may change (condition 5).
   llvm::SmallPtrSet<const llvm::Value*, 8> Exposed;
+  // Calls that store fresh memory into an object (condition 6): the call
+  // stands for that memory.
+  llvm::SmallPtrSet<const llvm::Value*, 8> FreshCalls;
+  // Parameters whose memory at the call (Old), or whose fresh memory (New),
+  // may receive a pointer of another origin.
+  llvm::SmallBitVector ForeignOld, ForeignNew;
   // Per scalar: the parameters whose address it may carry (from ptrtoint).
   llvm::DenseMap<const llvm::Value*, llvm::SmallBitVector> Taint;
   llvm::DenseMap<const llvm::Value*, llvm::SmallVector<const llvm::Value*, 2>>
@@ -667,7 +693,8 @@ private:
 
   // Whether the analysis sees every pointer stored into object \p A.
   bool knownContent(const llvm::Value* A) const {
-    if (!freshAllocation(A) || Exposed.count(A) || HoldsUnknown.count(A))
+    if (!(freshAllocation(A) || FreshCalls.count(A)) || Exposed.count(A) ||
+        HoldsUnknown.count(A))
       return false;
     auto It = Owners.find(A);
     return It == Owners.end() || It->second.K != Owner::Escaped;
@@ -1112,6 +1139,37 @@ private:
     return Any;
   }
 
+  // The memory reachable from \p O, without what \p Skip holds.
+  Origin reachable(const Origin& O, const llvm::Value* Skip = nullptr) const {
+    Origin R = O;
+    for (bool More = true; More;) {
+      Origin Shallow = R;
+      llvm::erase(Shallow.Objs, Skip);
+      More = R.join(loadedFrom(Shallow));
+    }
+    return R;
+  }
+
+  // The callee stores into the objects of \p O, or with \p Through into all
+  // the memory reachable from them, pointers into that memory or into the
+  // fresh memory that \p CB stands for (condition 6).
+  bool holdFresh(const llvm::CallBase& CB, const Origin& O, bool Through,
+                 bool Deep) {
+    bool Changed =
+        Deep ? FreshCalls.insert(&CB).second : HoldsUnknown.insert(&CB).second;
+    Origin Self = reachable(O, &CB);
+    Origin Fresh(N);
+    Fresh.Objs.push_back(&CB);
+    Self.join(Fresh);
+    Origin Dst = Through ? Self : O;
+    if (!Deep)
+      llvm::erase(Dst.Objs, &CB);
+    else if (!Through)
+      Dst.join(Fresh);
+    Changed |= recordCopy(Self, Dst);
+    return Changed;
+  }
+
   bool ownersAtCall(const llvm::CallBase& CB) {
     const Reach& S = callee(CB);
     bool Changed = false;
@@ -1146,17 +1204,26 @@ private:
       Addresses |= O.Direct;
       AnyCaptured |= S.Params[K].Captured;
       // Freeing an object leaves no content to load.
-      if (!Sink && llvm::isModSet(S.Params[K].Direct | S.Params[K].Reachable))
+      const bool Writes =
+          !Sink && llvm::isModSet(S.Params[K].Direct | S.Params[K].Reachable);
+      // &CB already stands for a fresh result (condition 6).
+      const bool Own = Writes && S.Params[K].StoresOwn &&
+                       !S.Params[K].Captured && !S.RetFresh;
+      if (Writes && !Own)
         Changed |= expose(O);
       for (const llvm::Value* Ob : O.Objs) {
-        Touched.push_back(Ob);
+        // Nothing foreign comes in, and nothing of it leaves (condition 6).
+        if (!Own)
+          Touched.push_back(Ob);
         if (!Internal && S.Params[K].Captured)
           Changed |= Owners[Ob].join(Owner{Owner::Escaped, 0});
         // A callee that writes it may store pointers of unknown origin.
-        if (!Internal &&
-            llvm::isModSet(S.Params[K].Direct | S.Params[K].Reachable))
+        if (!Internal && Writes && !Own)
           Changed |= HoldsUnknown.insert(Ob).second;
       }
+      if (Own)
+        Changed |= holdFresh(CB, O, llvm::isModSet(S.Params[K].Reachable),
+                             S.Params[K].StoresOwnDeep);
     }
     if (S.RetFresh && CB.getType()->isPointerTy())
       Touched.push_back(&CB);
@@ -1264,6 +1331,182 @@ private:
     captureByCopy(Src, *Dst);
   }
 
+  // A type whose values may hold an address: a pointer, a wide integer, or
+  // an aggregate of them.
+  bool holdsAddress(llvm::Type* T) const {
+    if (T->isPointerTy() || wide(T))
+      return true;
+    if (auto* ST = llvm::dyn_cast<llvm::StructType>(T))
+      return llvm::any_of(ST->elements(),
+                          [&](llvm::Type* E) { return holdsAddress(E); });
+    if (auto* AT = llvm::dyn_cast<llvm::ArrayType>(T))
+      return holdsAddress(AT->getElementType());
+    if (auto* VT = llvm::dyn_cast<llvm::VectorType>(T))
+      return holdsAddress(VT->getElementType());
+    return false;
+  }
+
+  // The origin of the addresses that a stored value may carry (condition 6).
+  // A typed integer load carries none; an integer of an unknown source, such
+  // as an argument or a call result, may carry any.
+  Origin storedOrigin(const llvm::Value* V) const {
+    llvm::SmallPtrSet<const llvm::Value*, 8> Seen;
+    return storedOrigin(V, Seen);
+  }
+
+  Origin storedOrigin(const llvm::Value* V,
+                      llvm::SmallPtrSetImpl<const llvm::Value*>& Seen) const {
+    if (V->getType()->isPointerTy())
+      return originOf(V);
+    Origin O(N);
+    if (scalar(V->getType())) {
+      O.Direct = taintOf(V);
+      Origin Objs(N);
+      Objs.Objs.assign(objTaintOf(V).begin(), objTaintOf(V).end());
+      llvm::sort(Objs.Objs);
+      O.join(Objs);
+    }
+    if (!holdsAddress(V->getType()) || !Seen.insert(V).second ||
+        llvm::isa<llvm::ConstantInt>(V) || llvm::isa<llvm::ConstantFP>(V) ||
+        llvm::isa<llvm::UndefValue>(V) ||
+        llvm::isa<llvm::ConstantAggregateZero>(V) ||
+        llvm::isa<llvm::ConstantDataSequential>(V))
+      return O;
+    const auto* I = llvm::dyn_cast<llvm::Instruction>(V);
+    if (const auto* CA = llvm::dyn_cast<llvm::ConstantAggregate>(V)) {
+      for (const llvm::Value* Op : CA->operands())
+        O.join(storedOrigin(Op, Seen));
+      return O;
+    }
+    if (!I) {
+      O.Unknown = true;
+      return O;
+    }
+    if (const auto* L = llvm::dyn_cast<llvm::LoadInst>(I)) {
+      if (!L->getMetadata(IntegerLoadKind))
+        O.join(loadedFrom(originOf(L->getPointerOperand())));
+      return O;
+    }
+    switch (I->getOpcode()) {
+    case llvm::Instruction::PHI:
+    case llvm::Instruction::Select:
+    case llvm::Instruction::Freeze:
+    case llvm::Instruction::InsertValue:
+    case llvm::Instruction::ExtractValue:
+    case llvm::Instruction::InsertElement:
+    case llvm::Instruction::ExtractElement:
+    case llvm::Instruction::ShuffleVector:
+    case llvm::Instruction::Trunc:
+    case llvm::Instruction::ZExt:
+    case llvm::Instruction::SExt:
+    case llvm::Instruction::BitCast:
+      for (const llvm::Value* Op : I->operands())
+        O.join(storedOrigin(Op, Seen));
+      return O;
+    case llvm::Instruction::PtrToInt:
+      return O; // the taint
+    default:
+      if (llvm::isa<llvm::BinaryOperator>(I)) {
+        for (const llvm::Value* Op : I->operands())
+          O.join(storedOrigin(Op, Seen));
+        return O;
+      }
+      O.Unknown = true;
+      return O;
+    }
+  }
+
+  // Whether pointers of origin \p Src, stored into the memory of parameter
+  // \p K, point into that memory or into fresh memory that only it holds;
+  // with \p Deep, whether that fresh memory holds only such pointers too.
+  bool ownOrFresh(const Origin& Src, unsigned K, bool Deep) const {
+    llvm::SmallBitVector P = Src.params();
+    P.reset(K);
+    if (Src.unowned() || P.any())
+      return false;
+    if (!Deep)
+      return llvm::all_of(Src.Objs, [&](const llvm::Value* A) {
+        Owner W = Owners.lookup(A);
+        return W.K == Owner::Unstored || (W.K == Owner::Param && W.P == K);
+      });
+    llvm::SmallPtrSet<const llvm::Value*, 8> Seen;
+    llvm::SmallVector<const llvm::Value*, 8> Work(Src.Objs.begin(),
+                                                  Src.Objs.end());
+    while (!Work.empty()) {
+      const llvm::Value* A = Work.pop_back_val();
+      if (!Seen.insert(A).second)
+        continue;
+      Owner W = Owners.lookup(A);
+      if (!knownContent(A) || W.K == Owner::Returned ||
+          (W.K == Owner::Param && W.P != K))
+        return false;
+      for (const auto* Map : {&Holds, &HoldsAddr}) {
+        auto It = Map->find(A);
+        if (It == Map->end())
+          continue;
+        llvm::SmallBitVector Held = It->second;
+        Held.reset(K);
+        if (Held.any())
+          return false;
+      }
+      auto HO = HoldsObjs.find(A);
+      if (HO != HoldsObjs.end())
+        Work.append(HO->second.begin(), HO->second.end());
+    }
+    return true;
+  }
+
+  // The parameters whose memory at the call \p Dst may be (escaped memory
+  // may be anyone's), and those whose fresh memory it may be. Unstored and
+  // returned objects are no parameter's.
+  std::pair<llvm::SmallBitVector, llvm::SmallBitVector>
+  memoryOf(const Origin& Dst) const {
+    llvm::SmallBitVector Old = Dst.params(), New(N);
+    for (const llvm::Value* A : Dst.Objs) {
+      Owner W = Owners.lookup(A);
+      if (W.K == Owner::Param)
+        New.set(W.P);
+      else if (W.K == Owner::Escaped)
+        Old.set();
+    }
+    return {Old, New};
+  }
+
+  // Pointers of origin \p Src may be stored into memory of origin \p Dst.
+  void storeInto(const Origin& Src, const Origin& Dst) {
+    auto [Old, New] = memoryOf(Dst);
+    for (unsigned K : Old.set_bits())
+      if (!ownOrFresh(Src, K, /*Deep=*/false))
+        ForeignOld.set(K);
+    New |= Old;
+    for (unsigned K : New.set_bits())
+      if (!ownOrFresh(Src, K, /*Deep=*/true))
+        ForeignNew.set(K);
+  }
+
+  // What a callee may store into the memory of argument \p K (condition 6):
+  // pointers into that memory and fresh memory, or the arguments it keeps.
+  void storeIntoByCall(const llvm::CallBase& CB, const Reach& S, unsigned K) {
+    Origin Dst = originOf(CB.getArgOperand(K));
+    if (llvm::isModSet(S.Params[K].Reachable))
+      Dst = reachable(Dst);
+    auto [Old, New] = memoryOf(Dst);
+    if (!S.Params[K].StoresOwn)
+      ForeignOld |= Old;
+    New |= Old;
+    if (!S.Params[K].StoresOwnDeep)
+      ForeignNew |= New;
+    for (unsigned J = 0; J < CB.arg_size(); ++J) {
+      const llvm::Value* A = CB.getArgOperand(J);
+      Origin Kept(N);
+      if (!A->getType()->isPointerTy())
+        Kept = storedOrigin(A);
+      else if (J != K && S.Params[J].Captured)
+        Kept = originOf(A);
+      storeInto(Kept, Dst);
+    }
+  }
+
   void collectCall(const llvm::CallBase& CB) {
     const Reach& S = callee(CB);
     R.Other |= S.Other;
@@ -1273,6 +1516,7 @@ private:
     // Intrinsics and the runtime consume their scalars.
     const bool Consumes = Callee && (Callee->isIntrinsic() ||
                                      IsRuntimeSupport(Callee->getName()));
+    const bool Sink = Callee && IsPointerSink(Callee->getName());
     for (unsigned K = 0; K < CB.arg_size(); ++K) {
       const llvm::Value* A = CB.getArgOperand(K);
       if (aggregate(A->getType())) {
@@ -1294,6 +1538,9 @@ private:
       Origin O = originOf(A);
       access(S.Params[K].Direct, O, /*Reachable=*/false);
       access(S.Params[K].Reachable, O, /*Reachable=*/true);
+      // Freeing memory stores no pointer.
+      if (!Sink && llvm::isModSet(S.Params[K].Direct | S.Params[K].Reachable))
+        storeIntoByCall(CB, S, K);
       if (S.Params[K].Captured && !Internal) {
         // The callee keeps what it is given only if its own summary says so.
         Origin Kept = O;
@@ -1351,12 +1598,16 @@ private:
         access(ModRefInfo::Mod, Dst, false);
         captureByCopy(carried(SI->getValueOperand()), Dst);
         captureScalar(SI->getValueOperand(), &Dst);
+        storeInto(storedOrigin(SI->getValueOperand()), Dst);
       } else if (const auto* MT = llvm::dyn_cast<llvm::MemTransferInst>(&I)) {
         Origin Src = originOf(MT->getRawSource());
         Origin Dst = originOf(MT->getRawDest());
         access(ModRefInfo::Ref, Src, false);
         access(ModRefInfo::Mod, Dst, false);
         captureByCopy(loadedFrom(Src), Dst);
+        storeInto(MT->getMetadata(CharacterCopyKind) ? Origin(N)
+                                                     : loadedFrom(Src),
+                  Dst);
       } else if (const auto* MS = llvm::dyn_cast<llvm::MemSetInst>(&I)) {
         access(ModRefInfo::Mod, originOf(MS->getRawDest()), false);
       } else if (const auto* RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I)) {
@@ -1364,11 +1615,13 @@ private:
         access(ModRefInfo::ModRef, Dst, false);
         captureByCopy(carried(RMW->getValOperand()), Dst);
         captureScalar(RMW->getValOperand(), &Dst);
+        storeInto(storedOrigin(RMW->getValOperand()), Dst);
       } else if (const auto* CX = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
         Origin Dst = originOf(CX->getPointerOperand());
         access(ModRefInfo::ModRef, Dst, false);
         captureByCopy(carried(CX->getNewValOperand()), Dst);
         captureScalar(CX->getNewValOperand(), &Dst);
+        storeInto(storedOrigin(CX->getNewValOperand()), Dst);
       } else if (const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
         collectCall(*CB);
       } else if (const auto* RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
@@ -1409,11 +1662,57 @@ private:
       for (unsigned I : Held.set_bits())
         if (Exposes(A, I))
           R.Params[I].Captured = R.Params[I].AddressCaptured = true;
+    // Through a captured pointer, code elsewhere may store anything.
+    for (unsigned I = 0; I < N; ++I) {
+      R.Params[I].StoresOwn = !ForeignOld.test(I) && !R.Params[I].Captured;
+      R.Params[I].StoresOwnDeep = R.Params[I].StoresOwn && !ForeignNew.test(I);
+    }
   }
 };
 
 Reach ReachAnalysis::analyze(const llvm::Function& F) {
   return FunctionReach(*this, F).run();
+}
+
+// Before optimization, mark a wide integer load from storage that the source
+// declares with that type (a local, a field or element, a global). Condition
+// 6 takes its value as an integer. Optimization drops unknown metadata when
+// it merges or rewrites a load, so the loads that it makes from a memcpy
+// stay unmarked.
+void MarkIntegerLoads(llvm::Function& F) {
+  llvm::LLVMContext& C = F.getContext();
+  const unsigned Kind = C.getMDKindID(IntegerLoadKind);
+  for (llvm::Instruction& I : llvm::instructions(F)) {
+    auto* L = llvm::dyn_cast<llvm::LoadInst>(&I);
+    if (!L || !L->getType()->isIntegerTy())
+      continue;
+    const llvm::Value* P = L->getPointerOperand();
+    llvm::Type* Declared = nullptr;
+    if (const auto* A = llvm::dyn_cast<llvm::AllocaInst>(P))
+      Declared = A->getAllocatedType();
+    else if (const auto* GV = llvm::dyn_cast<llvm::GlobalVariable>(P))
+      Declared = GV->getValueType();
+    else if (const auto* G = llvm::dyn_cast<llvm::GEPOperator>(P))
+      // Into an aggregate: a pointer index alone shows only a cast's type.
+      if (G->getNumIndices() > 1)
+        Declared = G->getResultElementType();
+    if (Declared == L->getType())
+      L->setMetadata(Kind, llvm::MDNode::get(C, {}));
+  }
+}
+
+// Mark the memcpy in std::char_traits<C>::copy and move: condition 6 takes
+// it as a copy of characters. Inlining keeps the mark on the copy.
+void MarkCharacterCopies(llvm::Function& F) {
+  llvm::StringRef Name = F.getName();
+  if (!Name.starts_with("_ZNSt11char_traitsI") ||
+      !(Name.contains("E4copyE") || Name.contains("E4moveE")))
+    return;
+  llvm::LLVMContext& C = F.getContext();
+  const unsigned Kind = C.getMDKindID(CharacterCopyKind);
+  for (llvm::Instruction& I : llvm::instructions(F))
+    if (llvm::isa<llvm::MemTransferInst>(I))
+      I.setMetadata(Kind, llvm::MDNode::get(C, {}));
 }
 
 void PrepareForAnalysis(llvm::Module& M, bool Trusted) {
@@ -1444,9 +1743,11 @@ void PrepareForAnalysis(llvm::Module& M, bool Trusted) {
       if (It != Summaries().end())
         ApplySummary(F, Trusted ? It->second.Trusted : It->second.Plain);
     }
+    MarkCharacterCopies(F);
     // At -O0 clang marks every function optnone and noinline; the analysis
     // must see through them.
     if (F.hasOptNone()) {
+      MarkIntegerLoads(F);
       F.removeFnAttr(llvm::Attribute::OptimizeNone);
       F.removeFnAttr(llvm::Attribute::NoInline);
     }
@@ -1903,7 +2204,15 @@ std::string VariantFields(const llvm::Function& F, ReachAnalysis& RA) {
     Direct += Ptr ? AccessChar(P.Direct) : 'n';
     Reachable += Ptr ? AccessChar(P.Reachable) : 'n';
     // 'r': pointers that the memory holds escape, but not its address.
-    Captured += !Ptr || !P.Captured ? '.' : P.AddressCaptured ? 'c' : 'r';
+    // 's': a write stores only own or fresh pointers; 'o': the fresh memory
+    // also holds only such pointers.
+    const bool Written = llvm::isModSet(P.Direct | P.Reachable);
+    Captured += !Ptr                         ? '.'
+                : P.AddressCaptured          ? 'c'
+                : P.Captured                 ? 'r'
+                : Written && P.StoresOwnDeep ? 'o'
+                : Written && P.StoresOwn     ? 's'
+                                             : '.';
     unsigned I = A.getArgNo();
     Ret += R.RetDirect.test(I) ? (R.RetLoaded.test(I) ? 'b' : 'd')
                                : (R.RetLoaded.test(I) ? 'l' : '.');
@@ -1933,6 +2242,8 @@ bool ParseVariant(llvm::ArrayRef<llvm::StringRef> Fields, SummaryVariant& V) {
       return false;
     P.Captured = Captured[I] == 'c' || Captured[I] == 'r';
     P.AddressCaptured = Captured[I] == 'c';
+    P.StoresOwn = Captured[I] == 'o' || Captured[I] == 's';
+    P.StoresOwnDeep = Captured[I] == 'o';
     char C = Ret[I + 1];
     if (C == 'd' || C == 'b')
       V.R.RetDirect.set(I);

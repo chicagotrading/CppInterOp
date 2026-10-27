@@ -45,12 +45,17 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
 /// The seven fields: LLVM's MemoryEffects in hex; per parameter LLVM's
 /// access (n/r/w/-) and capture (c none, a address only, . provenance); per
 /// parameter the access to its own object (n/r/w/m); per parameter the
-/// access to memory reachable from it; per parameter c when a pointer into
-/// its memory escapes; the access to other memory; the origin of a pointer
-/// result (f fresh, u unknown, b both, . none) then per parameter d (into
+/// access to memory reachable from it; per parameter the capture (see
+/// below); the access to other memory; the origin of a pointer result (f
+/// fresh, u unknown, b both, . none) then per parameter d (into
 /// its object), l (into its reachable memory), b or ".". The flag is "."
 /// for a complete summary and "i" for one whose body reaches an opaque
 /// call, so its effects are an upper bound only with that call included.
+/// The capture field per parameter: c when a pointer to its object escapes;
+/// r when only pointers that its memory holds escape. For a parameter whose
+/// memory the function writes and nothing escapes: s when every stored
+/// pointer points into that memory or into fresh memory that only it holds,
+/// and o when that fresh memory holds only such pointers too. Else ".".
 int LoadMemoryEffectsSummaries(llvm::StringRef Text);
 
 /// Run the analysis pipeline on \p M in place and return the summaries of
