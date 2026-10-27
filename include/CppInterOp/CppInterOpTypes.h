@@ -575,10 +575,16 @@ struct MemoryEffects {
   /// that only this parameter's memory holds, is not a capture. A captured
   /// parameter's reachable memory may later change through other pointers.
   std::vector<bool> Captured;
+  /// Per parameter: true when the pointer to the parameter's own object may
+  /// escape, as opposed to only pointers that its memory holds. A copy of
+  /// the parameter's bytes sets Captured but not AddressCaptured. Exact when
+  /// the parameter's memory holds no pointer to the parameter itself, as for
+  /// a type with no pointer member.
+  std::vector<bool> AddressCaptured;
   /// The calls that are reachable and have no body or summary. A reachable
   /// summary marked incomplete contributes the opaque calls of its own body.
   std::vector<OpaqueCall> Opaque;
-  /// Other, Captured, Params, ParamsDirect and ParamsReachable
+  /// Other, Captured, AddressCaptured, Params, ParamsDirect and ParamsReachable
   /// when every opaque call is trusted to access only memory through its
   /// arguments, to keep no copy of them, and not to write through a const
   /// reference, a pointer to const, or `this` of a const method. They show
@@ -586,6 +592,7 @@ struct MemoryEffects {
   /// is empty.
   ModRef TrustedOther = ModRef::ReadWrite;
   std::vector<bool> TrustedCaptured;
+  std::vector<bool> TrustedAddressCaptured;
   std::vector<ModRef> TrustedParams;
   std::vector<ModRef> TrustedParamsDirect;
   std::vector<ModRef> TrustedParamsReachable;
