@@ -1328,3 +1328,182 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressArithmeticOfAFreshBuffer) 
   EXPECT_FALSE(ME.Captured[0]);
   EXPECT_FALSE(ME.AddressCaptured[1]);
 }
+
+// A lookup that returns a copy through a temporary: the callee builds the
+// result from fresh memory and the result's own buffer, and the caller frees
+// it again.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ResultInATemporary) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("expects the char_traits and string layout of libstdc++");
+  TestFixture::CreateInterpreter({"-std=c++20"});
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <optional>\n"
+                         "#include <string>\n#include <unordered_map>"),
+            0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_info { int64_t id; std::string group; uint64_t mult; };
+    struct me_infos {
+      std::optional<me_info> get(int64_t k) const {
+        const auto it = m.find(k);
+        return it != m.end() ? std::make_optional<>(it->second) : std::nullopt;
+      }
+      std::unordered_map<int64_t, me_info> m;
+    };
+    extern "C" void me_discard(const me_infos* h, const int64_t* k) {
+      (void)h->get(*k);
+    }
+    extern "C" void me_keep(const me_infos* h, const int64_t* k, void* out) {
+      ::new (out) std::optional<me_info>(h->get(*k));
+    }
+  )",
+      {"me_discard", "me_keep"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
+    EXPECT_EQ(ME.Other, ModRef::None);
+    EXPECT_FALSE(Writes(ME.ParamsDirect[0]));
+    EXPECT_FALSE(Writes(ME.ParamsReachable[0]));
+  }
+  // The kept result holds copied bytes of the receiver's memory.
+  EXPECT_FALSE(MEs[0].Captured[0]);
+}
+
+// A pointer that the callee stores into the result, or into fresh memory
+// that the result holds, keeps its origin in the caller.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ForeignPointerInAResult) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    int me_global;
+    struct me_res { int* p; long a, b, c; };
+    struct me_cell { int** cell; long a, b, c; };
+    __attribute__((noinline)) me_res me_wrap(int* q) { return {q, 0, 0, 0}; }
+    __attribute__((noinline)) me_res me_wrap_global() {
+      return {&me_global, 0, 0, 0};
+    }
+    __attribute__((noinline)) me_cell me_wrap_deep(int* q) {
+      return {new int*(q), 0, 0, 0};
+    }
+    extern "C" void me_through(int* q) { *me_wrap(q).p = 1; }
+    extern "C" void me_through_global() { *me_wrap_global().p = 1; }
+    extern "C" void me_through_deep(int* q) {
+      me_cell c = me_wrap_deep(q);
+      **c.cell = 1;
+      delete c.cell;
+    }
+  )",
+      {"me_through", "me_through_global", "me_through_deep"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].ParamsDirect[0]) || Writes(MEs[0].Other));
+  EXPECT_TRUE(Writes(MEs[1].Other));
+  EXPECT_TRUE(Writes(MEs[2].ParamsDirect[0]) || Writes(MEs[2].Other));
+}
+
+// Integers of an unknown source, and integer fields that hold an address,
+// still carry it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressesInIntegers) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    int me_int_global;
+    __attribute__((noinline)) void me_put(long* slot, long v) { *slot = v; }
+    __attribute__((noinline)) void me_set(unsigned long* s) {
+      *s = reinterpret_cast<unsigned long>(&me_int_global);
+    }
+    extern "C" void me_via_put(int** p) {
+      int* x = nullptr;
+      me_put(reinterpret_cast<long*>(&x), *reinterpret_cast<long*>(p));
+      *x = 1;
+    }
+    extern "C" void me_via_set() {
+      int* x;
+      me_set(reinterpret_cast<unsigned long*>(&x));
+      *x = 1;
+    }
+  )",
+      {"me_via_put", "me_via_set"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].ParamsReachable[0]) || Writes(MEs[0].Other));
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_TRUE(Writes(MEs[1].Other));
+}
+
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressInAnIntegerField) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_handle { unsigned long bits; };
+    inline void me_copy_handle(me_handle* d, const me_handle* s) {
+      d->bits = s->bits;
+    }
+    extern "C" void me_keep_address(int* p, me_handle* out) {
+      me_handle h{reinterpret_cast<unsigned long>(p)};
+      me_copy_handle(out, &h);
+    }
+  )",
+      {"me_keep_address"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(MEs[0].Captured[0]);
+}
+
+// A memcpy into an integer field may copy a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerCopies) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_ints { long v; };
+    struct me_ptrs { int* p; };
+    extern "C" void me_copy_bytes(me_ints* dst, const me_ptrs* src) {
+      __builtin_memcpy(&dst->v, &src->p, sizeof(long));
+    }
+  )",
+      {"me_copy_bytes"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(MEs[0].Captured[1]);
+}
+
+// A string copy copies characters: the result's own memory stays local.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CharacterCopies) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("expects the char_traits of libstdc++");
+  TestFixture::CreateInterpreter({"-std=c++20"});
+  ASSERT_EQ(Cpp::Declare("#include <string>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    extern "C" void me_copy_string(const std::string* s, void* out) {
+      ::new (out) std::string(*s);
+    }
+    extern "C" void me_bytes_of_a_pointer(std::string* out, int* const* src) {
+      out->assign(reinterpret_cast<const char*>(src), sizeof(int*));
+    }
+  )",
+      {"me_copy_string", "me_bytes_of_a_pointer"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(MEs[0].Opaque.empty()) << OpaqueNames(MEs[0]);
+  EXPECT_EQ(MEs[0].Other, ModRef::None);
+  // Characters may be the bytes of a pointer.
+  ASSERT_TRUE(MEs[1].Valid);
+  EXPECT_TRUE(MEs[1].Captured[1]);
+}
