@@ -1503,7 +1503,134 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CharacterCopies) {
   ASSERT_TRUE(MEs[0].Valid);
   EXPECT_TRUE(MEs[0].Opaque.empty()) << OpaqueNames(MEs[0]);
   EXPECT_EQ(MEs[0].Other, ModRef::None);
-  // Characters may be the bytes of a pointer.
+  // Characters may be the bytes of a pointer: here those of an int*.
   ASSERT_TRUE(MEs[1].Valid);
   EXPECT_TRUE(MEs[1].Captured[1]);
+  EXPECT_TRUE(MEs[1].PointerCaptured[1]);
+}
+
+// A copy of a string, or of the fields of a class, copies data: the copy
+// keeps no pointer into the source.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_StringCopyKeepsNoPointer) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("expects the char_traits of libstdc++");
+  TestFixture::CreateInterpreter({"-std=c++20"});
+  ASSERT_EQ(Cpp::Declare("#include <string>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_params { std::string key; double x; bool invalid; };
+    struct me_word { std::string key; int n; float x; };
+    extern "C" void me_assign_string(std::string* d, const std::string* s) {
+      *d = *s;
+    }
+    extern "C" void me_assign_struct(me_params* d, const me_params* s) {
+      *d = *s;
+    }
+    extern "C" void me_construct_string(const std::string* s, void* out) {
+      ::new (out) std::string(*s);
+    }
+    extern "C" void me_construct_struct(const me_params* s, void* out) {
+      ::new (out) me_params(*s);
+    }
+    extern "C" void me_assign_word(me_word* d, const me_word* s) { *d = *s; }
+  )",
+      {"me_assign_string", "me_assign_struct", "me_construct_string",
+       "me_construct_struct", "me_assign_word"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 5u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
+    EXPECT_EQ(ME.Other, ModRef::None);
+  }
+  // The source is parameter 1 of an assignment, 0 of a construction.
+  for (unsigned I : {0u, 1u, 4u}) {
+    EXPECT_TRUE(MEs[I].Captured[1]) << I;
+    EXPECT_FALSE(MEs[I].PointerCaptured[1]) << I;
+    EXPECT_FALSE(MEs[I].AddressCaptured[1]) << I;
+  }
+  for (unsigned I : {2u, 3u}) {
+    EXPECT_TRUE(MEs[I].Captured[0]) << I;
+    EXPECT_FALSE(MEs[I].PointerCaptured[0]) << I;
+    EXPECT_FALSE(MEs[I].AddressCaptured[0]) << I;
+  }
+}
+
+// A kept inner pointer, or a pointer field in a copied run of fields, is a
+// pointer capture. An address in an integer field is data.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PointerCaptureFollowsTypes) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("expects the char_traits of libstdc++");
+  TestFixture::CreateInterpreter({"-std=c++20"});
+  ASSERT_EQ(Cpp::Declare("#include <string>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_raw { std::string key; int* p; double x; };
+    struct me_bits { std::string key; __UINTPTR_TYPE__ a; double x; };
+    const char* me_kept_chars;
+    extern "C" void me_keep_data(const std::string* s) {
+      me_kept_chars = s->data();
+    }
+    extern "C" void me_data_into(const char** d, const std::string* s) {
+      *d = s->data();
+    }
+    extern "C" void me_assign_raw(me_raw* d, const me_raw* s) { *d = *s; }
+    extern "C" void me_construct_raw(const me_raw* s, void* out) {
+      ::new (out) me_raw(*s);
+    }
+    extern "C" void me_assign_bits(me_bits* d, const me_bits* s) { *d = *s; }
+  )",
+      {"me_keep_data", "me_data_into", "me_assign_raw", "me_construct_raw",
+       "me_assign_bits"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 5u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(MEs[0].PointerCaptured[0]);
+  EXPECT_FALSE(MEs[0].AddressCaptured[0]);
+  EXPECT_TRUE(MEs[1].PointerCaptured[1]);
+  EXPECT_TRUE(MEs[2].PointerCaptured[1]);
+  EXPECT_TRUE(MEs[3].PointerCaptured[0]);
+  EXPECT_TRUE(MEs[4].Captured[1]);
+  EXPECT_FALSE(MEs[4].PointerCaptured[1]);
+  EXPECT_FALSE(MEs[4].AddressCaptured[1]);
+}
+
+// A summary carries the kind of the capture.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryCarriesPointerCapture) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  TestFixture::CreateInterpreter();
+  // It reads other memory too, so its captures are not internal.
+  std::string Effects =
+      llvm::utohexstr(llvm::MemoryEffects::readOnly().toIntValue());
+  auto Keeps = [&](const std::string& Name, char Capture) {
+    return Name + "\t" + Effects + "\tr.\tr\tr\t" + Capture + "\tr\t..\t.\n";
+  };
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries((SummaryHeader() +
+                                             Keeps("_Z9me_keep_iPKi", 'i') +
+                                             Keeps("_Z9me_keep_rPKi", 'r'))
+                                                .c_str()),
+            2);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    void me_keep_i(const int* x);
+    void me_keep_r(const int* x);
+    extern "C" void me_uses_i(const int* x) { me_keep_i(x); }
+    extern "C" void me_uses_r(const int* x) { me_keep_r(x); }
+  )",
+      {"me_uses_i", "me_uses_r"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
+    EXPECT_TRUE(ME.Captured[0]);
+    EXPECT_FALSE(ME.AddressCaptured[0]);
+  }
+  EXPECT_FALSE(MEs[0].PointerCaptured[0]);
+  EXPECT_TRUE(MEs[1].PointerCaptured[0]);
 }

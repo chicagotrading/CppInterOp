@@ -86,9 +86,11 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Demangle/Demangle.h"
@@ -6566,6 +6568,148 @@ static void CollectScopeNames(clang::Sema& S, clang::DeclContext* DC,
 }
 #endif
 
+#ifndef CPPINTEROP_USE_CLING
+// Whether a value of type \p T may hold a pointer; unknown types may.
+static bool MayHoldPointer(const clang::ASTContext& C, clang::QualType T);
+
+static bool RecordMayHoldPointer(const clang::ASTContext& C,
+                                 const clang::RecordDecl* RD) {
+  RD = RD->getDefinition();
+  if (!RD || RD->isInvalidDecl())
+    return true;
+  if (const auto* CXX = llvm::dyn_cast<clang::CXXRecordDecl>(RD)) {
+    if (CXX->isDependentType() || CXX->isDynamicClass())
+      return true;
+    for (const clang::CXXBaseSpecifier& B : CXX->bases())
+      if (MayHoldPointer(C, B.getType()))
+        return true;
+  }
+  for (const clang::FieldDecl* FD : RD->fields())
+    if (MayHoldPointer(C, FD->getType()))
+      return true;
+  return false;
+}
+
+static bool MayHoldPointer(const clang::ASTContext& C, clang::QualType T) {
+  T = C.getBaseElementType(T.getCanonicalType());
+  const clang::Type* Ty = T.getTypePtr();
+  if (const auto* AT = llvm::dyn_cast<clang::AtomicType>(Ty))
+    return MayHoldPointer(C, AT->getValueType());
+  if (const auto* CT = llvm::dyn_cast<clang::ComplexType>(Ty))
+    return MayHoldPointer(C, CT->getElementType());
+  if (const auto* VT = llvm::dyn_cast<clang::VectorType>(Ty))
+    return MayHoldPointer(C, VT->getElementType());
+  if (Ty->isIntegralOrEnumerationType() || Ty->isRealFloatingType())
+    return false;
+  if (const clang::RecordDecl* RD = Ty->getAsRecordDecl())
+    return RecordMayHoldPointer(C, RD);
+  return true;
+}
+
+// Whether bytes [Offset, Offset + Size) of an object of class \p RD hold no
+// pointer: no field, base or table pointer there may hold one.
+static bool PointerFreeBytesOf(const clang::ASTContext& C,
+                               const clang::CXXRecordDecl* RD, uint64_t Offset,
+                               uint64_t Size) {
+  if (RD->isInvalidDecl() || RD->isDependentType())
+    return false;
+  const clang::ASTRecordLayout& L = C.getASTRecordLayout(RD);
+  const uint64_t Begin = C.toBits(clang::CharUnits::fromQuantity(Offset));
+  const uint64_t End = Begin + C.toBits(clang::CharUnits::fromQuantity(Size));
+  if (End > static_cast<uint64_t>(C.toBits(L.getSize())))
+    return false;
+  auto Overlaps = [&](uint64_t At, uint64_t Bits) {
+    return At < End && Begin < At + Bits;
+  };
+  const uint64_t PtrBits = C.getTypeSize(C.VoidPtrTy);
+  if (L.hasOwnVFPtr() && Overlaps(0, PtrBits))
+    return false;
+  if (L.hasOwnVBPtr() && Overlaps(C.toBits(L.getVBPtrOffset()), PtrBits))
+    return false;
+  for (const clang::CXXBaseSpecifier& B : RD->bases()) {
+    const clang::CXXRecordDecl* BD = B.getType()->getAsCXXRecordDecl();
+    if (!BD)
+      return false;
+    clang::CharUnits At =
+        B.isVirtual() ? L.getVBaseClassOffset(BD) : L.getBaseClassOffset(BD);
+    if (Overlaps(C.toBits(At), C.toBits(C.getASTRecordLayout(BD).getSize())) &&
+        RecordMayHoldPointer(C, BD))
+      return false;
+  }
+  unsigned I = 0;
+  for (const clang::FieldDecl* FD : RD->fields()) {
+    const uint64_t At = L.getFieldOffset(I++);
+    // A bit-field has an integral type.
+    if (FD->isBitField())
+      continue;
+    if (Overlaps(At, C.getTypeSize(FD->getType())) &&
+        MayHoldPointer(C, FD->getType()))
+      return false;
+  }
+  return true;
+}
+
+// Maps the mangled names of the defaulted copy and move members of the
+// classes in some declaration contexts to their class.
+class DefaultedCopies {
+public:
+  explicit DefaultedCopies(clang::ASTContext& C)
+      : MC(C.createMangleContext()) {}
+
+  void collect(const clang::DeclContext* DC) {
+    for (const clang::Decl* D : DC->decls()) {
+      if (const auto* CTD = llvm::dyn_cast<clang::ClassTemplateDecl>(D)) {
+        for (const clang::ClassTemplateSpecializationDecl* Spec :
+             CTD->specializations())
+          record(Spec);
+      } else if (const auto* RD = llvm::dyn_cast<clang::CXXRecordDecl>(D)) {
+        record(RD);
+      } else if (llvm::isa<clang::NamespaceDecl>(D) ||
+                 llvm::isa<clang::LinkageSpecDecl>(D) ||
+                 llvm::isa<clang::ExportDecl>(D)) {
+        collect(llvm::cast<clang::DeclContext>(D));
+      }
+    }
+  }
+
+  const clang::CXXRecordDecl* find(llvm::StringRef Mangled) const {
+    return Classes.lookup(Mangled);
+  }
+
+private:
+  std::unique_ptr<clang::MangleContext> MC;
+  llvm::StringMap<const clang::CXXRecordDecl*> Classes;
+  llvm::SmallPtrSet<const clang::CXXRecordDecl*, 32> Seen;
+
+  void add(clang::GlobalDecl GD, const clang::CXXRecordDecl* RD) {
+    std::string Name;
+    llvm::raw_string_ostream OS(Name);
+    MC->mangleName(GD, OS);
+    Classes[OS.str()] = RD;
+  }
+
+  void record(const clang::CXXRecordDecl* RD) {
+    if (!RD->isThisDeclarationADefinition() || RD->isDependentContext() ||
+        !Seen.insert(RD).second)
+      return;
+    for (const clang::CXXMethodDecl* MD : RD->methods()) {
+      if (!MD->isDefaulted() || MD->isDeleted())
+        continue;
+      if (const auto* CD = llvm::dyn_cast<clang::CXXConstructorDecl>(MD)) {
+        if (!CD->isCopyOrMoveConstructor())
+          continue;
+        add(clang::GlobalDecl(CD, clang::Ctor_Complete), RD);
+        add(clang::GlobalDecl(CD, clang::Ctor_Base), RD);
+      } else if (MD->isCopyAssignmentOperator() ||
+                 MD->isMoveAssignmentOperator()) {
+        add(clang::GlobalDecl(MD), RD);
+      }
+    }
+    collect(RD);
+  }
+};
+#endif
+
 std::vector<MemoryEffects>
 GetFunctionsMemoryEffects(const char* code,
                           const std::vector<std::string>& names, bool rewind) {
@@ -6580,8 +6724,22 @@ GetFunctionsMemoryEffects(const char* code,
   {
     clang::DiagnosticsEngine& Diag = I.getSema().getDiagnostics();
     clang::DiagnosticErrorTrap Trap(Diag);
+    // Built on first use, from the input units that are live now; units
+    // that a rewind removed may name other classes.
+    clang::ASTContext& C = I.getSema().getASTContext();
+    std::optional<DefaultedCopies> Copies;
+    auto PointerFree = [&](llvm::StringRef Function, uint64_t Offset,
+                           uint64_t Size) {
+      if (!Copies) {
+        Copies.emplace(C);
+        for (const clang::PartialTranslationUnit& PTU : PTUs)
+          Copies->collect(PTU.TUPart);
+      }
+      const clang::CXXRecordDecl* RD = Copies->find(Function);
+      return RD && PointerFreeBytesOf(C, RD, Offset, Size);
+    };
     auto Analyze = [&](const llvm::Module& M) {
-      CppInternal::AnalyzeMemoryEffects(M, names, Out);
+      CppInternal::AnalyzeMemoryEffects(M, names, Out, PointerFree);
     };
     Ok = I.declare(code, /*PTU=*/nullptr, Analyze) ==
              compat::Interpreter::kSuccess &&

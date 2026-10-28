@@ -581,18 +581,26 @@ struct MemoryEffects {
   /// the parameter's memory holds no pointer to the parameter itself, as for
   /// a type with no pointer member.
   std::vector<bool> AddressCaptured;
+  /// Per parameter: true when a value that may be a pointer escapes from the
+  /// parameter's memory: a pointer, an address in an integer, or bytes that
+  /// may hold a pointer. False when only integer data that code loads as an
+  /// integer, or characters of a buffer that the memory points to, escape;
+  /// the caller decides what such data means for its types. AddressCaptured
+  /// implies it, and it implies Captured.
+  std::vector<bool> PointerCaptured;
   /// The calls that are reachable and have no body or summary. A reachable
   /// summary marked incomplete contributes the opaque calls of its own body.
   std::vector<OpaqueCall> Opaque;
-  /// Other, Captured, AddressCaptured, Params, ParamsDirect and ParamsReachable
-  /// when every opaque call is trusted to access only memory through its
-  /// arguments, to keep no copy of them, and not to write through a const
-  /// reference, a pointer to const, or `this` of a const method. They show
-  /// what the visible code does. Equal to the untrusted fields when Opaque
-  /// is empty.
+  /// Other, Captured, AddressCaptured, PointerCaptured, Params, ParamsDirect
+  /// and ParamsReachable when every opaque call is trusted to access only
+  /// memory through its arguments, to keep no copy of them, and not to write
+  /// through a const reference, a pointer to const, or `this` of a const
+  /// method. They show what the visible code does. Equal to the untrusted
+  /// fields when Opaque is empty.
   ModRef TrustedOther = ModRef::ReadWrite;
   std::vector<bool> TrustedCaptured;
   std::vector<bool> TrustedAddressCaptured;
+  std::vector<bool> TrustedPointerCaptured;
   std::vector<ModRef> TrustedParams;
   std::vector<ModRef> TrustedParamsDirect;
   std::vector<ModRef> TrustedParamsReachable;
