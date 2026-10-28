@@ -13,8 +13,10 @@
 #include "CppInterOp/CppInterOpTypes.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -24,12 +26,20 @@ class Module;
 
 namespace CppInternal {
 
+/// Whether bytes [Offset, Offset + Size) of an object of the class whose
+/// defaulted copy or move constructor or assignment has the mangled name
+/// \p Function hold no pointer. False when the function is not such a member.
+using PointerFreeBytes = llvm::function_ref<bool(
+    llvm::StringRef Function, uint64_t Offset, uint64_t Size)>;
+
 /// Optimize one copy of \p M and store in \p Out, per name in \p Names, the
 /// memory effects that LLVM infers for that function. \p M itself is not
-/// changed.
+/// changed. \p PointerFree, from the AST, makes the field copies of
+/// defaulted members precise for PointerCaptured.
 void AnalyzeMemoryEffects(const llvm::Module& M,
                           llvm::ArrayRef<std::string> Names,
-                          std::vector<Cpp::MemoryEffects>& Out);
+                          std::vector<Cpp::MemoryEffects>& Out,
+                          PointerFreeBytes PointerFree = {});
 
 /// Read effect summaries of functions whose bodies the analysis cannot see
 /// (a prebuilt library); the analysis applies them to matching declarations.
@@ -52,7 +62,8 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
 /// for a complete summary and "i" for one whose body reaches an opaque
 /// call, so its effects are an upper bound only with that call included.
 /// The capture field per parameter: c when a pointer to its object escapes;
-/// r when only pointers that its memory holds escape. For a parameter whose
+/// r when only pointers that its memory holds escape; i when only integers
+/// and characters of its memory escape. For a parameter whose
 /// memory the function writes and nothing escapes: s when every stored
 /// pointer points into that memory or into fresh memory that only it holds,
 /// and o when that fresh memory holds only such pointers too. Else ".".
