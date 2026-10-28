@@ -237,7 +237,10 @@ void LocalizeTerminate(llvm::Module& M) {
 //    another for an offset, is not a capture (LLVM 21's capture
 //    components). A capture
 //    makes the attribution to P advisory: the caller must treat P as
-//    possibly written.
+//    possibly written. A capture is also a pointer capture unless only data
+//    escapes: an integer that -O0 code loads from an integer object, a
+//    character copy from a buffer that a pointer in P's memory points to,
+//    or a copy of bytes where the class layout shows no pointer.
 // 3. An object belongs to the parameter whose memory holds a pointer to it,
 //    so storing a pointer to P's memory into an object that only P holds is
 //    not a capture. An object that escapes (stored to global or unknown
@@ -274,6 +277,8 @@ struct ParamReach {
   // The pointer to the parameter's own object escapes, not only pointers
   // that its memory holds.
   bool AddressCaptured = false;
+  // A value that may be a pointer escapes, not only integers or characters.
+  bool PointerCaptured = false;
   // Condition 6: every address that the callee stores into the memory that
   // the parameter reaches at the call points into that memory, or into fresh
   // memory that only the parameter holds.
@@ -297,7 +302,7 @@ struct Reach {
     Reach R(N);
     R.Other = ModRefInfo::ModRef;
     for (ParamReach& P : R.Params)
-      P = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true};
+      P = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true, true};
     R.RetUnknown = true;
     return R;
   }
@@ -363,6 +368,9 @@ constexpr llvm::StringLiteral SummaryHeader =
 constexpr llvm::StringLiteral IntegerLoadKind = "cppinterop.integer";
 // The metadata of a copy of characters (MarkCharacterCopies).
 constexpr llvm::StringLiteral CharacterCopyKind = "cppinterop.characters";
+// The metadata of a copy, or a load, of bytes that the class layout shows
+// to hold no pointer (MarkPointerFreeCopies).
+constexpr llvm::StringLiteral PointerFreeKind = "cppinterop.pointer-free";
 
 // The table spells an opaque call as the mangled name of a declaration or as
 // one of these; a leading '!' marks one that no signature bounds.
@@ -517,7 +525,8 @@ private:
     Out.RetDirect.resize(N);
     Out.RetLoaded.resize(N);
     for (unsigned K = R.Params.size(); K < N; ++K)
-      Out.Params[K] = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true};
+      Out.Params[K] = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true,
+                       true};
     return Out;
   }
 
@@ -549,7 +558,8 @@ private:
       R.Params[K].Direct = MR;
       llvm::CaptureInfo CI = CB.getCaptureInfo(K);
       R.Params[K].Captured = R.Params[K].AddressCaptured =
-          llvm::capturesAnyProvenance(CI.getOtherComponents());
+          R.Params[K].PointerCaptured =
+              llvm::capturesAnyProvenance(CI.getOtherComponents());
       if ((PtrResult || AggResult) &&
           llvm::capturesAnyProvenance(CI.getRetComponents()))
         R.RetLoaded.set(K);
@@ -602,6 +612,9 @@ private:
   // whether it may hold pointers of unknown origin.
   llvm::DenseMap<const llvm::Value*, llvm::SmallBitVector> Holds;
   llvm::SmallPtrSet<const llvm::Value*, 8> HoldsUnknown;
+  // The subset of Holds whose data may be a pointer, not only integers or
+  // characters.
+  llvm::DenseMap<const llvm::Value*, llvm::SmallBitVector> HoldsPtr;
   // Per object: the parameters whose own object it may hold a pointer to.
   llvm::DenseMap<const llvm::Value*, llvm::SmallBitVector> HoldsAddr;
   // Per object: the objects it may hold pointers to.
@@ -956,8 +969,10 @@ private:
   }
 
   // Pointers with origin \p Src are copied into memory with origin \p Dst
-  // (a pointer store, or a memcpy of bytes that may hold pointers).
-  bool recordCopy(const Origin& Src, const Origin& Dst) {
+  // (a pointer store, or a memcpy of bytes that may hold pointers). \p Ptr
+  // has the parameters whose data may be a pointer; null for all.
+  bool recordCopy(const Origin& Src, const Origin& Dst,
+                  const llvm::SmallBitVector* Ptr = nullptr) {
     bool Changed = false;
     if (Src.Objs.empty() && !Src.anyParam() && !Src.unowned())
       return false;
@@ -983,6 +998,14 @@ private:
       llvm::SmallBitVector P = Src.params();
       if (P.test(H)) {
         H |= P;
+        Changed = true;
+      }
+      llvm::SmallBitVector& HP = HoldsPtr.try_emplace(A, N).first->second;
+      if (Ptr)
+        P &= *Ptr;
+      P |= Src.Direct;
+      if (P.test(HP)) {
+        HP |= P;
         Changed = true;
       }
       llvm::SmallBitVector& HA = HoldsAddr.try_emplace(A, N).first->second;
@@ -1029,6 +1052,74 @@ private:
     if (!mayHoldPointers(V->getType()))
       return O;
     return originOf(V);
+  }
+
+  // How code reads memory: as bytes that may hold anything, as data of a
+  // declared type that is no pointer, or as characters.
+  enum class ReadAs { Bytes, Data, Characters };
+
+  static ReadAs readOf(const llvm::MemTransferInst& MT) {
+    if (MT.getMetadata(PointerFreeKind))
+      return ReadAs::Data;
+    if (MT.getMetadata(CharacterCopyKind))
+      return ReadAs::Characters;
+    return ReadAs::Bytes;
+  }
+
+  // The parameters of loadedFrom(O) for which a read of O may yield a
+  // pointer. Its Direct, the addresses, always count.
+  llvm::SmallBitVector pointersLoaded(const Origin& O, ReadAs As) const {
+    llvm::SmallBitVector P(N);
+    if (As == ReadAs::Data)
+      return P;
+    // A character copy of a parameter's own object may copy the bytes of a
+    // pointer; the buffer that a loaded pointer points to holds characters.
+    P = As == ReadAs::Bytes ? O.params() : O.Direct;
+    for (const llvm::Value* A : O.Objs) {
+      if (!knownContent(A))
+        continue;
+      auto H = HoldsPtr.find(A);
+      if (H != HoldsPtr.end())
+        P |= H->second;
+      auto W = Owners.find(A);
+      if (W != Owners.end() && W->second.K == Owner::Param)
+        P.set(W->second.P);
+    }
+    return P;
+  }
+
+  // The parameters of carried(V) whose data in V may be a pointer. At -O0
+  // an integer load from an integer object holds data (MarkIntegerLoads).
+  llvm::SmallBitVector pointersIn(const llvm::Value* V) const {
+    if (!scalar(V->getType()))
+      return carried(V).params();
+    llvm::SmallBitVector P = taintOf(V);
+    llvm::SmallPtrSet<const llvm::Value*, 8> Seen;
+    if (wide(V->getType()))
+      P |= pointersInInteger(V, Seen);
+    return P;
+  }
+
+  // As transferInt.
+  llvm::SmallBitVector
+  pointersInInteger(const llvm::Value* V,
+                    llvm::SmallPtrSetImpl<const llvm::Value*>& Seen) const {
+    llvm::SmallBitVector P(N);
+    const auto* I = llvm::dyn_cast<llvm::Instruction>(V);
+    if (!I || !Seen.insert(I).second)
+      return P;
+    if (const auto* L = llvm::dyn_cast<llvm::LoadInst>(I)) {
+      const bool Data =
+          L->getMetadata(IntegerLoadKind) || L->getMetadata(PointerFreeKind);
+      return pointersLoaded(originOf(L->getPointerOperand()),
+                            Data ? ReadAs::Data : ReadAs::Bytes);
+    }
+    if (llvm::isa<llvm::PHINode>(I) || llvm::isa<llvm::SelectInst>(I) ||
+        llvm::isa<llvm::FreezeInst>(I))
+      for (const llvm::Value* Op : I->operands())
+        if (wide(Op->getType()))
+          P |= pointersInInteger(Op, Seen);
+    return P;
   }
 
   // The objects of \p O and those they hold, transitively, may change
@@ -1118,11 +1209,14 @@ private:
       for (const llvm::Instruction& I : llvm::instructions(F)) {
         Changed |= escapeAddresses(I);
         if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+          const llvm::SmallBitVector Ptr = pointersIn(SI->getValueOperand());
           Changed |= recordCopy(carried(SI->getValueOperand()),
-                                originOf(SI->getPointerOperand()));
+                                originOf(SI->getPointerOperand()), &Ptr);
         } else if (const auto* MT = llvm::dyn_cast<llvm::MemTransferInst>(&I)) {
-          Changed |= recordCopy(loadedFrom(originOf(MT->getRawSource())),
-                                originOf(MT->getRawDest()));
+          const Origin Src = originOf(MT->getRawSource());
+          const llvm::SmallBitVector Ptr = pointersLoaded(Src, readOf(*MT));
+          Changed |=
+              recordCopy(loadedFrom(Src), originOf(MT->getRawDest()), &Ptr);
         } else if (const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
           if (ignored(I) || llvm::isa<llvm::MemIntrinsic>(I))
             continue;
@@ -1249,6 +1343,11 @@ private:
         H |= Params;
         Changed = true;
       }
+      llvm::SmallBitVector& HP = HoldsPtr.try_emplace(Ob, N).first->second;
+      if (Params.test(HP)) {
+        HP |= Params;
+        Changed = true;
+      }
       llvm::SmallBitVector& HA = HoldsAddr.try_emplace(Ob, N).first->second;
       if (Addresses.test(HA)) {
         HA |= Addresses;
@@ -1281,13 +1380,16 @@ private:
   }
 
   // Pointers of origin \p O escape: the parameters' own objects for Direct,
-  // the memory reachable from them for both.
-  void capture(const Origin& O) {
+  // the memory reachable from them for both. Without \p Pointer only the
+  // integers and characters of that memory escape.
+  void capture(const Origin& O, bool Pointer = true) {
     const llvm::SmallBitVector Params = O.params();
-    for (unsigned I : Params.set_bits())
+    for (unsigned I : Params.set_bits()) {
       R.Params[I].Captured = true;
+      R.Params[I].PointerCaptured |= Pointer;
+    }
     for (unsigned I : O.Direct.set_bits())
-      R.Params[I].AddressCaptured = true;
+      R.Params[I].AddressCaptured = R.Params[I].PointerCaptured = true;
   }
 
   // An address that a scalar carries may be either.
@@ -1298,8 +1400,10 @@ private:
   }
 
   // A pointer into the memory of \p Src's parameters is copied into memory
-  // of origin \p Dst (condition 2).
-  void captureByCopy(const Origin& Src, const Origin& Dst) {
+  // of origin \p Dst (condition 2). \p Ptr has the parameters whose data
+  // may be a pointer.
+  void captureByCopy(const Origin& Src, const Origin& Dst,
+                     const llvm::SmallBitVector& Ptr) {
     const llvm::SmallBitVector SrcParams = Src.params();
     const llvm::SmallBitVector DstParams = Dst.params();
     for (unsigned I : SrcParams.set_bits()) {
@@ -1313,6 +1417,8 @@ private:
       if (Own)
         continue;
       R.Params[I].Captured = true;
+      if (Ptr.test(I) || Src.Direct.test(I))
+        R.Params[I].PointerCaptured = true;
       if (Src.Direct.test(I))
         R.Params[I].AddressCaptured = true;
     }
@@ -1328,7 +1434,7 @@ private:
       return capture(It->second);
     Origin Src(N);
     Src.Direct = It->second;
-    captureByCopy(Src, *Dst);
+    captureByCopy(Src, *Dst, Src.Direct);
   }
 
   // A type whose values may hold an address: a pointer, a wide integer, or
@@ -1548,7 +1654,7 @@ private:
           Kept.Loaded |= Kept.Direct;
           Kept.Direct.reset();
         }
-        capture(Kept);
+        capture(Kept, S.Params[K].PointerCaptured);
       }
     }
   }
@@ -1596,7 +1702,8 @@ private:
       } else if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
         Origin Dst = originOf(SI->getPointerOperand());
         access(ModRefInfo::Mod, Dst, false);
-        captureByCopy(carried(SI->getValueOperand()), Dst);
+        captureByCopy(carried(SI->getValueOperand()), Dst,
+                      pointersIn(SI->getValueOperand()));
         captureScalar(SI->getValueOperand(), &Dst);
         storeInto(storedOrigin(SI->getValueOperand()), Dst);
       } else if (const auto* MT = llvm::dyn_cast<llvm::MemTransferInst>(&I)) {
@@ -1604,7 +1711,7 @@ private:
         Origin Dst = originOf(MT->getRawDest());
         access(ModRefInfo::Ref, Src, false);
         access(ModRefInfo::Mod, Dst, false);
-        captureByCopy(loadedFrom(Src), Dst);
+        captureByCopy(loadedFrom(Src), Dst, pointersLoaded(Src, readOf(*MT)));
         storeInto(MT->getMetadata(CharacterCopyKind) ? Origin(N)
                                                      : loadedFrom(Src),
                   Dst);
@@ -1613,13 +1720,15 @@ private:
       } else if (const auto* RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I)) {
         Origin Dst = originOf(RMW->getPointerOperand());
         access(ModRefInfo::ModRef, Dst, false);
-        captureByCopy(carried(RMW->getValOperand()), Dst);
+        captureByCopy(carried(RMW->getValOperand()), Dst,
+                      pointersIn(RMW->getValOperand()));
         captureScalar(RMW->getValOperand(), &Dst);
         storeInto(storedOrigin(RMW->getValOperand()), Dst);
       } else if (const auto* CX = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
         Origin Dst = originOf(CX->getPointerOperand());
         access(ModRefInfo::ModRef, Dst, false);
-        captureByCopy(carried(CX->getNewValOperand()), Dst);
+        captureByCopy(carried(CX->getNewValOperand()), Dst,
+                      pointersIn(CX->getNewValOperand()));
         captureScalar(CX->getNewValOperand(), &Dst);
         storeInto(storedOrigin(CX->getNewValOperand()), Dst);
       } else if (const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
@@ -1658,10 +1767,15 @@ private:
       for (unsigned I : Held.set_bits())
         if (Exposes(A, I))
           R.Params[I].Captured = true;
+    for (const auto& [A, Held] : HoldsPtr)
+      for (unsigned I : Held.set_bits())
+        if (Exposes(A, I))
+          R.Params[I].PointerCaptured = true;
     for (const auto& [A, Held] : HoldsAddr)
       for (unsigned I : Held.set_bits())
         if (Exposes(A, I))
-          R.Params[I].Captured = R.Params[I].AddressCaptured = true;
+          R.Params[I].Captured = R.Params[I].AddressCaptured =
+              R.Params[I].PointerCaptured = true;
     // Through a captured pointer, code elsewhere may store anything.
     for (unsigned I = 0; I < N; ++I) {
       R.Params[I].StoresOwn = !ForeignOld.test(I) && !R.Params[I].Captured;
@@ -1715,7 +1829,82 @@ void MarkCharacterCopies(llvm::Function& F) {
       I.setMetadata(Kind, llvm::MDNode::get(C, {}));
 }
 
-void PrepareForAnalysis(llvm::Module& M, bool Trusted) {
+// The argument that \p V is, directly or through the stack slot that -O0
+// stores it into.
+const llvm::Argument* SpilledArgument(const llvm::Value* V) {
+  if (const auto* A = llvm::dyn_cast<llvm::Argument>(V))
+    return A;
+  const auto* L = llvm::dyn_cast<llvm::LoadInst>(V);
+  const auto* Slot =
+      L ? llvm::dyn_cast<llvm::AllocaInst>(L->getPointerOperand()) : nullptr;
+  if (!Slot)
+    return nullptr;
+  const llvm::Argument* Out = nullptr;
+  for (const llvm::User* U : Slot->users()) {
+    if (llvm::isa<llvm::LoadInst>(U))
+      continue;
+    const auto* SI = llvm::dyn_cast<llvm::StoreInst>(U);
+    const auto* A =
+        SI ? llvm::dyn_cast<llvm::Argument>(SI->getValueOperand()) : nullptr;
+    if (!A || SI->getPointerOperand() != Slot || (Out && Out != A))
+      return nullptr;
+    Out = A;
+  }
+  return Out;
+}
+
+// Before optimization, mark a memcpy between two parameters at one offset
+// when \p PointerFree shows that these bytes of the function's class hold
+// no pointer. A defaulted copy or move member copies a run of fields with
+// one memcpy. Inlining keeps the mark. A copy of 8 bytes or fewer becomes a
+// marked load and store, because InstCombine makes an unmarked one.
+void MarkPointerFreeCopies(llvm::Function& F, PointerFreeBytes PointerFree) {
+  if (!PointerFree || F.isDeclaration())
+    return;
+  const llvm::DataLayout& DL = F.getParent()->getDataLayout();
+  llvm::SmallVector<llvm::MemCpyInst*, 4> Copies;
+  for (llvm::Instruction& I : llvm::instructions(F)) {
+    auto* MC = llvm::dyn_cast<llvm::MemCpyInst>(&I);
+    auto* Len =
+        MC ? llvm::dyn_cast<llvm::ConstantInt>(MC->getLength()) : nullptr;
+    if (!Len || MC->isVolatile())
+      continue;
+    const unsigned Bits =
+        DL.getIndexTypeSizeInBits(MC->getRawDest()->getType());
+    llvm::APInt DstOff(Bits, 0), SrcOff(Bits, 0);
+    const llvm::Value* Dst =
+        MC->getRawDest()->stripAndAccumulateConstantOffsets(DL, DstOff, true);
+    const llvm::Value* Src =
+        MC->getRawSource()->stripAndAccumulateConstantOffsets(DL, SrcOff, true);
+    const llvm::Argument* DA = SpilledArgument(Dst);
+    const llvm::Argument* SA = SpilledArgument(Src);
+    if (!DA || !SA || DA == SA || DstOff != SrcOff || DstOff.isNegative())
+      continue;
+    if (PointerFree(F.getName(), DstOff.getZExtValue(), Len->getZExtValue()))
+      Copies.push_back(MC);
+  }
+  llvm::LLVMContext& C = F.getContext();
+  const unsigned Kind = C.getMDKindID(PointerFreeKind);
+  llvm::MDNode* Mark = llvm::MDNode::get(C, {});
+  for (llvm::MemCpyInst* MC : Copies) {
+    const uint64_t Size =
+        llvm::cast<llvm::ConstantInt>(MC->getLength())->getZExtValue();
+    if (Size > 8 || !llvm::isPowerOf2_64(Size)) {
+      MC->setMetadata(Kind, Mark);
+      continue;
+    }
+    llvm::IRBuilder<> B(MC);
+    llvm::Type* T = B.getIntNTy(8 * Size);
+    llvm::LoadInst* L = B.CreateAlignedLoad(T, MC->getRawSource(),
+                                            MC->getSourceAlign().valueOrOne());
+    L->setMetadata(Kind, Mark);
+    B.CreateAlignedStore(L, MC->getRawDest(), MC->getDestAlign().valueOrOne());
+    MC->eraseFromParent();
+  }
+}
+
+void PrepareForAnalysis(llvm::Module& M, bool Trusted,
+                        PointerFreeBytes PointerFree = {}) {
   LocalizeThrows(M);
   LocalizeTerminate(M);
   llvm::LLVMContext& C = M.getContext();
@@ -1751,6 +1940,8 @@ void PrepareForAnalysis(llvm::Module& M, bool Trusted) {
       F.removeFnAttr(llvm::Attribute::OptimizeNone);
       F.removeFnAttr(llvm::Attribute::NoInline);
     }
+    // After MarkIntegerLoads: condition 6 does not use the class layout.
+    MarkPointerFreeCopies(F, PointerFree);
   }
 }
 
@@ -2123,7 +2314,7 @@ Cpp::ModRef ParamBound(const llvm::Argument& A, Cpp::ModRef ArgMem) {
 struct Variant {
   Cpp::ModRef Other = Cpp::ModRef::ReadWrite;
   std::vector<Cpp::ModRef> Params, Direct, Reachable;
-  std::vector<bool> Captured, AddressCaptured;
+  std::vector<bool> Captured, AddressCaptured, PointerCaptured;
 };
 
 Variant ReadVariant(const llvm::Function& F, ReachAnalysis& RA) {
@@ -2140,6 +2331,7 @@ Variant ReadVariant(const llvm::Function& F, ReachAnalysis& RA) {
     V.Reachable.push_back(Ptr ? ToModRef(P.Reachable) : Cpp::ModRef::None);
     V.Captured.push_back(Ptr && P.Captured);
     V.AddressCaptured.push_back(Ptr && P.AddressCaptured);
+    V.PointerCaptured.push_back(Ptr && P.PointerCaptured);
   }
   return V;
 }
@@ -2160,6 +2352,7 @@ void ReadMemoryEffects(const llvm::Function& F, ReachAnalysis& RA,
   Out.ParamsReachable = V.Reachable;
   Out.Captured = V.Captured;
   Out.AddressCaptured = V.AddressCaptured;
+  Out.PointerCaptured = V.PointerCaptured;
   for (const OpaqueRef& Ref : Opaque.Opaque) {
     Cpp::OpaqueCall Call;
     Call.Kind = Ref.Kind;
@@ -2204,12 +2397,14 @@ std::string VariantFields(const llvm::Function& F, ReachAnalysis& RA) {
     Direct += Ptr ? AccessChar(P.Direct) : 'n';
     Reachable += Ptr ? AccessChar(P.Reachable) : 'n';
     // 'r': pointers that the memory holds escape, but not its address.
-    // 's': a write stores only own or fresh pointers; 'o': the fresh memory
-    // also holds only such pointers.
+    // 'i': only integers and characters escape. 's': a write stores only
+    // own or fresh pointers; 'o': the fresh memory also holds only such
+    // pointers.
     const bool Written = llvm::isModSet(P.Direct | P.Reachable);
     Captured += !Ptr                         ? '.'
                 : P.AddressCaptured          ? 'c'
-                : P.Captured                 ? 'r'
+                : P.PointerCaptured          ? 'r'
+                : P.Captured                 ? 'i'
                 : Written && P.StoresOwnDeep ? 'o'
                 : Written && P.StoresOwn     ? 's'
                                              : '.';
@@ -2240,7 +2435,8 @@ bool ParseVariant(llvm::ArrayRef<llvm::StringRef> Fields, SummaryVariant& V) {
     if (!ParseAccess(Direct[I], P.Direct) ||
         !ParseAccess(Reachable[I], P.Reachable))
       return false;
-    P.Captured = Captured[I] == 'c' || Captured[I] == 'r';
+    P.Captured = Captured[I] == 'c' || Captured[I] == 'r' || Captured[I] == 'i';
+    P.PointerCaptured = Captured[I] == 'c' || Captured[I] == 'r';
     P.AddressCaptured = Captured[I] == 'c';
     P.StoresOwn = Captured[I] == 'o' || Captured[I] == 's';
     P.StoresOwnDeep = Captured[I] == 'o';
@@ -2267,7 +2463,8 @@ bool VisibleToTheJIT(const llvm::Function& F) {
 
 void AnalyzeMemoryEffects(const llvm::Module& M,
                           llvm::ArrayRef<std::string> Names,
-                          std::vector<Cpp::MemoryEffects>& Out) {
+                          std::vector<Cpp::MemoryEffects>& Out,
+                          PointerFreeBytes PointerFree) {
   Out.assign(Names.size(), Cpp::MemoryEffects{});
   // Optimization inlines the callees and removes the calls.
   for (size_t I = 0; I < Names.size(); ++I)
@@ -2275,7 +2472,7 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
       CollectCallees(*F, Out[I]);
 
   std::unique_ptr<llvm::Module> Copy = llvm::CloneModule(M);
-  PrepareForAnalysis(*Copy, /*Trusted=*/false);
+  PrepareForAnalysis(*Copy, /*Trusted=*/false, PointerFree);
   Optimize(*Copy);
   if (std::getenv("CPPINTEROP_MEMORY_EFFECTS_DUMP"))
     Copy->print(llvm::errs(), nullptr);
@@ -2291,6 +2488,7 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
       Out[I].TrustedOther = Out[I].Other;
       Out[I].TrustedCaptured = Out[I].Captured;
       Out[I].TrustedAddressCaptured = Out[I].AddressCaptured;
+      Out[I].TrustedPointerCaptured = Out[I].PointerCaptured;
       Out[I].TrustedParams = Out[I].Params;
       Out[I].TrustedParamsDirect = Out[I].ParamsDirect;
       Out[I].TrustedParamsReachable = Out[I].ParamsReachable;
@@ -2301,7 +2499,7 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
     return;
 
   Copy = llvm::CloneModule(M);
-  PrepareForAnalysis(*Copy, /*Trusted=*/true);
+  PrepareForAnalysis(*Copy, /*Trusted=*/true, PointerFree);
   llvm::StringSet<> Unbounded = TrustOpaqueCalls(*Copy);
   Optimize(*Copy);
   ReachAnalysis RA(/*Trusted=*/true);
@@ -2313,6 +2511,7 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
     Out[I].TrustedOther = V.Other;
     Out[I].TrustedCaptured = V.Captured;
     Out[I].TrustedAddressCaptured = V.AddressCaptured;
+    Out[I].TrustedPointerCaptured = V.PointerCaptured;
     Out[I].TrustedParams = V.Params;
     Out[I].TrustedParamsDirect = V.Direct;
     Out[I].TrustedParamsReachable = V.Reachable;
@@ -2325,9 +2524,12 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
 int LoadMemoryEffectsSummaries(llvm::StringRef Text) {
   llvm::SmallVector<llvm::StringRef, 64> Lines;
   Text.split(Lines, '\n', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
-  if (Lines.empty() || !Lines[0].starts_with(SummaryHeader) ||
-      Lines[0].drop_front(SummaryHeader.size()).trim() !=
-          std::to_string(LLVM_VERSION_MAJOR))
+  if (Lines.empty())
+    return -1;
+  llvm::StringRef Header = Lines[0];
+  if (!Header.consume_front(SummaryHeader))
+    return -1;
+  if (Header.trim() != std::to_string(LLVM_VERSION_MAJOR))
     return -1;
   llvm::StringMap<FunctionSummary> Read;
   for (llvm::StringRef Line : llvm::ArrayRef(Lines).drop_front()) {
