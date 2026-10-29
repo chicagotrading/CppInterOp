@@ -67,6 +67,8 @@ void AnalyzeMemoryEffects(const llvm::Module& M,
 /// memory the function writes and nothing escapes: s when every stored
 /// pointer points into that memory or into fresh memory that only it holds,
 /// and o when that fresh memory holds only such pointers too. Else ".".
+/// For a parameter that is no pointer: c when its value may leave the call
+/// or become a pointer, else ".".
 int LoadMemoryEffectsSummaries(llvm::StringRef Text);
 
 /// Run the analysis pipeline on \p M in place and return the summaries of

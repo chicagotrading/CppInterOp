@@ -1634,3 +1634,279 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryCarriesPointerCapture) {
   EXPECT_FALSE(MEs[0].PointerCaptured[0]);
   EXPECT_TRUE(MEs[1].PointerCaptured[0]);
 }
+
+namespace {
+// The fields of the row of \p Name in a summary table; empty when absent.
+std::vector<std::string> RowOf(const std::string& Table, llvm::StringRef Name) {
+  llvm::SmallVector<llvm::StringRef, 8> Lines;
+  llvm::StringRef(Table).split(Lines, '\n', -1, false);
+  for (llvm::StringRef Line : Lines) {
+    llvm::SmallVector<llvm::StringRef, 20> Fields;
+    Line.split(Fields, '\t');
+    if (Fields[0] == Name)
+      return {Fields.begin(), Fields.end()};
+  }
+  return {};
+}
+} // namespace
+
+// A callee that copies only characters out of a parameter's memory keeps no
+// pointer to it: what the callee stores there stays known to the caller.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_DataCaptureKeepsStoresOwn) {
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  // InstCombine makes an unmarked load and store of a copy of 8 bytes or less.
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare noalias ptr @_Znwm(i64)
+    declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+    define linkonce_odr ptr @_ZNSt11char_traitsIcE4copyEPcPKcm(ptr %d, ptr %s,
+                                                               i64 %n) {
+      call void @llvm.memcpy.p0.p0.i64(ptr %d, ptr %s, i64 %n, i1 false)
+      ret ptr %d
+    }
+    define void @me_fill_chars(ptr %p, ptr %out) noinline {
+      %buf = load ptr, ptr %p
+      call ptr @_ZNSt11char_traitsIcE4copyEPcPKcm(ptr %out, ptr %buf, i64 32)
+      %n = call ptr @_Znwm(i64 8)
+      store ptr %n, ptr %p
+      ret void
+    }
+    define void @me_fill_pointer(ptr %p, ptr %out) noinline {
+      %buf = load ptr, ptr %p
+      store ptr %buf, ptr %out
+      %n = call ptr @_Znwm(i64 8)
+      store ptr %n, ptr %p
+      ret void
+    }
+    define void @me_use_chars(ptr %out) {
+      %x = alloca ptr
+      %b = call ptr @_Znwm(i64 8)
+      store ptr %b, ptr %x
+      call void @me_fill_chars(ptr %x, ptr %out)
+      %y = load ptr, ptr %x
+      store i8 1, ptr %y
+      ret void
+    }
+    define void @me_use_pointer(ptr %out) {
+      %x = alloca ptr
+      %b = call ptr @_Znwm(i64 8)
+      store ptr %b, ptr %x
+      call void @me_fill_pointer(ptr %x, ptr %out)
+      %y = load ptr, ptr %x
+      store i8 1, ptr %y
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  std::vector<std::string> Chars = RowOf(Table, "me_fill_chars");
+  ASSERT_EQ(Chars.size(), 9u) << Table;
+  EXPECT_EQ(Chars[5][0], 'i');
+  std::vector<std::string> Pointer = RowOf(Table, "me_fill_pointer");
+  ASSERT_EQ(Pointer.size(), 9u) << Table;
+  EXPECT_EQ(Pointer[5][0], 'r');
+  // The write goes into the fresh memory that the callee stored into x.
+  std::vector<std::string> UseChars = RowOf(Table, "me_use_chars");
+  ASSERT_EQ(UseChars.size(), 9u) << Table;
+  EXPECT_EQ(UseChars[6], "n");
+  // Through the kept pointer, x may hold any address.
+  std::vector<std::string> UsePointer = RowOf(Table, "me_use_pointer");
+  ASSERT_EQ(UsePointer.size(), 9u) << Table;
+  EXPECT_EQ(UsePointer[6], "w");
+}
+
+// A wrapper that forwards its result to a callee keeps the callee's "stores
+// own" result when the callee keeps only data of the other argument.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ForwardedResultStoresOwn) {
+  std::string Effects =
+      llvm::utohexstr(llvm::MemoryEffects::unknown().toIntValue());
+  auto Get = [&](const std::string& Name, char Capture) {
+    return Name + "\t" + Effects + "\t-.rc\twr\tnr\ts" + Capture +
+           "\tn\t...\t.\n";
+  };
+  ASSERT_EQ(CppInternal::LoadMemoryEffectsSummaries(SummaryHeader() +
+                                                    Get("me_get_data", 'i') +
+                                                    Get("me_get_pointer", 'r')),
+            2);
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare void @me_get_data(ptr, ptr)
+    declare void @me_get_pointer(ptr, ptr)
+    define void @me_wrap_data(ptr %r, ptr %this) {
+      %m = load ptr, ptr %this
+      call void @me_get_data(ptr %r, ptr %m)
+      ret void
+    }
+    define void @me_wrap_pointer(ptr %r, ptr %this) {
+      %m = load ptr, ptr %this
+      call void @me_get_pointer(ptr %r, ptr %m)
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  std::vector<std::string> Data = RowOf(Table, "me_wrap_data");
+  ASSERT_EQ(Data.size(), 9u) << Table;
+  EXPECT_EQ(Data[5], "si");
+  // The callee may store a pointer that it loads through m into the result.
+  std::vector<std::string> Pointer = RowOf(Table, "me_wrap_pointer");
+  ASSERT_EQ(Pointer.size(), 9u) << Table;
+  EXPECT_EQ(Pointer[5], ".r");
+}
+
+// A forwarded integer that the callee only compares or uses as an index
+// cannot become a pointer in the result. One that the callee keeps or makes
+// a pointer can.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ForwardedIntegerArgument) {
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare noalias ptr @_Znwm(i64)
+    @me_kept_id = global i64 0
+    define void @me_get_id(ptr %r, ptr %this, i64 %id) noinline {
+      %h = urem i64 %id, 7
+      %slot = getelementptr i64, ptr %this, i64 %h
+      %k = load i64, ptr %slot
+      %hit = icmp eq i64 %k, %id
+      %n = call ptr @_Znwm(i64 8)
+      %v = select i1 %hit, ptr %n, ptr null
+      store ptr %v, ptr %r
+      ret void
+    }
+    define void @me_get_keep(ptr %r, ptr %this, i64 %id) noinline {
+      store i64 %id, ptr @me_kept_id
+      %n = call ptr @_Znwm(i64 8)
+      store ptr %n, ptr %r
+      ret void
+    }
+    define void @me_get_ptr(ptr %r, ptr %this, i64 %id) noinline {
+      %p = inttoptr i64 %id to ptr
+      store ptr %p, ptr %r
+      ret void
+    }
+    define void @me_wrap_id(ptr %r, ptr %this, i64 %id) {
+      %m = load ptr, ptr %this
+      call void @me_get_id(ptr %r, ptr %m, i64 %id)
+      ret void
+    }
+    define void @me_wrap_keep(ptr %r, ptr %this, i64 %id) {
+      %m = load ptr, ptr %this
+      call void @me_get_keep(ptr %r, ptr %m, i64 %id)
+      ret void
+    }
+    define void @me_wrap_ptr(ptr %r, ptr %this, i64 %id) {
+      %m = load ptr, ptr %this
+      call void @me_get_ptr(ptr %r, ptr %m, i64 %id)
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  // The capture of the result and of the integer.
+  auto Capture = [&](llvm::StringRef Name) {
+    std::vector<std::string> Row = RowOf(Table, Name);
+    return Row.size() == 9u ? std::string{Row[5][0], Row[5][2]} : Table;
+  };
+  EXPECT_EQ(Capture("me_get_id"), "o.");
+  EXPECT_EQ(Capture("me_wrap_id"), "o.");
+  EXPECT_EQ(Capture("me_get_keep"), "oc");
+  EXPECT_EQ(Capture("me_wrap_keep"), ".c");
+  EXPECT_EQ(Capture("me_get_ptr"), ".c");
+  EXPECT_EQ(Capture("me_wrap_ptr"), ".c");
+}
+
+// Under trust, an opaque call keeps no copy of an integer argument, as of a
+// pointer argument, except in its result.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedCallKeepsNoInteger) {
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare noalias ptr @_Znwm(i64)
+    declare void @_Z7me_sinkl(i64)
+    declare i64 @_Z7me_hashl(i64)
+    @me_kept_hash = global i64 0
+    define void @me_get_logged(ptr %r, ptr %this, i64 %id) noinline {
+      call void @_Z7me_sinkl(i64 %id)
+      %n = call ptr @_Znwm(i64 8)
+      store ptr %n, ptr %r
+      ret void
+    }
+    define void @me_get_hashed(ptr %r, ptr %this, i64 %id) noinline {
+      %h = call i64 @_Z7me_hashl(i64 %id)
+      store i64 %h, ptr @me_kept_hash
+      %n = call ptr @_Znwm(i64 8)
+      store ptr %n, ptr %r
+      ret void
+    }
+    define void @me_wrap_logged(ptr %r, ptr %this, i64 %id) {
+      %m = load ptr, ptr %this
+      call void @me_get_logged(ptr %r, ptr %m, i64 %id)
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  // The capture of the result and of the integer, untrusted then trusted.
+  auto Capture = [&](llvm::StringRef Name) {
+    std::vector<std::string> Row = RowOf(Table, Name);
+    if (Row.size() < 14u || Row[8] != "i")
+      return Table;
+    return std::string{Row[5][0], Row[5][2], ' ', Row[13][0], Row[13][2]};
+  };
+  EXPECT_EQ(Capture("me_get_logged"), "oc o.");
+  EXPECT_EQ(Capture("me_wrap_logged"), ".c o.");
+  // The hash may carry the integer into memory.
+  EXPECT_EQ(Capture("me_get_hashed"), "oc oc");
+}
+
+// An integer in a stack slot that only goes by reference to a trusted call
+// stays in the function. A slot whose address leaves does not.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerInAPrivateSlot) {
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare noalias ptr @_Znwm(i64)
+    declare void @_Z6me_logRKl(ptr)
+    @me_slot_ref = global ptr null
+    define void @me_get_spilled(ptr %r, ptr %this, i64 %id) noinline {
+      %slot = alloca i64
+      store i64 %id, ptr %slot
+      call void @_Z6me_logRKl(ptr %slot)
+      %n = call ptr @_Znwm(i64 8)
+      store ptr %n, ptr %r
+      ret void
+    }
+    define void @me_get_leaked(ptr %r, ptr %this, i64 %id) noinline {
+      %slot = alloca i64
+      store i64 %id, ptr %slot
+      store ptr %slot, ptr @me_slot_ref
+      call void @_Z6me_logRKl(ptr %slot)
+      %n = call ptr @_Znwm(i64 8)
+      store ptr %n, ptr %r
+      ret void
+    }
+    define void @me_wrap_spilled(ptr %r, ptr %this, i64 %id) {
+      %m = load ptr, ptr %this
+      call void @me_get_spilled(ptr %r, ptr %m, i64 %id)
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  // The capture of the result and of the integer, untrusted then trusted.
+  auto Capture = [&](llvm::StringRef Name) {
+    std::vector<std::string> Row = RowOf(Table, Name);
+    if (Row.size() < 14u || Row[8] != "i")
+      return Table;
+    return std::string{Row[5][0], Row[5][2], ' ', Row[13][0], Row[13][2]};
+  };
+  EXPECT_EQ(Capture("me_get_spilled"), ".c o.");
+  EXPECT_EQ(Capture("me_wrap_spilled"), ".c o.");
+  EXPECT_EQ(Capture("me_get_leaked"), ".c .c");
+}
