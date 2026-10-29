@@ -371,6 +371,8 @@ constexpr llvm::StringLiteral CharacterCopyKind = "cppinterop.characters";
 // The metadata of a copy, or a load, of bytes that the class layout shows
 // to hold no pointer (MarkPointerFreeCopies).
 constexpr llvm::StringLiteral PointerFreeKind = "cppinterop.pointer-free";
+// The attribute of a call that TrustOpaqueCalls bounds by trust.
+constexpr llvm::StringLiteral TrustedCallAttr = "cppinterop-trusted-call";
 
 // The table spells an opaque call as the mangled name of a declaration or as
 // one of these; a leading '!' marks one that no signature bounds.
@@ -546,8 +548,12 @@ private:
                             T->isVectorTy()) &&
                            !T->isIntOrIntVectorTy() && !T->isFPOrFPVectorTy();
     for (unsigned K = 0; K < N; ++K) {
-      if (!CB.getArgOperand(K)->getType()->isPointerTy())
+      if (!CB.getArgOperand(K)->getType()->isPointerTy()) {
+        // Only trust bounds where the value of an integer argument goes.
+        R.Params[K].Captured = R.Params[K].AddressCaptured =
+            R.Params[K].PointerCaptured = !CB.hasFnAttr(TrustedCallAttr);
         continue;
+      }
       ModRefInfo MR = Arg;
       if (CB.paramHasAttr(K, llvm::Attribute::ReadNone))
         MR = ModRefInfo::NoModRef;
@@ -1300,9 +1306,10 @@ private:
       // Freeing an object leaves no content to load.
       const bool Writes =
           !Sink && llvm::isModSet(S.Params[K].Direct | S.Params[K].Reachable);
-      // &CB already stands for a fresh result (condition 6).
+      // &CB already stands for a fresh result (condition 6). Copied data
+      // gives nobody a pointer to store through.
       const bool Own = Writes && S.Params[K].StoresOwn &&
-                       !S.Params[K].Captured && !S.RetFresh;
+                       !S.Params[K].PointerCaptured && !S.RetFresh;
       if (Writes && !Own)
         Changed |= expose(O);
       for (const llvm::Value* Ob : O.Objs) {
@@ -1605,9 +1612,10 @@ private:
     for (unsigned J = 0; J < CB.arg_size(); ++J) {
       const llvm::Value* A = CB.getArgOperand(J);
       Origin Kept(N);
-      if (!A->getType()->isPointerTy())
-        Kept = storedOrigin(A);
-      else if (J != K && S.Params[J].Captured)
+      if (!A->getType()->isPointerTy()) {
+        if (S.Params[J].PointerCaptured)
+          Kept = storedOrigin(A);
+      } else if (J != K && S.Params[J].PointerCaptured)
         Kept = originOf(A);
       storeInto(Kept, Dst);
     }
@@ -1693,7 +1701,130 @@ private:
       capture(O);
   }
 
+  // Whether \p D is stack memory whose content can leave only through the
+  // loads that this adds to \p Loads: no pointer to it leaves, and each
+  // callee that gets one keeps nothing of it.
+  bool loadsOfPrivateSlot(const Origin& D,
+                          llvm::SmallVectorImpl<const llvm::Value*>& Loads) {
+    if (D.unowned() || D.anyParam() || D.Objs.empty() ||
+        !llvm::all_of(D.Objs, [](const llvm::Value* A) {
+          return llvm::isa<llvm::AllocaInst>(A);
+        }))
+      return false;
+    auto Into = [&](const llvm::Value* V) {
+      if (!V->getType()->isPointerTy())
+        return false;
+      Origin O = originOf(V);
+      return llvm::any_of(O.Objs, [&](const llvm::Value* A) {
+        return llvm::is_contained(D.Objs, A);
+      });
+    };
+    for (const llvm::Instruction& I : llvm::instructions(F)) {
+      for (const llvm::Use& U : I.operands()) {
+        if (!Into(U.get()) || ignored(I) || llvm::isa<llvm::ICmpInst>(I))
+          continue;
+        // The pointer moves on; its users are scanned too.
+        if (I.getType()->isPointerTy() &&
+            (llvm::isa<llvm::GetElementPtrInst>(I) ||
+             llvm::isa<llvm::PHINode>(I) || llvm::isa<llvm::SelectInst>(I) ||
+             llvm::isa<llvm::FreezeInst>(I) || llvm::isa<llvm::CastInst>(I)))
+          continue;
+        if (const auto* L = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+          if (!scalar(L->getType()))
+            return false;
+          Loads.push_back(L);
+          continue;
+        }
+        if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+          if (U.getOperandNo() != SI->getPointerOperandIndex())
+            return false;
+          continue;
+        }
+        const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!CB || !CB->isArgOperand(&U))
+          return false;
+        if (const auto* MI = llvm::dyn_cast<llvm::MemIntrinsic>(CB))
+          if (&U == &MI->getRawDestUse())
+            continue;
+        const llvm::Function* Callee = CB->getCalledFunction();
+        if (Callee &&
+            (Callee->isIntrinsic() || IsRuntimeSupport(Callee->getName())))
+          return false;
+        const Reach& S = callee(*CB);
+        const unsigned K = CB->getArgOperandNo(&U);
+        if (S.Params[K].Captured || S.RetDirect.test(K) || S.RetLoaded.test(K))
+          return false;
+        // A callee may return what it reads there.
+        if (!CB->getType()->isVoidTy())
+          Loads.push_back(CB);
+      }
+    }
+    return true;
+  }
+
+  // Whether a value computed from the non-pointer argument \p A may leave
+  // the call or become a pointer: stored outside a private stack slot,
+  // returned, made a pointer, or given to a callee that may keep it.
+  bool scalarEscapes(const llvm::Argument& A) {
+    if (!scalar(A.getType()))
+      return true;
+    llvm::SmallPtrSet<const llvm::Value*, 16> Seen;
+    llvm::SmallVector<const llvm::Value*, 16> Work{&A};
+    while (!Work.empty()) {
+      const llvm::Value* V = Work.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      for (const llvm::Use& U : V->uses()) {
+        const auto* I = llvm::dyn_cast<llvm::Instruction>(U.getUser());
+        if (!I)
+          return true;
+        if (ignored(*I) || llvm::isa<llvm::CmpInst>(I) ||
+            llvm::isa<llvm::BranchInst>(I) || llvm::isa<llvm::SwitchInst>(I))
+          continue;
+        // The result has the provenance of the other operands.
+        if ((llvm::isa<llvm::SelectInst>(I) && U.getOperandNo() == 0) ||
+            (llvm::isa<llvm::GetElementPtrInst>(I) && U.getOperandNo() > 0 &&
+             !llvm::isa<llvm::Constant>(I->getOperand(0))))
+          continue;
+        if (arithmetic(*I)) {
+          Work.push_back(I);
+          continue;
+        }
+        if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(I)) {
+          if (U.getOperandNo() != 0 ||
+              !loadsOfPrivateSlot(originOf(SI->getPointerOperand()), Work))
+            return true;
+          continue;
+        }
+        const auto* CB = llvm::dyn_cast<llvm::CallBase>(I);
+        if (!CB || !CB->isArgOperand(&U))
+          return true;
+        const llvm::Function* Callee = CB->getCalledFunction();
+        if (Callee && IsRuntimeSupport(Callee->getName()))
+          continue;
+        if (const auto* MI = llvm::dyn_cast<llvm::MemIntrinsic>(CB))
+          if (&U == &MI->getLengthUse())
+            continue;
+        if (Callee && Callee->isIntrinsic())
+          return true;
+        if (callee(*CB).Params[CB->getArgOperandNo(&U)].PointerCaptured)
+          return true;
+        // A trusted call keeps no copy except in its result.
+        if (CB->hasFnAttr(TrustedCallAttr) && !CB->getType()->isVoidTy())
+          Work.push_back(CB);
+      }
+    }
+    return false;
+  }
+
   void collect() {
+    // Condition 6 in the caller: an integer argument that goes nowhere
+    // cannot become a pointer in any memory.
+    for (const llvm::Argument& A : F.args())
+      if (!A.getType()->isPointerTy())
+        R.Params[A.getArgNo()].Captured =
+            R.Params[A.getArgNo()].AddressCaptured =
+                R.Params[A.getArgNo()].PointerCaptured = scalarEscapes(A);
     for (const llvm::Instruction& I : llvm::instructions(F)) {
       if (ignored(I))
         continue;
@@ -1776,9 +1907,11 @@ private:
         if (Exposes(A, I))
           R.Params[I].Captured = R.Params[I].AddressCaptured =
               R.Params[I].PointerCaptured = true;
-    // Through a captured pointer, code elsewhere may store anything.
+    // Through a captured pointer, code elsewhere may store anything; copied
+    // data gives nobody a pointer.
     for (unsigned I = 0; I < N; ++I) {
-      R.Params[I].StoresOwn = !ForeignOld.test(I) && !R.Params[I].Captured;
+      R.Params[I].StoresOwn =
+          !ForeignOld.test(I) && !R.Params[I].PointerCaptured;
       R.Params[I].StoresOwnDeep = R.Params[I].StoresOwn && !ForeignNew.test(I);
     }
   }
@@ -2254,6 +2387,7 @@ llvm::StringSet<> TrustOpaqueCalls(llvm::Module& M) {
       llvm::MemoryEffects::inaccessibleOrArgMemOnly();
   auto Bound = [&](auto& Call) {
     Call.setMemoryEffects(Call.getMemoryEffects() & ArgOnly);
+    Call.addFnAttr(llvm::Attribute::get(M.getContext(), TrustedCallAttr));
     llvm::FunctionType* FT = Call.getFunctionType();
     llvm::CaptureInfo CI = FT->getReturnType()->isPointerTy()
                                ? llvm::CaptureInfo::retOnly()
@@ -2399,9 +2533,11 @@ std::string VariantFields(const llvm::Function& F, ReachAnalysis& RA) {
     // 'r': pointers that the memory holds escape, but not its address.
     // 'i': only integers and characters escape. 's': a write stores only
     // own or fresh pointers; 'o': the fresh memory also holds only such
-    // pointers.
+    // pointers. 'i' hides 's' and 'o': the reader then keeps both unproven.
+    // For a non-pointer, 'c': its value may leave the call or become a
+    // pointer.
     const bool Written = llvm::isModSet(P.Direct | P.Reachable);
-    Captured += !Ptr                         ? '.'
+    Captured += !Ptr                         ? (P.PointerCaptured ? 'c' : '.')
                 : P.AddressCaptured          ? 'c'
                 : P.PointerCaptured          ? 'r'
                 : P.Captured                 ? 'i'
