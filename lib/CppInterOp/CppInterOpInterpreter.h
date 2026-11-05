@@ -9,6 +9,7 @@
 #include "Compatibility.h"
 #include "CompatibilityGLIBC.h"
 #include "DynamicLibraryManager.h"
+#include "InputRollback.h"
 #include "Paths.h"
 
 #include "clang/Interpreter/Interpreter.h"
@@ -39,9 +40,13 @@
 #include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/CoreContainers.h"
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
+#if __has_include("llvm/ExecutionEngine/Orc/SymbolLookupSet.h")
+#include "llvm/ExecutionEngine/Orc/SymbolLookupSet.h"
+#endif
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/TargetSelect.h"
@@ -326,6 +331,7 @@ private:
   mutable std::unique_ptr<DynamicLibraryManager> sDLM;
   mutable std::once_flag sDLMInit;
   bool outOfProcess;
+  std::unique_ptr<CppInternal::InputRollback> rollback;
 
 #if CLANG_VERSION_MAJOR < 24
   // Weak thread_local definitions already handed to the JIT, so later modules
@@ -366,7 +372,10 @@ private:
 public:
   Interpreter(std::unique_ptr<clang::Interpreter> CI,
               std::unique_ptr<IOContext> ctx = nullptr, bool oop = false)
-      : inner(std::move(CI)), io_context(std::move(ctx)), outOfProcess(oop) {}
+      : inner(std::move(CI)), io_context(std::move(ctx)), outOfProcess(oop) {
+    rollback =
+        CppInternal::InputRollback::install(*inner->getCompilerInstance());
+  }
 
 public:
   static std::unique_ptr<Interpreter>
@@ -477,20 +486,80 @@ public:
   }
 
   llvm::Expected<clang::PartialTranslationUnit&> Parse(llvm::StringRef Code) {
-    return inner->Parse(Code);
+    if (rollback)
+      rollback->beginInput(CppInternal::InputCountOf(*inner));
+    auto PTU = inner->Parse(Code);
+    if (!PTU && rollback)
+      rollback->failedParse();
+    return PTU;
   }
 
+  CppInternal::InputRollback* getRollback() { return rollback.get(); }
+
   llvm::Error Execute(clang::PartialTranslationUnit& T) {
+#ifndef __EMSCRIPTEN__
+    if (T.TheModule && !outOfProcess)
+      if (llvm::Error Err = checkUnresolved(*T.TheModule))
+        return Err;
+#endif
     return inner->Execute(T);
   }
 
+#ifndef __EMSCRIPTEN__
+  /// LLJIT keeps the init function of a module that fails to link, and every
+  /// later input fails. Only a module with static initializers links here.
+  llvm::Error checkUnresolved(llvm::Module& M) {
+    if (llvm::orc::getStaticInitGVs(M).empty())
+      return llvm::Error::success();
+    llvm::orc::LLJIT& Jit = *compat::getExecutionEngine(*inner);
+    llvm::orc::SymbolLookupSet Names;
+    for (const llvm::GlobalValue& GV : M.global_values()) {
+      if (!GV.isDeclaration() || GV.hasExternalWeakLinkage() ||
+          GV.use_empty() || GV.getName().starts_with("llvm."))
+        continue;
+      // The JIT linker defines these itself.
+      if (GV.getName() == "__ImageBase" ||
+          GV.getName() == "_GLOBAL_OFFSET_TABLE_")
+        continue;
+      Names.add(Jit.mangleAndIntern(GV.getName()),
+                llvm::orc::SymbolLookupFlags::WeaklyReferencedSymbol);
+    }
+    if (Names.empty())
+      return llvm::Error::success();
+    llvm::orc::JITDylibSearchOrder Order;
+    Jit.getMainJITDylib().withLinkOrderDo(
+        [&](const llvm::orc::JITDylibSearchOrder& O) { Order = O; });
+    auto& ES = Jit.getExecutionSession();
+    auto Found = ES.lookup(Order, Names);
+    // A symbol that fails to materialize fails the link as well.
+    if (!Found) {
+      return Found.takeError();
+    }
+    llvm::orc::SymbolNameVector Missing;
+    for (const auto& [Name, Flags] : Names)
+      if (!Found->contains(Name))
+        Missing.push_back(Name);
+    if (Missing.empty())
+      return llvm::Error::success();
+    return llvm::make_error<llvm::orc::SymbolsNotFound>(
+        Jit.getExecutionSession().getSymbolStringPool(), std::move(Missing));
+  }
+#endif
+
   llvm::Error ParseAndExecute(llvm::StringRef Code, clang::Value* V = nullptr) {
-    // Value-returning execution keeps clang's LastValue handling (private to
-    // clang::Interpreter), so delegate. The no-value path -- used by wrapper
-    // compilation -- is split so the module can be sanitized before Execute.
-    if (V)
-      return inner->ParseAndExecute(Code, V);
-    auto PTU = inner->Parse(Code);
+    // The no-value path -- used by wrapper compilation -- sanitizes the module
+    // before Execute.
+    if (V) {
+      auto PTU = Parse(Code);
+      if (!PTU)
+        return PTU.takeError();
+      if (PTU->TheModule)
+        if (llvm::Error Err = Execute(*PTU))
+          return Err;
+      CppInternal::TakeLastValue(*inner, *V);
+      return llvm::Error::success();
+    }
+    auto PTU = Parse(Code);
     if (!PTU)
       return PTU.takeError();
     if (PTU->TheModule) {
@@ -508,7 +577,7 @@ public:
       if (!outOfProcess)
         compat::bindProcessWeakGlobals(*PTU->TheModule);
 #endif
-      if (llvm::Error Err = inner->Execute(*PTU))
+      if (llvm::Error Err = Execute(*PTU))
         return Err;
     }
     return llvm::Error::success();
