@@ -246,6 +246,7 @@ add_llvm_library(clangCppInterOp
   CXCppInterOp.cpp
   CXCppInterOpGenerated.cpp
   ErrorInternal.cpp
+  InputRollback.cpp
   MemoryEffects.cpp
   Tracing.cpp
   ${DLM}
