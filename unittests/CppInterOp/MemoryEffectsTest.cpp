@@ -352,6 +352,167 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_GlobalWriteIsOtherMemory) {
             0u);
 }
 
+// A pointer that code loads from a constant global points where the
+// initializer of that global says.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PointerFromAConstantGlobal) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_cg_a = 0, me_cg_b = 0, me_cg_c = 0, me_cg_d = 0;
+    inline long* const me_cg_tbl[4] = {&me_cg_a, &me_cg_b, &me_cg_c, &me_cg_d};
+    struct me_cg_entry { int k; long* p; };
+    inline const me_cg_entry me_cg_entries[4] = {
+        {1, &me_cg_a}, {2, &me_cg_b}, {3, &me_cg_c}, {4, &me_cg_d}};
+    extern long* const me_cg_ext;
+    extern "C" void me_cg_table(const int* i) { ++*me_cg_tbl[*i & 3]; }
+    extern "C" long me_cg_table_read(const int* i) { return *me_cg_tbl[*i & 3]; }
+    extern "C" void me_cg_struct(const int* i) { ++*me_cg_entries[*i & 3].p; }
+    extern "C" void me_cg_local(const int* i) {
+      static long s0, s1, s2, s3;
+      static long* const t[4] = {&s0, &s1, &s2, &s3};
+      ++*t[*i & 3];
+    }
+    extern "C" void me_cg_plain() { ++me_cg_a; }
+    extern "C" void me_cg_extern() { ++*me_cg_ext; }
+    extern "C" void me_cg_switch(const int* i) {
+      switch (*i & 3) {
+      case 0: ++me_cg_a; break;
+      case 1: ++me_cg_b; break;
+      case 2: ++me_cg_c; break;
+      default: ++me_cg_d; break;
+      }
+    }
+    extern "C" int me_cg_numbers(const int* i) {
+      static const int t[4] = {3, 1, 4, 1};
+      return t[*i & 3];
+    }
+  )",
+      {"me_cg_table", "me_cg_table_read", "me_cg_struct", "me_cg_local",
+       "me_cg_plain", "me_cg_extern", "me_cg_switch", "me_cg_numbers"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 8u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(MEs[0].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[1].Other, ModRef::Read);
+  EXPECT_EQ(MEs[2].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[3].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[4].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[5].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[6].Other, ModRef::ReadWrite);
+  // A table of numbers is constant memory.
+  EXPECT_EQ(MEs[7].Other, ModRef::None);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    EXPECT_FALSE(
+        Writes(ME.ParamsDirect.empty() ? ModRef::None : ME.ParamsDirect[0]));
+}
+
+// A pointer into a constant table, or an address in a constant integer,
+// keeps its content known through a callee and a local object.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ConstantGlobalThroughACallee) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_cc_a = 0, me_cc_b = 0, me_cc_c = 0, me_cc_d = 0;
+    inline long* const me_cc_tbl[4] = {&me_cc_a, &me_cc_b, &me_cc_c, &me_cc_d};
+    struct me_cc_view { long* const* t; };
+    __attribute__((noinline)) void me_cc_bump(long* const* t, int i) {
+      ++*t[i & 3];
+    }
+    __attribute__((noinline)) long* const* me_cc_get() { return me_cc_tbl; }
+    __attribute__((noinline)) void me_cc_bump_view(const me_cc_view* v, int i) {
+      ++*v->t[i & 3];
+    }
+    extern "C" void me_cc_call(const int* i) { me_cc_bump(me_cc_tbl, *i); }
+    extern "C" void me_cc_result(const int* i) { ++*me_cc_get()[*i & 3]; }
+    extern "C" void me_cc_object(const int* i) {
+      me_cc_view v{me_cc_tbl};
+      me_cc_bump_view(&v, *i);
+    }
+    struct me_cc_ref { long* p; };
+    __attribute__((noinline)) void me_cc_bump_ref(const me_cc_ref* r) {
+      ++*r->p;
+    }
+    extern "C" void me_cc_global() {
+      me_cc_ref r{&me_cc_a};
+      me_cc_bump_ref(&r);
+    }
+  )",
+      {"me_cc_call", "me_cc_result", "me_cc_object", "me_cc_global"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(Writes(ME.Other));
+  }
+}
+
+// Only a declaration of type data counts as constant by its name: a
+// definition with such a name is inspected as any other global.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TypeDataNameIsNotEnough) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    extern "C" { long _ZTVme_tn_a = 0, _ZTVme_tn_b = 0, _ZTVme_tn_c = 0; }
+    inline long* const me_tn_tbl[4] = {&_ZTVme_tn_a, &_ZTVme_tn_b,
+                                       &_ZTVme_tn_c, &_ZTVme_tn_a};
+    extern "C" void me_tn_name(const int* i) { ++*me_tn_tbl[*i & 3]; }
+    inline long me_tn_e = 0, me_tn_f = 0, me_tn_g = 0, me_tn_h = 0;
+    extern long* const me_tn_asm_tbl[4] asm("_ZTSme_tn_table");
+    long* const me_tn_asm_tbl[4] = {&me_tn_e, &me_tn_f, &me_tn_g, &me_tn_h};
+    extern "C" void me_tn_asm(const int* i) { ++*me_tn_asm_tbl[*i & 3]; }
+    inline long* const me_tn_in0[2] = {&me_tn_e, &me_tn_f};
+    inline long* const me_tn_in1[2] = {&me_tn_g, &me_tn_h};
+    inline long* const* const me_tn_out[2] = {me_tn_in0, me_tn_in1};
+    extern "C" void me_tn_chain(const int* i) {
+      ++*me_tn_out[*i & 1][(*i >> 1) & 1];
+    }
+  )",
+      {"me_tn_name", "me_tn_asm", "me_tn_chain"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 3u);
+  for (size_t I = 0; I < MEs.size(); ++I) {
+    ASSERT_TRUE(MEs[I].Valid);
+    EXPECT_TRUE(Writes(MEs[I].Other)) << I;
+  }
+}
+
+// A vtable and the type information it points to are constant data of the
+// C++ runtime, so an object that holds a vtable pointer stays local.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_VtablePointerIsConstantData) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("expects the Itanium names of vtables and type information");
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_vt_base {
+      virtual ~me_vt_base() {}
+      virtual int f() const { return 1; }
+      long* q = nullptr;
+    };
+    struct me_vt_derived : me_vt_base {
+      int f() const override { return 2; }
+    };
+    __attribute__((noinline)) long me_vt_read(const me_vt_base* b) {
+      return *b->q;
+    }
+    extern "C" long me_vt_local(const long* x) {
+      long v = *x;
+      me_vt_derived d;
+      d.q = &v;
+      return me_vt_read(&d);
+    }
+  )",
+      {"me_vt_local"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Other, ModRef::None);
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ExternalCallIsOpaque) {
   SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();

@@ -221,6 +221,9 @@ void LocalizeTerminate(llvm::Module& M) {
 //   Global     a non-constant global; Unknown anything else (inttoptr, a
 //              load from an object whose content is not known, an opaque
 //              result).
+//   Const(G)   a constant global whose initializer, directly or through
+//              other constants, points to memory that changes: a load
+//              from it yields the origins of that initializer.
 //
 // Soundness conditions, enforced below:
 //
@@ -426,6 +429,8 @@ void ApplySummary(llvm::Function& F, const SummaryVariant& S) {
 struct Origin {
   llvm::SmallBitVector Direct, Loaded;
   llvm::SmallVector<const llvm::Value*, 2> Objs; // sorted
+  // Constant globals whose content may point to memory that changes.
+  llvm::SmallVector<const llvm::GlobalVariable*, 1> Consts; // sorted
   bool Global = false, Unknown = false;
 
   explicit Origin(unsigned N) : Direct(N), Loaded(N) {}
@@ -447,6 +452,13 @@ struct Origin {
       auto It = std::lower_bound(Objs.begin(), Objs.end(), A);
       if (It == Objs.end() || *It != A) {
         Objs.insert(It, A);
+        Changed = true;
+      }
+    }
+    for (const llvm::GlobalVariable* G : O.Consts) {
+      auto It = std::lower_bound(Consts.begin(), Consts.end(), G);
+      if (It == Consts.end() || *It != G) {
+        Consts.insert(It, G);
         Changed = true;
       }
     }
@@ -626,6 +638,11 @@ private:
   // Per object: the objects it may hold pointers to.
   llvm::DenseMap<const llvm::Value*, llvm::SmallVector<const llvm::Value*, 2>>
       HoldsObjs;
+  // Per object: the constant globals it may hold pointers into.
+  llvm::DenseMap<const llvm::Value*,
+                 llvm::SmallVector<const llvm::GlobalVariable*, 1>>
+      HoldsConsts;
+  mutable llvm::DenseMap<const llvm::GlobalVariable*, bool> Inert;
   // Objects that a write the analysis does not see may change (condition 5).
   llvm::SmallPtrSet<const llvm::Value*, 8> Exposed;
   // Calls that store fresh memory into an object (condition 6): the call
@@ -674,13 +691,105 @@ private:
         llvm::isa<llvm::UndefValue>(UO) || llvm::isa<llvm::Function>(UO))
       return O; // no memory
     if (const auto* GV = llvm::dyn_cast<llvm::GlobalVariable>(UO)) {
-      // Constant memory holds no value that changes.
+      // Constant memory holds no value that changes, but it may hold
+      // pointers to memory that does.
       if (!GV->isConstant())
         O.Global = true;
+      else if (!inert(GV))
+        O.Consts.push_back(GV);
       return O;
     }
     O.Unknown = true;
     return O;
+  }
+
+  // Where the pointers in the initializer of a constant may point. An
+  // integer expression may hold an address.
+  Origin initializerOrigin(const llvm::Constant* C) const {
+    Origin O(N);
+    if (C->getType()->isPointerTy())
+      return constantOrigin(C);
+    if (llvm::isa<llvm::ConstantAggregate>(C)) {
+      for (const llvm::Value* Op : C->operands())
+        O.join(initializerOrigin(llvm::cast<llvm::Constant>(Op)));
+      return O;
+    }
+    if (const auto* CE = llvm::dyn_cast<llvm::ConstantExpr>(C))
+      if (CE->getOpcode() == llvm::Instruction::PtrToInt)
+        return constantOrigin(CE->getOperand(0));
+    if (!llvm::isa<llvm::ConstantData>(C))
+      O.Unknown = true;
+    return O;
+  }
+
+  // The memory that a load from constant global \p GV may point to.
+  Origin contentOf(const llvm::GlobalVariable* GV) const {
+    if (!GV->hasDefinitiveInitializer()) {
+      Origin O(N);
+      O.Unknown = true;
+      return O;
+    }
+    return initializerOrigin(GV->getInitializer());
+  }
+
+  // A declaration of Itanium type data that another unit defines: a
+  // constant vtable, VTT or type information, or a type information vtable
+  // of the runtime, which the module declares without the constant flag.
+  // A definition is inspected as any other constant. The names are reserved:
+  // a program that gives one to its own data (an asm label) is not covered.
+  static bool typeData(const llvm::GlobalVariable* GV) {
+    if (GV->hasInitializer())
+      return false;
+    llvm::StringRef Name = GV->getName();
+    if (Name.starts_with("_ZTVN10__cxxabiv1"))
+      return true;
+    return GV->isConstant() &&
+           (Name.starts_with("_ZTV") || Name.starts_with("_ZTT") ||
+            Name.starts_with("_ZTI") || Name.starts_with("_ZTS"));
+  }
+
+  // A constant global whose content, followed through other constant
+  // globals, points to no memory that changes.
+  bool inert(const llvm::GlobalVariable* GV) const {
+    auto It = Inert.find(GV);
+    if (It != Inert.end())
+      return It->second;
+    bool Result = true;
+    llvm::SmallPtrSet<const llvm::GlobalVariable*, 8> Seen;
+    llvm::SmallVector<const llvm::GlobalVariable*, 8> Work{GV};
+    while (Result && !Work.empty()) {
+      const llvm::GlobalVariable* G = Work.pop_back_val();
+      if (!Seen.insert(G).second || typeData(G))
+        continue;
+      if (!G->hasDefinitiveInitializer()) {
+        Result = false;
+        break;
+      }
+      llvm::SmallVector<const llvm::Constant*, 8> Cs{G->getInitializer()};
+      while (Result && !Cs.empty()) {
+        const llvm::Constant* C = Cs.pop_back_val();
+        if (llvm::isa<llvm::ConstantAggregate>(C)) {
+          for (const llvm::Value* Op : C->operands())
+            Cs.push_back(llvm::cast<llvm::Constant>(Op));
+          continue;
+        }
+        if (!C->getType()->isPointerTy()) {
+          Result = llvm::isa<llvm::ConstantData>(C);
+          continue;
+        }
+        const llvm::Value* UO = llvm::getUnderlyingObject(C);
+        if (llvm::isa<llvm::ConstantPointerNull>(UO) ||
+            llvm::isa<llvm::UndefValue>(UO) || llvm::isa<llvm::Function>(UO))
+          continue;
+        const auto* Next = llvm::dyn_cast<llvm::GlobalVariable>(UO);
+        if (Next && (Next->isConstant() || typeData(Next)))
+          Work.push_back(Next);
+        else
+          Result = false;
+      }
+    }
+    Inert[GV] = Result;
+    return Result;
   }
 
   Origin originOf(const llvm::Value* V) const {
@@ -726,6 +835,8 @@ private:
     Origin R(N);
     R.Loaded = O.params();
     R.Unknown = O.unowned();
+    for (const llvm::GlobalVariable* G : O.Consts)
+      R.join(contentOf(G));
     for (const llvm::Value* A : O.Objs) {
       if (!knownContent(A)) {
         R.Unknown = true;
@@ -741,6 +852,9 @@ private:
       auto HO = HoldsObjs.find(A);
       if (HO != HoldsObjs.end())
         Held.Objs.assign(HO->second.begin(), HO->second.end());
+      auto HC = HoldsConsts.find(A);
+      if (HC != HoldsConsts.end())
+        Held.Consts.assign(HC->second.begin(), HC->second.end());
       // Code that writes the owner's reachable memory may store into it.
       auto W = Owners.find(A);
       if (W != Owners.end() && W->second.K == Owner::Param)
@@ -950,7 +1064,7 @@ private:
       if (!A->getType()->isPointerTy())
         continue;
       Origin O = originOf(A);
-      if (O.unowned())
+      if (O.unowned() || !O.Consts.empty())
         return false;
       Seen |= O.params();
     }
@@ -980,7 +1094,8 @@ private:
   bool recordCopy(const Origin& Src, const Origin& Dst,
                   const llvm::SmallBitVector* Ptr = nullptr) {
     bool Changed = false;
-    if (Src.Objs.empty() && !Src.anyParam() && !Src.unowned())
+    if (Src.Objs.empty() && Src.Consts.empty() && !Src.anyParam() &&
+        !Src.unowned())
       return false;
     Owner W = ownerOf(Dst);
     for (const llvm::Value* A : Src.Objs)
@@ -997,6 +1112,14 @@ private:
         auto It = std::lower_bound(HO.begin(), HO.end(), B);
         if (It == HO.end() || *It != B) {
           HO.insert(It, B);
+          Changed = true;
+        }
+      }
+      llvm::SmallVector<const llvm::GlobalVariable*, 1>& HC = HoldsConsts[A];
+      for (const llvm::GlobalVariable* G : Src.Consts) {
+        auto It = std::lower_bound(HC.begin(), HC.end(), G);
+        if (It == HC.end() || *It != G) {
+          HC.insert(It, G);
           Changed = true;
         }
       }
@@ -1051,7 +1174,10 @@ private:
     Origin O(N);
     if (scalar(V->getType())) {
       O.Direct = taintOf(V);
-      if (wide(V->getType()) && !llvm::isa<llvm::Constant>(V))
+      if (const auto* C = llvm::dyn_cast<llvm::Constant>(V)) {
+        if (wide(V->getType()))
+          O.join(initializerOrigin(C));
+      } else if (wide(V->getType()))
         O.join(originOf(V));
       return O;
     }
@@ -1375,13 +1501,18 @@ private:
       R.Other |= MR;
     if (!Reachable)
       return;
+    // Not inert: a constant reaches memory that changes.
+    if (!O.Consts.empty())
+      R.Other |= MR;
     // Memory reachable from an object: whatever it holds.
     for (const llvm::Value* A : O.Objs) {
       auto It = Holds.find(A);
       if (It != Holds.end())
         for (unsigned I : It->second.set_bits())
           R.Params[I].Reachable |= MR;
-      if (HoldsUnknown.count(A))
+      auto HC = HoldsConsts.find(A);
+      if (HoldsUnknown.count(A) ||
+          (HC != HoldsConsts.end() && !HC->second.empty()))
         R.Other |= MR;
     }
   }
@@ -1535,7 +1666,7 @@ private:
   bool ownOrFresh(const Origin& Src, unsigned K, bool Deep) const {
     llvm::SmallBitVector P = Src.params();
     P.reset(K);
-    if (Src.unowned() || P.any())
+    if (Src.unowned() || P.any() || !Src.Consts.empty())
       return false;
     if (!Deep)
       return llvm::all_of(Src.Objs, [&](const llvm::Value* A) {
@@ -1562,6 +1693,9 @@ private:
         if (Held.any())
           return false;
       }
+      auto HC = HoldsConsts.find(A);
+      if (HC != HoldsConsts.end() && !HC->second.empty())
+        return false;
       auto HO = HoldsObjs.find(A);
       if (HO != HoldsObjs.end())
         Work.append(HO->second.begin(), HO->second.end());
@@ -1673,7 +1807,8 @@ private:
     Origin O = originOf(V);
     R.RetDirect |= O.Direct;
     R.RetLoaded |= O.Loaded;
-    R.RetUnknown |= O.unowned();
+    // The summary has no place for a constant that is not inert.
+    R.RetUnknown |= O.unowned() || !O.Consts.empty();
     for (const llvm::Value* A : O.Objs) {
       Owner W = Owners.lookup(A);
       if (W.K == Owner::Param)
