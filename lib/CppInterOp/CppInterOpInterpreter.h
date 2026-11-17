@@ -398,6 +398,30 @@ private:
   }
 #endif
 
+  /// The rewrites that a module gets before Execute. Without \p WillRun,
+  /// they change no interpreter or JIT state.
+  void rewriteForJIT(llvm::Module& M, bool WillRun) {
+#if CLANG_VERSION_MAJOR < 24
+    if (WillRun) {
+      compat::dedupeWeakEmulatedTLS(M, DedupedWeakTLS);
+    } else {
+      llvm::StringSet<> Defined = DedupedWeakTLS;
+      compat::dedupeWeakEmulatedTLS(M, Defined);
+    }
+#endif
+#ifndef _WIN32
+    if (!outOfProcess && compat::redirectNativeTLSDeclarations(M) && WillRun)
+      installNativeTLSHelperOnce();
+#endif
+      // WORKAROUND: see bindProcessWeakGlobals in Compatibility.h -- remove
+      // with the pass once the clang JIT fix lands.
+#if !defined(_WIN32) && CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
+    if (!outOfProcess)
+      compat::bindProcessWeakGlobals(M);
+#endif
+    (void)WillRun;
+  }
+
 public:
   Interpreter(std::unique_ptr<clang::Interpreter> CI,
               std::unique_ptr<IOContext> ctx = nullptr, bool oop = false,
@@ -719,21 +743,8 @@ public:
     if (PTU)
       *PTU = &*PTUOrErr;
 
-#if CLANG_VERSION_MAJOR < 24
     if (PTUOrErr->TheModule)
-      compat::dedupeWeakEmulatedTLS(*PTUOrErr->TheModule, DedupedWeakTLS);
-#endif
-#ifndef _WIN32
-    if (PTUOrErr->TheModule && !outOfProcess &&
-        compat::redirectNativeTLSDeclarations(*PTUOrErr->TheModule))
-      installNativeTLSHelperOnce();
-#endif
-      // WORKAROUND: see bindProcessWeakGlobals in Compatibility.h -- remove
-      // with the pass once the clang JIT fix lands.
-#if !defined(_WIN32) && CPPINTEROP_WORKAROUND_BIND_PROCESS_WEAK_GLOBALS
-    if (PTUOrErr->TheModule && !outOfProcess)
-      compat::bindProcessWeakGlobals(*PTUOrErr->TheModule);
-#endif
+      rewriteForJIT(*PTUOrErr->TheModule, /*WillRun=*/true);
 
     if (OnModule && PTUOrErr->TheModule)
       OnModule(*PTUOrErr->TheModule);
@@ -742,6 +753,24 @@ public:
       llvm::logAllUnhandledErrors(std::move(Err), llvm::errs(),
                                   "Failed to execute via ::process:");
       return Interpreter::kFailure;
+    }
+    return Interpreter::kSuccess;
+  }
+
+  /// Parses \p input and shows its module to \p OnModule after the rewrites
+  /// of process, but does not link or run it. The caller withdraws the input.
+  CompilationResult
+  parseWithoutRun(const std::string& input,
+                  llvm::function_ref<void(const llvm::Module&)> OnModule) {
+    auto PTUOrErr = Parse(input);
+    if (!PTUOrErr) {
+      llvm::logAllUnhandledErrors(PTUOrErr.takeError(), llvm::errs(),
+                                  "Failed to parse via ::parseWithoutRun:");
+      return Interpreter::kFailure;
+    }
+    if (PTUOrErr->TheModule) {
+      rewriteForJIT(*PTUOrErr->TheModule, /*WillRun=*/false);
+      OnModule(*PTUOrErr->TheModule);
     }
     return Interpreter::kSuccess;
   }

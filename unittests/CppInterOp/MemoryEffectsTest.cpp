@@ -847,6 +847,302 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RewoundProbeLeavesCodeReusable) {
   EXPECT_EQ(Fn(1.0f, 2), 7.0f);
 }
 
+namespace {
+const char* ModRefName(ModRef MR) {
+  switch (MR) {
+  case ModRef::None:
+    return "None";
+  case ModRef::Read:
+    return "Read";
+  case ModRef::Write:
+    return "Write";
+  case ModRef::ReadWrite:
+    return "ReadWrite";
+  }
+  return "?";
+}
+
+std::string Describe(const Cpp::FunctionSignature& S) {
+  std::string Out = S.Known ? "known " : "unknown ";
+  Out += S.BaseName + "(";
+  for (Cpp::ParamKind K : S.Params)
+    Out += std::to_string(static_cast<int>(K)) + " ";
+  Out += ")";
+  Out += S.ConstMethod ? " const" : "";
+  Out += S.Variadic ? " variadic" : "";
+  return Out;
+}
+
+// Every field, so that a mismatch shows in the failure message.
+std::string Describe(const Cpp::MemoryEffects& ME) {
+  std::string Out = ME.Valid ? "valid\n" : "invalid\n";
+  auto ModRefs = [&](const char* Name, const std::vector<ModRef>& V) {
+    Out += Name;
+    for (ModRef MR : V)
+      Out += std::string(" ") + ModRefName(MR);
+    Out += "\n";
+  };
+  auto Bools = [&](const char* Name, const std::vector<bool>& V) {
+    Out += Name;
+    for (bool B : V)
+      Out += B ? " 1" : " 0";
+    Out += "\n";
+  };
+  Out += std::string("ArgMem ") + ModRefName(ME.ArgMem) + "\n";
+  Out += std::string("Other ") + ModRefName(ME.Other) + "\n";
+  ModRefs("Params", ME.Params);
+  ModRefs("ParamsDirect", ME.ParamsDirect);
+  ModRefs("ParamsReachable", ME.ParamsReachable);
+  Bools("Captured", ME.Captured);
+  Bools("AddressCaptured", ME.AddressCaptured);
+  Bools("PointerCaptured", ME.PointerCaptured);
+  Out += std::string("TrustedOther ") + ModRefName(ME.TrustedOther) + "\n";
+  ModRefs("TrustedParams", ME.TrustedParams);
+  ModRefs("TrustedParamsDirect", ME.TrustedParamsDirect);
+  ModRefs("TrustedParamsReachable", ME.TrustedParamsReachable);
+  Bools("TrustedCaptured", ME.TrustedCaptured);
+  Bools("TrustedAddressCaptured", ME.TrustedAddressCaptured);
+  Bools("TrustedPointerCaptured", ME.TrustedPointerCaptured);
+  for (const Cpp::OpaqueCall& O : ME.Opaque)
+    Out += "opaque " + std::to_string(static_cast<int>(O.Kind)) + " " +
+           O.Mangled + " | " + O.Demangled + " | " + Describe(O.Signature) +
+           (O.Bounded ? " bounded\n" : "\n");
+  for (const Cpp::MemoryEffects::Callee& C : ME.Callees)
+    Out += "callee " + C.Mangled + " | " + C.Demangled + " | " +
+           Describe(C.Signature) + "\n";
+  return Out;
+}
+
+std::vector<std::string> Describe(const std::vector<Cpp::MemoryEffects>& MEs) {
+  std::vector<std::string> Out;
+  for (const Cpp::MemoryEffects& ME : MEs)
+    Out.push_back(Describe(ME));
+  return Out;
+}
+} // namespace
+
+// A unit that cannot link still has optimized IR: the analysis without a
+// run gives its effects, where the run fails.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AnalyseOnlyNeedsNoDefinition) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  const char* Code = R"(
+    extern "C" void me_unlinked(int* p);
+    extern "C" int me_unlinked_seed();
+    int me_unlinked_seeded = me_unlinked_seed();
+    extern "C" int me_calls_unlinked(int* p, int* q) {
+      me_unlinked(p);
+      return *q;
+    }
+  )";
+  const size_t Before = Cpp::GetInputCount();
+  // Without the in-process link check, the failed link breaks later inputs.
+  if (!TypeParam::isOutOfProcess) {
+    std::vector<Cpp::MemoryEffects> Run = Cpp::GetFunctionsMemoryEffects(
+        Code, {"me_calls_unlinked"}, /*rewind=*/true);
+    ASSERT_EQ(Run.size(), 1u);
+    EXPECT_FALSE(Run[0].Valid);
+    EXPECT_EQ(Cpp::GetInputCount(), Before);
+  }
+
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_calls_unlinked"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Other, ModRef::ReadWrite);
+  ASSERT_EQ(MEs[0].Params.size(), 2u);
+  EXPECT_EQ(MEs[0].Params[0], ModRef::ReadWrite);
+  EXPECT_TRUE(MEs[0].Captured[0]);
+  EXPECT_TRUE(Mentions(MEs[0], "me_unlinked")) << OpaqueNames(MEs[0]);
+  EXPECT_EQ(MEs[0].TrustedOther, ModRef::None);
+  EXPECT_EQ(MEs[0].TrustedParams[1], ModRef::Read);
+  ASSERT_EQ(MEs[0].Callees.size(), 1u);
+  EXPECT_EQ(MEs[0].Callees[0].Mangled, "me_unlinked");
+  EXPECT_EQ(Cpp::GetInputCount(), Before);
+}
+
+// The analysis without a run withdraws the unit: its names are free again,
+// and the units before it stay.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AnalyseOnlyLeavesNoState) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("namespace me_ao_before_ns { int kept = 3; }"), 0);
+  const size_t Before = Cpp::GetInputCount();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    namespace me_ao_ns {
+    struct Box { int v; };
+    inline int twice(const Box& b) { return 2 * b.v; }
+    extern "C" int me_ao_defined(Box* b) { return twice(*b); }
+    }
+  )",
+      {"me_ao_defined"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Params[0], ModRef::Read);
+  EXPECT_EQ(Cpp::GetInputCount(), Before);
+  EXPECT_FALSE(Cpp::GetNamed("me_ao_ns"));
+  EXPECT_FALSE(Cpp::GetFunctionAddress("me_ao_defined"));
+  EXPECT_TRUE(Cpp::GetNamed("me_ao_before_ns"));
+
+  ASSERT_EQ(Cpp::Declare(R"(
+    namespace me_ao_ns {
+    struct Box { int v; int w; };
+    inline int twice(const Box& b) { return 2 * b.w; }
+    extern "C" int me_ao_defined(Box* b) { return twice(*b) + 1; }
+    }
+  )"),
+            0);
+  void* Addr = Cpp::GetFunctionAddress("me_ao_defined");
+  ASSERT_NE(Addr, nullptr);
+  ASSERT_EQ(Cpp::Undo(Cpp::GetInputCount() - Before), 0);
+  ASSERT_EQ(Cpp::Undo(1), 0);
+  EXPECT_FALSE(Cpp::GetNamed("me_ao_before_ns"));
+}
+
+// The analysis without a run does not run the static initializers.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AnalyseOnlyRunsNoInitializer) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  if (TypeParam::isOutOfProcess)
+    GTEST_SKIP() << "Evaluate does not work with the OOP JIT";
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("int me_init_runs = 0;"), 0);
+  const char* Code = R"(
+    struct MeCountsInit { MeCountsInit() { ++me_init_runs; } };
+    MeCountsInit me_counts_init;
+    me_init_runs += 10;
+    extern "C" int me_init_reader(int* p) { return *p; }
+  )";
+  std::vector<Cpp::MemoryEffects> MEs =
+      Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_init_reader"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(Cpp::Evaluate("me_init_runs").unbox<int>(), 0);
+
+  // The run does run them, so the counter shows a run.
+  std::vector<Cpp::MemoryEffects> Run =
+      Cpp::GetFunctionsMemoryEffects(Code, {"me_init_reader"}, /*rewind=*/true);
+  ASSERT_TRUE(Run[0].Valid);
+  EXPECT_EQ(Cpp::Evaluate("me_init_runs").unbox<int>(), 11);
+}
+
+// A unit that does not compile gives invalid effects and leaves nothing:
+// no input, no name, no macro. The error comes first: clang-repl keeps the
+// IR of the definitions before it (llvm/llvm-project#226285).
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AnalyseOnlyCompileError) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  const size_t Before = Cpp::GetInputCount();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    #define ME_AO_BROKEN_MACRO 1
+    extern "C" int me_ao_broken(int* p) { return *p + me_ao_undeclared; }
+    namespace me_ao_broken_ns { int kept = 1; }
+    extern "C" int me_ao_fine(int* p) { return *p; }
+  )",
+      {"me_ao_broken", "me_ao_fine"});
+  ASSERT_EQ(MEs.size(), 2u);
+  EXPECT_FALSE(MEs[0].Valid);
+  EXPECT_FALSE(MEs[1].Valid);
+  EXPECT_EQ(Cpp::GetInputCount(), Before);
+#if LLVM_VERSION_MAJOR >= 22
+  // The rollback of names and macros of a failed parse needs LLVM 22.
+  EXPECT_FALSE(Cpp::GetNamed("me_ao_broken_ns"));
+  EXPECT_EQ(Cpp::Declare(R"(
+    #ifdef ME_AO_BROKEN_MACRO
+    #error the macro of the failed unit stays
+    #endif
+  )"),
+            0);
+#endif
+  EXPECT_NE(Cpp::Declare("int me_ao_use = me_ao_broken_ns::kept;",
+                         /*silent=*/true),
+            0);
+  EXPECT_EQ(Cpp::Declare(R"(
+    namespace me_ao_broken_ns { int kept = 2; }
+    extern "C" int me_ao_fine(int* p) { return *p; }
+  )"),
+            0);
+}
+
+// For a unit that links, the analysis without a run gives the same effects
+// and callees as the analysis that runs the unit.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AnalyseOnlyEqualsRun) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  // Each unit runs twice. A header that a withdrawn unit enters first does
+  // not parse again, and an instantiation of a template that a withdrawn
+  // unit defines is not emitted again.
+  ASSERT_EQ(Cpp::Declare(R"(
+    #include <cstring>
+    template <class T> T me_eq_thrice(T x) { return x + x + x; }
+  )"),
+            0);
+  struct Unit {
+    std::string Code;
+    std::vector<std::string> Names;
+  };
+  std::vector<Unit> Units = {
+      {R"(
+    struct Box { int v; };
+    inline int twice(const Box& b) { return 2 * b.v; }
+    extern "C" int me_eq_pure(Box* b) { return twice(*b); }
+    extern "C" void me_eq_bump(int* a, int* b) { *a += 1; (void)*b; }
+  )",
+       {"me_eq_pure", "me_eq_bump", "me_eq_absent"}},
+      {R"(
+    extern "C" unsigned long me_eq_len(const char* s, char* d) {
+      std::memcpy(d, s, 4);
+      return std::strlen(s);
+    }
+  )",
+       {"me_eq_len"}},
+      {R"(
+    namespace me_eq_ns {
+    struct Box { int v; Box(int x) : v(x) {} ~Box() {} };
+    inline int pick(const Box& b) { return b.v; }
+    inline int pick(Box& b) { return -b.v; }
+    extern "C" int me_eq_callees(const Box* b, int* x) {
+      return pick(*b) + pick(Box(*x)) + me_eq_thrice(*x);
+    }
+    }
+  )",
+       {"me_eq_callees"}},
+      {R"(
+    int* me_eq_global = nullptr;
+    extern "C" void me_eq_escape(int* p, int** q) { me_eq_global = p; *q = p; }
+  )",
+       {"me_eq_escape"}},
+      {R"(
+    extern "C" int me_eq_seed() { return 3; }
+    int me_eq_seeded = me_eq_seed();
+    extern "C" int me_eq_reads_seeded(int* p) { return *p + me_eq_seeded; }
+  )",
+       {"me_eq_reads_seeded"}},
+  };
+#if !defined(_WIN32) && !defined(EMSCRIPTEN)
+  // The native-TLS rewrite changes the module that the analysis sees.
+  if (!TypeParam::isOutOfProcess)
+    Units.push_back({R"(
+    extern "C" __thread int me_native_tls;
+    extern "C" int me_eq_reads_tls(int* p) { return *p + me_native_tls; }
+  )",
+                     {"me_eq_reads_tls"}});
+#endif
+  for (const Unit& U : Units) {
+    SCOPED_TRACE(U.Names.front());
+    const size_t Before = Cpp::GetInputCount();
+    std::vector<Cpp::MemoryEffects> Analysed =
+        Cpp::AnalyzeFunctionsMemoryEffects(U.Code.c_str(), U.Names);
+    EXPECT_EQ(Cpp::GetInputCount(), Before);
+    std::vector<Cpp::MemoryEffects> Run = Cpp::GetFunctionsMemoryEffects(
+        U.Code.c_str(), U.Names, /*rewind=*/true);
+    EXPECT_EQ(Cpp::GetInputCount(), Before);
+    ASSERT_TRUE(Run.front().Valid);
+    EXPECT_EQ(Describe(Analysed), Describe(Run));
+  }
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CalleesNameTheSelectedOverload) {
   SKIP_WITHOUT_MEMORY_EFFECTS();
   SKIP_ON_MSVC_ABI("the test expects Itanium mangled and demangled names");
