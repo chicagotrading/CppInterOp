@@ -605,8 +605,8 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
   // The IncrementalExecutorBuilder must outlive the IncrementalCompiler
   // it gets attached to, so it's a unique_ptr at function scope.
   auto ExecutorConfig = std::make_unique<clang::IncrementalExecutorBuilder>();
-  // Run the JIT with the large code model, as the LLVM <= 21 path below does.
-  // With the default CodeModel::Small (LLJIT.cpp sets it when the builder
+  // Run the JIT with the large code model. With the default
+  // CodeModel::Small (LLJIT.cpp sets it when the builder
   // leaves the code model unset), x86-64 PIC gets the personality encoding
   // sdata4|pcrel|indirect (TargetLoweringObjectFileELF::Initialize). The
   // .eh_frame CIE personality field is then a PC32 delta, and it must reach
@@ -702,24 +702,10 @@ createClangInterpreter(std::vector<const char*>& args, int stdin_fd = -1,
                   : clang::Interpreter::create(std::move(*ciOrErr),
                                                std::move(ExecutorConfig));
 #else
-  // FIXME: this is the simplest way to hard code large code model
-  auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
-  if (!JTMB) {
-    // Also required for correctness: dereferencing an unchecked Expected
-    // aborts under LLVM_ENABLE_ABI_BREAKING_CHECKS builds.
-    llvm::logAllUnhandledErrors(JTMB.takeError(), llvm::errs(),
-                                "Failed to detect host for the JIT:");
-    return nullptr;
-  }
-  JTMB->setCodeModel(llvm::CodeModel::Large);
-  auto JB = std::make_unique<llvm::orc::LLJITBuilder>();
-  JB->setJITTargetMachineBuilder(std::move(*JTMB));
-
   auto innerOrErr =
-      CudaEnabled
-          ? clang::Interpreter::createWithCUDA(std::move(*ciOrErr),
-                                               std::move(DeviceCI))
-          : clang::Interpreter::create(std::move(*ciOrErr), std::move(JB));
+      CudaEnabled ? clang::Interpreter::createWithCUDA(std::move(*ciOrErr),
+                                                       std::move(DeviceCI))
+                  : clang::Interpreter::create(std::move(*ciOrErr));
 #endif
   if (!innerOrErr) {
     llvm::logAllUnhandledErrors(innerOrErr.takeError(), llvm::errs(),
