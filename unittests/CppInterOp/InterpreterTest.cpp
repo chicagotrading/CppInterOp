@@ -1285,6 +1285,18 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_FailedParseDropsMacros) {
   EXPECT_EQ(0, Cpp::Declare("#ifdef FPM_X\n#error kept\n#endif"));
 }
 
+TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_FailedParseDropsNames) {
+  SKIP_WITHOUT_INPUT_ROLLBACK();
+  TestFixture::CreateInterpreter();
+
+  EXPECT_NE(0, Cpp::Declare("namespace fpn_ns { int kept = 1; }"
+                            "int fpn_bad = fpn_nope;",
+                            /*silent=*/true));
+  EXPECT_FALSE(Cpp::GetNamed("fpn_ns"));
+  EXPECT_FALSE(Cpp::GetNamed("fpn_bad"));
+  EXPECT_NE(0, Cpp::Declare("int fpn_use = fpn_ns::kept;", /*silent=*/true));
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, Interpreter_UndoRestoresMacro) {
   SKIP_WITHOUT_INPUT_ROLLBACK();
   TestFixture::CreateInterpreter();

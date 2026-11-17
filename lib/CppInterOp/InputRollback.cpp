@@ -22,6 +22,7 @@
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Sema/Scope.h"
 #include "clang/Sema/Sema.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -63,6 +64,7 @@ struct InputRollback::State {
 
   void resetInstantiations();
   void revertPreprocessor(size_t From);
+  void dropScopeNames();
 };
 
 namespace {
@@ -207,7 +209,29 @@ void InputRollback::beginInput(size_t Index) {
   S->Vars.clear();
 }
 
+// clang-repl drops the names of a failed input from the TU scope and the
+// identifier chains only when the next input pops the scope. In C++ the pop
+// leaves the kept inputs visible through the TU lookup.
+void InputRollback::State::dropScopeNames() {
+  clang::Sema& Sema = CI->getSema();
+  if (!Sema.TUScope || !Sema.getLangOpts().CPlusPlus)
+    return;
+  // The failed input's TU is no longer the current one.
+  const clang::TranslationUnitDecl* Kept =
+      CI->getASTContext().getTranslationUnitDecl();
+  llvm::SmallVector<clang::NamedDecl*, 8> Names;
+  for (clang::Decl* D : Sema.TUScope->decls())
+    if (auto* ND = llvm::dyn_cast<clang::NamedDecl>(D))
+      if (ND->getDeclName() && ND->getTranslationUnitDecl() != Kept)
+        Names.push_back(ND);
+  for (clang::NamedDecl* ND : Names) {
+    Sema.TUScope->RemoveDecl(ND);
+    Sema.IdResolver.RemoveDecl(ND);
+  }
+}
+
 void InputRollback::failedParse() {
+  S->dropScopeNames();
   S->resetInstantiations();
   S->revertPreprocessor(S->Input);
 }
