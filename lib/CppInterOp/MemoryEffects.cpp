@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -309,6 +310,53 @@ struct Reach {
     R.RetUnknown = true;
     return R;
   }
+
+  // The start of a fixpoint over recursive calls: no effect at all.
+  static Reach none(unsigned N) {
+    Reach R(N);
+    for (ParamReach& P : R.Params)
+      P.StoresOwn = P.StoresOwnDeep = true;
+    return R;
+  }
+
+  // Add the effects of \p O; return whether this changes.
+  bool join(const Reach& O) {
+    Reach Old = *this;
+    Other |= O.Other;
+    for (size_t I = 0; I < Params.size(); ++I) {
+      ParamReach& P = Params[I];
+      const ParamReach& Q = O.Params[I];
+      P.Direct |= Q.Direct;
+      P.Reachable |= Q.Reachable;
+      P.Captured |= Q.Captured;
+      P.AddressCaptured |= Q.AddressCaptured;
+      P.PointerCaptured |= Q.PointerCaptured;
+      P.StoresOwn &= Q.StoresOwn;
+      P.StoresOwnDeep &= Q.StoresOwnDeep;
+    }
+    RetDirect |= O.RetDirect;
+    RetLoaded |= O.RetLoaded;
+    RetFresh |= O.RetFresh;
+    RetUnknown |= O.RetUnknown;
+    return !(*this == Old);
+  }
+
+  friend bool operator==(const Reach& A, const Reach& B) {
+    if (A.Other != B.Other || A.RetDirect != B.RetDirect ||
+        A.RetLoaded != B.RetLoaded || A.RetFresh != B.RetFresh ||
+        A.RetUnknown != B.RetUnknown || A.Params.size() != B.Params.size())
+      return false;
+    for (size_t I = 0; I < A.Params.size(); ++I) {
+      const ParamReach& P = A.Params[I];
+      const ParamReach& Q = B.Params[I];
+      if (std::tie(P.Direct, P.Reachable, P.Captured, P.AddressCaptured,
+                   P.PointerCaptured, P.StoresOwn, P.StoresOwnDeep) !=
+          std::tie(Q.Direct, Q.Reachable, Q.Captured, Q.AddressCaptured,
+                   Q.PointerCaptured, Q.StoresOwn, Q.StoresOwnDeep))
+        return false;
+    }
+    return true;
+  }
 };
 
 // One parameter of a summary: how LLVM bounds the access through it and
@@ -497,17 +545,42 @@ class ReachAnalysis {
 public:
   explicit ReachAnalysis(bool Trusted) : Trusted(Trusted) {}
 
+  // A recursive call uses an assumed summary of its callee, which starts
+  // at no effect. The analysis of the callee repeats until its result is
+  // inside the assumption. A result that uses the assumption of a caller
+  // that is still open is not kept.
   const Reach& of(const llvm::Function& F) {
     auto It = Done.find(&F);
     if (It != Done.end())
       return *It->second;
-    if (!Busy.insert(&F).second) {
-      // Recursion: the callee is bounded by nothing yet.
-      return *(Done[&F] =
-                   std::make_unique<Reach>(Reach::conservative(F.arg_size())));
+    auto A = Assumed.find(&F);
+    if (A != Assumed.end()) {
+      A->second.Used = true;
+      Low = std::min(Low, A->second.Depth);
+      return A->second.R;
     }
-    Reach R = analyze(F);
-    Busy.erase(&F);
+    const unsigned D = Assumed.size();
+    Assumed.try_emplace(&F, Assumption{Reach::none(F.arg_size()), D, false});
+    const unsigned OuterLow = Low;
+    Reach R;
+    for (unsigned Round = 0;; ++Round) {
+      Assumption& Own = Assumed.find(&F)->second;
+      Own.Used = false;
+      Low = ~0u;
+      R = analyze(F);
+      Assumption& After = Assumed.find(&F)->second;
+      if (!After.Used || !After.R.join(R))
+        break;
+      if (Round == MaxRounds) {
+        R = Reach::conservative(F.arg_size());
+        break;
+      }
+    }
+    Assumed.erase(&F);
+    const bool Open = Low < D;
+    Low = std::min(OuterLow, Low);
+    if (Open)
+      return *Temp.emplace_back(std::make_unique<Reach>(std::move(R)));
     return *(Done[&F] = std::make_unique<Reach>(std::move(R)));
   }
 
@@ -528,7 +601,18 @@ public:
 private:
   bool Trusted;
   llvm::DenseMap<const llvm::Function*, std::unique_ptr<Reach>> Done;
-  llvm::SmallPtrSet<const llvm::Function*, 8> Busy;
+  // The functions whose analysis is open, by depth.
+  struct Assumption {
+    Reach R;
+    unsigned Depth;
+    bool Used;
+  };
+  std::map<const llvm::Function*, Assumption> Assumed;
+  // The least depth of an assumption that the current analysis uses.
+  unsigned Low = ~0u;
+  // Results that use the assumption of an open caller.
+  std::vector<std::unique_ptr<Reach>> Temp;
+  static constexpr unsigned MaxRounds = 8;
 
   // A variadic callee's extra arguments are bounded by nothing.
   static Reach padded(const Reach& R, unsigned N) {

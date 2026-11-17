@@ -1786,6 +1786,183 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressArithmeticOfAFreshBuffer) 
   EXPECT_FALSE(ME.AddressCaptured[1]);
 }
 
+// A sort of a local copy is recursive; it writes only the copy.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SortedCopyOfAMember) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("libc++ inlines its throws around out-of-line exception "
+                 "constructors, which are opaque calls");
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("#include <algorithm>\n#include <vector>"), 0);
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct me_sc_window {
+      double q = 0.5;
+      unsigned long n = 0;
+      std::vector<double> init;
+      double median() const {
+        if (n == 0)
+          return 0.0;
+        std::vector<double> v = init;
+        std::sort(v.begin(), v.end());
+        return v[static_cast<unsigned long>(q * v.size())];
+      }
+    };
+    extern "C" double me_sorted_copy(const me_sc_window* w) {
+      return w->median();
+    }
+  )",
+                                                        "me_sorted_copy");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_FALSE(Writes(ME.ParamsDirect[0]));
+  EXPECT_FALSE(Writes(ME.ParamsReachable[0]));
+}
+
+// A recursive call has the effects of its callee at any depth.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RecursiveCalls) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    long me_rc_g = 0;
+    long* me_rc_kept = nullptr;
+    __attribute__((noinline)) void me_rc_count(const int* n) {
+      if (*n > 0) {
+        int m = *n - 1;
+        me_rc_count(&m);
+      } else {
+        ++me_rc_g;
+      }
+    }
+    __attribute__((noinline)) void me_rc_keep(long* p, const int* n) {
+      if (*n > 0) {
+        int m = *n - 1;
+        me_rc_keep(p, &m);
+      } else {
+        me_rc_kept = p;
+      }
+    }
+    __attribute__((noinline)) void me_rc_odd(long* p, const int* n);
+    __attribute__((noinline)) void me_rc_even(long* p, const int* n) {
+      if (*n > 0) {
+        int m = *n - 1;
+        me_rc_odd(p, &m);
+      }
+    }
+    __attribute__((noinline)) void me_rc_odd(long* p, const int* n) {
+      if (*n > 0) {
+        int m = *n - 1;
+        me_rc_even(p, &m);
+      } else {
+        *p = 1;
+      }
+    }
+    __attribute__((noinline)) long me_rc_sum(const long* p, const int* n) {
+      if (*n <= 0)
+        return 0;
+      int m = *n - 1;
+      return p[m] + me_rc_sum(p, &m);
+    }
+    extern "C" void me_rc_count_top(const int* n) { me_rc_count(n); }
+    extern "C" void me_rc_keep_top(long* p, const int* n) { me_rc_keep(p, n); }
+    extern "C" void me_rc_even_top(long* p, const int* n) { me_rc_even(p, n); }
+    extern "C" long me_rc_sum_top(const long* p, const int* n) {
+      return me_rc_sum(p, n);
+    }
+  )",
+      {"me_rc_count_top", "me_rc_keep_top", "me_rc_even_top", "me_rc_sum_top"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other));
+  EXPECT_TRUE(MEs[1].Captured[0]);
+  EXPECT_TRUE(Writes(MEs[2].ParamsDirect[0]));
+  EXPECT_FALSE(MEs[2].Captured[0]);
+  EXPECT_EQ(MEs[3].Other, ModRef::None);
+  EXPECT_EQ(MEs[3].ParamsDirect[0], ModRef::Read);
+  EXPECT_FALSE(MEs[3].Captured[0]);
+}
+
+// A recursive call that returns a pointer: a global or another argument
+// reaches the result only after more than one round of the fixpoint.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RecursivePointerResults) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_rp_g = 0;
+    __attribute__((noinline)) long* me_rp_pick(long* p, int d) {
+      if (d <= 0)
+        return p;
+      long* a = me_rp_pick(&me_rp_g, d - 1);
+      long* b = me_rp_pick(p, d - 2);
+      return (d & 1) ? a : b;
+    }
+    extern "C" void me_rp_ret(long* p, int d) { *me_rp_pick(p, d) = 1; }
+    __attribute__((noinline)) long* me_rp_rot4(long* a0, long* a1, long* a2,
+                                               long* a3, int d) {
+      if (d <= 0)
+        return a0;
+      long* x = me_rp_rot4(a1, a2, a3, a0, d - 1);
+      long* y = me_rp_rot4(a1, a2, a3, a0, d - 2);
+      return (d & 1) ? x : y;
+    }
+    extern "C" void me_rp_rot4_top(long* a0, long* a1, long* a2, long* a3,
+                                   int d) {
+      *me_rp_rot4(a0, a1, a2, a3, d) = 1;
+    }
+    __attribute__((noinline)) long* me_rp_rot10(long* a0, long* a1, long* a2,
+        long* a3, long* a4, long* a5, long* a6, long* a7, long* a8,
+        long* a9, int d) {
+      if (d <= 0)
+        return a0;
+      long* x = me_rp_rot10(a1, a2, a3, a4, a5, a6, a7, a8, a9, a0, d - 1);
+      long* y = me_rp_rot10(a1, a2, a3, a4, a5, a6, a7, a8, a9, a0, d - 2);
+      return (d & 1) ? x : y;
+    }
+    extern "C" void me_rp_rot10_top(long* a0, long* a1, long* a2, long* a3,
+        long* a4, long* a5, long* a6, long* a7, long* a8, long* a9, int d) {
+      *me_rp_rot10(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, d) = 1;
+    }
+    // The global reaches the result only at depth 2.
+    __attribute__((noinline)) long* me_rp_b(long* p, int d);
+    __attribute__((noinline)) long* me_rp_a(long* p, int d) {
+      if (d <= 0)
+        return p;
+      long* x = me_rp_b(p, d - 1);
+      long* y = me_rp_b(p, d - 2);
+      return (d & 1) ? x : y;
+    }
+    __attribute__((noinline)) long* me_rp_b(long* p, int d) {
+      if (d <= 0)
+        return p;
+      long* x = me_rp_a(&me_rp_g, d - 1);
+      long* y = me_rp_a(p, d - 2);
+      return (d & 1) ? x : y;
+    }
+    extern "C" void me_rp_b_top(long* p, int d) { *me_rp_b(p, d) = 1; }
+    extern "C" void me_rp_a_top(long* p, int d) { *me_rp_a(p, d) = 1; }
+  )",
+      {"me_rp_ret", "me_rp_rot4_top", "me_rp_rot10_top", "me_rp_b_top",
+       "me_rp_a_top"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 5u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other));
+  for (int K = 0; K < 4; ++K)
+    EXPECT_TRUE(Writes(MEs[1].ParamsDirect[K]) || Writes(MEs[1].Other)) << K;
+  for (int K = 0; K < 10; ++K)
+    EXPECT_TRUE(Writes(MEs[2].ParamsDirect[K]) || Writes(MEs[2].Other)) << K;
+  EXPECT_TRUE(Writes(MEs[3].Other));
+  EXPECT_TRUE(Writes(MEs[4].Other));
+}
+
 // A lookup that returns a copy through a temporary: the callee builds the
 // result from fresh memory and the result's own buffer, and the caller frees
 // it again.
