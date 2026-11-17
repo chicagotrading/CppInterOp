@@ -63,7 +63,7 @@ What CppInterOp rolls back
      - Clear the included-file state of files that the input entered first;
        an include guard is a macro
    * - Names in the TU scope
-     - ``Undo``
+     - Failed parse, ``Undo``
      - Remove them from ``TUScope`` and ``IdResolver``
    * - Members added to a namespace that an earlier input opened
      - ``Undo``

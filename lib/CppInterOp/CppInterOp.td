@@ -1632,6 +1632,20 @@ and no JIT code.}];
   ];
 }
 
+def AnalyzeFunctionsMemoryEffects : CppInterOpAPI {
+  let Doc = [{Returns the same memory effects as GetFunctionsMemoryEffects
+with \c rewind true, but does not link or run \c code: it parses the code,
+analyses the module, and undoes the code. So the code can call functions that
+the JIT cannot resolve, and its static initializers do not run.}];
+  // MemoryEffects holds C++ containers; no mechanical C mapping.
+  let NoCWrapper = true;
+  let ReturnType = "std::vector<MemoryEffects>";
+  let Args = [
+    Arg<"const char*", "code">,
+    Arg<"const std::vector<std::string>&", "names">
+  ];
+}
+
 def LoadMemoryEffectsSummaries : CppInterOpAPI {
   let Doc = [{Reads memory-effect summaries of functions whose bodies
 GetFunctionMemoryEffects cannot see (a prebuilt library), in the format of

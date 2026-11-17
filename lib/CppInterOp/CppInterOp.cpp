@@ -6970,10 +6970,10 @@ private:
 };
 #endif
 
-std::vector<MemoryEffects>
-GetFunctionsMemoryEffects(const char* code,
-                          const std::vector<std::string>& names, bool rewind) {
-  INTEROP_TRACE(code, names, rewind);
+// Without \p run, the code is parsed and analysed but not linked or run.
+static std::vector<MemoryEffects>
+FunctionsMemoryEffects(const char* code, const std::vector<std::string>& names,
+                       bool rewind, bool run) {
   std::vector<MemoryEffects> Out(names.size());
 #ifndef CPPINTEROP_USE_CLING
   compat::Interpreter& I = getInterp();
@@ -7001,16 +7001,32 @@ GetFunctionsMemoryEffects(const char* code,
     auto Analyze = [&](const llvm::Module& M) {
       CppInternal::AnalyzeMemoryEffects(M, names, Out, PointerFree);
     };
-    Ok = I.declare(code, /*PTU=*/nullptr, Analyze) ==
-             compat::Interpreter::kSuccess &&
-         !Trap.hasErrorOccurred();
+    const auto Result = run ? I.declare(code, /*PTU=*/nullptr, Analyze)
+                            : I.parseWithoutRun(code, Analyze);
+    Ok = Result == compat::Interpreter::kSuccess && !Trap.hasErrorOccurred();
   }
   if (!Ok)
     Out.assign(names.size(), MemoryEffects{});
   if (rewind && !WithdrawInputs(I, Before))
     Out.assign(names.size(), MemoryEffects{});
 #endif
-  return INTEROP_RETURN(Out);
+  return Out;
+}
+
+std::vector<MemoryEffects>
+GetFunctionsMemoryEffects(const char* code,
+                          const std::vector<std::string>& names, bool rewind) {
+  INTEROP_TRACE(code, names, rewind);
+  return INTEROP_RETURN(
+      FunctionsMemoryEffects(code, names, rewind, /*run=*/true));
+}
+
+std::vector<MemoryEffects>
+AnalyzeFunctionsMemoryEffects(const char* code,
+                              const std::vector<std::string>& names) {
+  INTEROP_TRACE(code, names);
+  return INTEROP_RETURN(
+      FunctionsMemoryEffects(code, names, /*rewind=*/true, /*run=*/false));
 }
 
 MemoryEffects GetFunctionMemoryEffects(const char* code, const char* name) {
