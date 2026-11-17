@@ -1963,6 +1963,36 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RecursivePointerResults) {
   EXPECT_TRUE(Writes(MEs[4].Other));
 }
 
+// The difference of two addresses is an address when one of them is null,
+// so a callee that stores it may store a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_DifferenceWithANullBase) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  ASSERT_EQ(Cpp::Declare("#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_nb_range { long* b; long* e; };
+    struct me_nb_out { long n; long* p; };
+    __attribute__((noinline)) void me_nb_diff(me_nb_out* o,
+                                              const me_nb_range* r) {
+      o->n = reinterpret_cast<long>(r->e) - reinterpret_cast<long>(r->b);
+    }
+    // With r->b == nullptr, o.n is the address r->e.
+    extern "C" void me_nb_write(const me_nb_range* r) {
+      me_nb_out o{0, nullptr};
+      me_nb_diff(&o, r);
+      long* p;
+      std::memcpy(&p, &o.n, sizeof p);
+      *p = 1;
+    }
+  )",
+      {"me_nb_write"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other) || Writes(MEs[0].ParamsReachable[0]));
+}
+
 // A lookup that returns a copy through a temporary: the callee builds the
 // result from fresh memory and the result's own buffer, and the caller frees
 // it again.
