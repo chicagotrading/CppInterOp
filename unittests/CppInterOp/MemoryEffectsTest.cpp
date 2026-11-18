@@ -3176,3 +3176,375 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ForeignPointerThroughACapture) {
   EXPECT_TRUE(MEs[0].Captured[1]);
   EXPECT_NE(MEs[0].Other, ModRef::None) << Describe(MEs[0]);
 }
+
+// Integer data loaded from a global holds no address.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerDataIsNoAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xc1_g = 0;
+    struct me_xc1_s { long n; long* p; };
+    extern "C" void me_xc1_f(me_xc1_s* s) {
+      s->n = me_xc1_g;
+      *s->p = 1;
+    }
+  )",
+      {"me_xc1_f"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_NE(MEs[0].Other, ModRef::None);
+  // Precision: only a read of the global.
+  EXPECT_FALSE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+}
+
+// A callee stores a global address as an integer into *p.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressStoredAsAnInteger) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xia_g1 = 0, me_xia_g2 = 0;
+    __attribute__((noinline)) void me_xia_c(unsigned long* p) {
+      *p = (unsigned long)&me_xia_g1;
+    }
+    extern "C" void me_xia_const(long** p) {
+      me_xia_c((unsigned long*)p);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xia_s(unsigned long* p, int c) {
+      *p = (unsigned long)(c ? &me_xia_g1 : &me_xia_g2);
+    }
+    extern "C" void me_xia_select(long** p, int c) {
+      me_xia_s((unsigned long*)p, c);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xia_l(unsigned long* p, int n) {
+      long* q = &me_xia_g1;
+      for (int i = 0; i < n; ++i)
+        q = (i & 1) ? &me_xia_g2 : q;
+      *p = (unsigned long)q;
+    }
+    extern "C" void me_xia_loop(long** p, int n) {
+      me_xia_l((unsigned long*)p, n);
+      **p = 1;
+    }
+    union me_xia_u { long* p; unsigned long i; };
+    __attribute__((noinline)) void me_xia_pun(me_xia_u* u) {
+      u->i = (unsigned long)&me_xia_g1;
+    }
+    extern "C" void me_xia_union(me_xia_u* u) {
+      me_xia_pun(u);
+      *u->p = 1;
+    }
+  )",
+      {"me_xia_const", "me_xia_select", "me_xia_loop", "me_xia_union"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(Writes(ME.Other)) << Describe(ME);
+  }
+}
+
+// Addresses that integers carry through selects, loads and arithmetic.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressArithmeticInIntegers) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xim_g1 = 0, me_xim_g2 = 0;
+    inline long* me_xim_gp = &me_xim_g1;
+    __attribute__((noinline)) void me_xim_s(unsigned long* p, long* q, int c) {
+      *p = (unsigned long)(c ? &me_xim_g1 : q);
+    }
+    extern "C" void me_xim_mixed(long** p, long* q, int c) {
+      me_xim_s((unsigned long*)p, q, c);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xim_i(unsigned long* p, int c) {
+      unsigned long a = (unsigned long)&me_xim_g1;
+      unsigned long b = (unsigned long)&me_xim_g2;
+      *p = c ? a : b;
+    }
+    extern "C" void me_xim_ints(long** p, int c) {
+      me_xim_i((unsigned long*)p, c);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xim_l(unsigned long* p) {
+      *p = (unsigned long)me_xim_gp;
+    }
+    extern "C" void me_xim_load(long** p) {
+      me_xim_l((unsigned long*)p);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xim_o(unsigned long* p, int c) {
+      *p = (unsigned long)(c ? &me_xim_g1 : &me_xim_g2) + 8;
+    }
+    extern "C" void me_xim_offset(long** p, int c) {
+      me_xim_o((unsigned long*)p, c);
+      *(*p - 1) = 1;
+    }
+    extern "C" void me_xim_inline(long** p, int c) {
+      *(unsigned long*)p = (unsigned long)(c ? &me_xim_g1 : &me_xim_g2);
+      **p = 1;
+    }
+  )",
+      {"me_xim_mixed", "me_xim_ints", "me_xim_load", "me_xim_offset",
+       "me_xim_inline"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 5u);
+  for (size_t K = 0; K < MEs.size(); ++K) {
+    ASSERT_TRUE(MEs[K].Valid);
+    EXPECT_TRUE(Writes(MEs[K].Other)) << K << "\n" << Describe(MEs[K]);
+  }
+}
+
+// An integer argument of unknown source, copied as bytes into a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerArgumentCopiedAsBytes) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    __attribute__((noinline)) void me_xc2_install(int** dst,
+                                                  unsigned long bits) {
+      __builtin_memcpy(dst, &bits, 8);
+    }
+    extern "C" void me_xc2_c(int** dst, unsigned long bits) {
+      me_xc2_install(dst, bits);
+      **dst = 1;
+    }
+  )",
+      {"me_xc2_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+}
+
+// A pointer loaded from a global, stored as an integer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerFromAGlobalPointer) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xc3_g = 0;
+    inline long* me_xc3_gp = &me_xc3_g;
+    __attribute__((noinline)) void me_xc3_set(unsigned long* p) {
+      *p = (unsigned long)me_xc3_gp;
+    }
+    extern "C" void me_xc3_c() {
+      long* slot;
+      me_xc3_set((unsigned long*)&slot);
+      *slot = 1;
+    }
+  )",
+      {"me_xc3_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+}
+
+// A copy of an object that holds a pointer, done as an integer copy.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PointerCopiedAsAnInteger) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  ASSERT_EQ(Cpp::Declare("#include <vector>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xpc_g = 0;
+    struct me_xpc_in { long* p; };
+    struct me_xpc_box { me_xpc_in* in; };
+    __attribute__((noinline)) void me_xpc_use(const me_xpc_box* b) {
+      *b->in->p = 1;
+    }
+    __attribute__((noinline)) void me_xpc_usev(const std::vector<me_xpc_box>* v) {
+      *(*v)[0].in->p = 1;
+    }
+    extern "C" void me_xpc_copy() {
+      me_xpc_in i{&me_xpc_g};
+      me_xpc_box t{&i};
+      me_xpc_box* b = new me_xpc_box(t);
+      me_xpc_use(b);
+      delete b;
+    }
+    extern "C" void me_xpc_param(long* q) {
+      me_xpc_in i{q};
+      me_xpc_box t{&i};
+      me_xpc_box* b = new me_xpc_box(t);
+      me_xpc_use(b);
+      delete b;
+    }
+    extern "C" void me_xpc_vector() {
+      me_xpc_in i{&me_xpc_g};
+      std::vector<me_xpc_box> v;
+      v.push_back(me_xpc_box{&i});
+      me_xpc_usev(&v);
+    }
+    extern "C" void me_xpc_vparam(long* q) {
+      me_xpc_in i{q};
+      std::vector<me_xpc_box> v;
+      v.push_back(me_xpc_box{&i});
+      me_xpc_usev(&v);
+    }
+    extern "C" void me_xpc_direct(me_xpc_box* out, long* q) {
+      me_xpc_in* i = new me_xpc_in{q};
+      me_xpc_box t{i};
+      *out = t;
+      me_xpc_use(out);
+    }
+  )",
+      {"me_xpc_copy", "me_xpc_param", "me_xpc_vector", "me_xpc_vparam"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[1].ParamsDirect[0]) || Writes(MEs[1].Other))
+      << Describe(MEs[1]);
+  EXPECT_TRUE(Writes(MEs[2].Other)) << Describe(MEs[2]);
+  EXPECT_TRUE(Writes(MEs[3].ParamsDirect[0]) || Writes(MEs[3].Other))
+      << Describe(MEs[3]);
+}
+
+// Levels behind a smart pointer and a heap box.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SmartPointerLevels) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  ASSERT_EQ(Cpp::Declare("#include <memory>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xup_g = 0;
+    struct me_xup_in { long* p; };
+    struct me_xup_box { me_xup_in* in; };
+    __attribute__((noinline)) void me_xup_use(const std::unique_ptr<me_xup_box>* u) {
+      *(*u)->in->p = 1;
+    }
+    __attribute__((noinline)) void me_xup_raw(const me_xup_box* b) {
+      *b->in->p = 1;
+    }
+    struct me_xup_w {
+      me_xup_box* p;
+      ~me_xup_w() { delete p; }
+    };
+    __attribute__((noinline)) void me_xup_wuse(const me_xup_w* w) {
+      *w->p->in->p = 1;
+    }
+    extern "C" void me_xup_make() {
+      me_xup_in i{&me_xup_g};
+      auto u = std::make_unique<me_xup_box>(me_xup_box{&i});
+      me_xup_use(&u);
+    }
+    extern "C" void me_xup_newu() {
+      me_xup_in i{&me_xup_g};
+      std::unique_ptr<me_xup_box> u(new me_xup_box{&i});
+      me_xup_use(&u);
+    }
+    extern "C" void me_xup_get() {
+      me_xup_in i{&me_xup_g};
+      auto u = std::make_unique<me_xup_box>(me_xup_box{&i});
+      me_xup_raw(u.get());
+    }
+    extern "C" void me_xup_wrap() {
+      me_xup_in i{&me_xup_g};
+      me_xup_w w{new me_xup_box{&i}};
+      me_xup_wuse(&w);
+    }
+    extern "C" void me_xup_wrapnodtor() {
+      me_xup_in i{&me_xup_g};
+      me_xup_box* b = new me_xup_box{&i};
+      me_xup_box* const* pb = &b;
+      me_xup_wuse(reinterpret_cast<const me_xup_w*>(pb));
+      delete b;
+    }
+  )",
+      {"me_xup_make", "me_xup_newu", "me_xup_get", "me_xup_wrap",
+       "me_xup_wrapnodtor"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 5u);
+  for (size_t K = 0; K < MEs.size(); ++K) {
+    ASSERT_TRUE(MEs[K].Valid);
+    EXPECT_TRUE(Writes(MEs[K].Other)) << K << "\n" << Describe(MEs[K]);
+  }
+}
+
+// Lambdas, references, arrays, smart pointers and constructors as levels.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MixedLevelKinds) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  ASSERT_EQ(Cpp::Declare("#include <memory>\n#include <new>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xmk_g = 0;
+    struct me_xmk_in { long* p; };
+    struct me_xmk_box { me_xmk_in* in; };
+    template <class F> __attribute__((noinline)) void me_xmk_run(F& f) { f(); }
+    extern "C" void me_xmk_lambda() {
+      me_xmk_in i{&me_xmk_g};
+      me_xmk_box b{&i};
+      auto l = [&] { *b.in->p = 1; };
+      me_xmk_run(l);
+    }
+    struct me_xmk_ref { long& r; };
+    struct me_xmk_rbox { const me_xmk_ref* ref; };
+    __attribute__((noinline)) void me_xmk_rset(const me_xmk_rbox* b) {
+      b->ref->r = 1;
+    }
+    extern "C" void me_xmk_refm() {
+      me_xmk_ref r{me_xmk_g};
+      me_xmk_rbox b{&r};
+      me_xmk_rset(&b);
+    }
+    struct me_xmk_arr { long* a[4]; };
+    __attribute__((noinline)) void me_xmk_aset(me_xmk_arr* a, int k) {
+      a->a[k & 3] = &me_xmk_g;
+    }
+    extern "C" void me_xmk_array(me_xmk_arr* a, int k) {
+      me_xmk_aset(a, k);
+      *a->a[0] = 1;
+    }
+    __attribute__((noinline)) void me_xmk_use(const std::unique_ptr<me_xmk_box>* u) {
+      *(*u)->in->p = 1;
+    }
+    extern "C" void me_xmk_uptr() {
+      me_xmk_in i{&me_xmk_g};
+      auto u = std::make_unique<me_xmk_box>(me_xmk_box{&i});
+      me_xmk_use(&u);
+    }
+    extern "C" void me_xmk_heap() {
+      auto* i = new me_xmk_in{&me_xmk_g};
+      auto u = std::make_unique<me_xmk_box>(me_xmk_box{i});
+      me_xmk_use(&u);
+      delete i;
+    }
+    struct me_xmk_s {
+      long* p;
+      __attribute__((noinline)) me_xmk_s() : p(&me_xmk_g) {}
+    };
+    extern "C" void me_xmk_ctor(void* o) {
+      me_xmk_s* s = ::new (o) me_xmk_s();
+      *s->p = 1;
+    }
+  )",
+      {"me_xmk_lambda", "me_xmk_refm", "me_xmk_array", "me_xmk_uptr",
+       "me_xmk_heap", "me_xmk_ctor"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 6u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(Writes(ME.Other)) << Describe(ME);
+  }
+}

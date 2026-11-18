@@ -204,6 +204,24 @@ void LocalizeTerminate(llvm::Module& M) {
   F->setDoesNotReturn();
 }
 
+// Whether the type-based alias tag of \p I names an integer or floating
+// type: the access reads or writes an object of that type, whose bytes are
+// data under the C++ object model. Character and enumeration types do not
+// count.
+bool DataAccess(const llvm::Instruction& I) {
+  const auto* Tag = I.getMetadata(llvm::LLVMContext::MD_tbaa);
+  if (!Tag || Tag->getNumOperands() < 3)
+    return false;
+  const auto* Type = llvm::dyn_cast<llvm::MDNode>(Tag->getOperand(1));
+  if (!Type || Type->getNumOperands() < 1)
+    return false;
+  const auto* Name = llvm::dyn_cast<llvm::MDString>(Type->getOperand(0));
+  return Name &&
+         llvm::is_contained({"bool", "short", "int", "long", "long long",
+                             "__int128", "float", "double", "long double"},
+                            Name->getString());
+}
+
 //===----------------------------------------------------------------------===//
 // Reachable-memory attribution
 //
@@ -423,7 +441,7 @@ llvm::StringMap<FunctionSummary>& Summaries() {
 constexpr llvm::StringLiteral SummaryHeader =
     "# cppinterop-memory-effects v1 llvm ";
 
-// The metadata of a load that reads an integer object (MarkIntegerLoads).
+// The metadata of a load or a store of an integer object (MarkIntegerLoads).
 constexpr llvm::StringLiteral IntegerLoadKind = "cppinterop.integer";
 // The metadata of a copy of characters (MarkCharacterCopies).
 constexpr llvm::StringLiteral CharacterCopyKind = "cppinterop.characters";
@@ -788,6 +806,9 @@ private:
           O.join(constantOrigin(Op));
         return O;
       }
+      // An integer of pointer size may hold an address.
+      if (wide(V->getType()))
+        return initializerOrigin(llvm::cast<llvm::Constant>(V));
       if (!mayHoldPointers(V->getType()))
         return O;
       O.Unknown = true;
@@ -1012,11 +1033,65 @@ private:
     Origin O(N);
     if (const auto* L = llvm::dyn_cast<llvm::LoadInst>(&I))
       return loadedFrom(originOf(L->getPointerOperand()));
-    if (llvm::isa<llvm::PHINode>(I) || llvm::isa<llvm::SelectInst>(I) ||
-        llvm::isa<llvm::FreezeInst>(I))
+    // The address itself, as the taint keeps it.
+    if (llvm::isa<llvm::PtrToIntInst>(I))
+      return originOf(I.getOperand(0));
+    if (I.getOpcode() == llvm::Instruction::Sub && intOrigin(I.getOperand(0)) &&
+        intOrigin(I.getOperand(1)))
+      return O; // the difference of two addresses
+    if (arithmetic(I))
       for (const llvm::Value* Op : I.operands())
         if (wide(Op->getType()))
           O.join(originOf(Op));
+    return O;
+  }
+
+  // Whether the integer \p V may carry an address that the origins know.
+  bool intOrigin(const llvm::Value* V) const {
+    const Origin O = originOf(V);
+    return O.anyParam() || O.unowned() || !O.Objs.empty() ||
+           !O.Consts.empty() || taintOf(V).any() || !objTaintOf(V).empty();
+  }
+
+  // Where the pointers that \p V may carry into a store \p S may point. An
+  // integer that code loads, or that \p S stores, as an object of integer
+  // type holds no address. Any other integer of unknown source may hold one.
+  Origin foreignSource(const llvm::Value* V, const llvm::Instruction& S) const {
+    llvm::SmallPtrSet<const llvm::Value*, 8> Seen;
+    return foreignSource(V, DataAccess(S) || S.getMetadata(IntegerLoadKind),
+                         Seen);
+  }
+
+  Origin foreignSource(const llvm::Value* V, bool DataStore,
+                       llvm::SmallPtrSetImpl<const llvm::Value*>& Seen) const {
+    if (!wide(V->getType()))
+      return carried(V);
+    Origin O(N);
+    if (!Seen.insert(V).second)
+      return O;
+    if (const auto* C = llvm::dyn_cast<llvm::Constant>(V))
+      return initializerOrigin(C);
+    const auto* I = llvm::dyn_cast<llvm::Instruction>(V);
+    if (const auto* L = llvm::dyn_cast_or_null<llvm::LoadInst>(I)) {
+      if (L->getMetadata(IntegerLoadKind) || L->getMetadata(PointerFreeKind) ||
+          DataAccess(*L))
+        return O;
+      return loadedFrom(originOf(L->getPointerOperand()));
+    }
+    if (I && (llvm::isa<llvm::PtrToIntInst>(I) ||
+              (I->getOpcode() == llvm::Instruction::Sub &&
+               intOrigin(I->getOperand(0)) && intOrigin(I->getOperand(1)))))
+      return originOf(V);
+    if (I && arithmetic(*I)) {
+      for (const llvm::Value* Op : I->operands())
+        if (wide(Op->getType()))
+          O.join(foreignSource(Op, DataStore, Seen));
+      return O;
+    }
+    // An argument, a call result or another value: the taint and the
+    // origins keep what they know; the rest is unknown.
+    O = carried(V);
+    O.Unknown |= !DataStore;
     return O;
   }
 
@@ -1576,24 +1651,25 @@ private:
           const Origin Src = carried(SI->getValueOperand());
           const Origin Dst = originOf(SI->getPointerOperand());
           Changed |= recordCopy(Src, Dst, &Ptr);
-          Changed |= storeForeign(Src, Dst);
+          Changed |=
+              storeForeign(foreignSource(SI->getValueOperand(), *SI), Dst);
           Changed |= otherWrite(Dst);
         } else if (const auto* MT = llvm::dyn_cast<llvm::MemTransferInst>(&I)) {
           const Origin Src = originOf(MT->getRawSource());
           const Origin Dst = originOf(MT->getRawDest());
           const llvm::SmallBitVector Ptr = pointersLoaded(Src, readOf(*MT));
           Changed |= recordCopy(loadedFrom(Src), Dst, &Ptr);
-          if (!MT->getMetadata(CharacterCopyKind))
+          if (readOf(*MT) == ReadAs::Bytes)
             Changed |= storeForeign(loadedFrom(Src), Dst);
           Changed |= otherWrite(Dst);
         } else if (const auto* RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I)) {
-          Changed |= storeForeign(carried(RMW->getValOperand()),
+          Changed |= storeForeign(foreignSource(RMW->getValOperand(), I),
                                   originOf(RMW->getPointerOperand()));
           Changed |= otherWrite(originOf(RMW->getPointerOperand()));
           Changed |= exposeOperands(I);
         } else if (const auto* CX =
                        llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
-          Changed |= storeForeign(carried(CX->getNewValOperand()),
+          Changed |= storeForeign(foreignSource(CX->getNewValOperand(), I),
                                   originOf(CX->getPointerOperand()));
           Changed |= otherWrite(originOf(CX->getPointerOperand()));
           Changed |= exposeOperands(I);
@@ -1944,7 +2020,9 @@ private:
         O.join(storedOrigin(Op, Seen));
       return O;
     case llvm::Instruction::PtrToInt:
-      return O; // the taint
+      // The taint, and an address of other memory.
+      O.join(originOf(I->getOperand(0)));
+      return O;
     default:
       if (llvm::isa<llvm::BinaryOperator>(I)) {
         for (const llvm::Value* Op : I->operands())
@@ -2363,19 +2441,21 @@ Reach ReachAnalysis::analyze(const llvm::Function& F) {
   return FunctionReach(*this, F).run();
 }
 
-// Before optimization, mark a wide integer load from storage that the source
-// declares with that type (a local, a field or element, a global). Condition
-// 6 takes its value as an integer. Optimization drops unknown metadata when
-// it merges or rewrites a load, so the loads that it makes from a memcpy
-// stay unmarked.
+// Before optimization, mark an integer load or store of storage that the
+// source declares with that type (a local, a field or element, a global).
+// Condition 6 takes its value as an integer. Optimization drops unknown
+// metadata when it merges or rewrites an access, so the accesses that it
+// makes from a memcpy stay unmarked.
 void MarkIntegerLoads(llvm::Function& F) {
   llvm::LLVMContext& C = F.getContext();
   const unsigned Kind = C.getMDKindID(IntegerLoadKind);
   for (llvm::Instruction& I : llvm::instructions(F)) {
-    auto* L = llvm::dyn_cast<llvm::LoadInst>(&I);
-    if (!L || !L->getType()->isIntegerTy())
+    if (!llvm::isa<llvm::LoadInst>(I) && !llvm::isa<llvm::StoreInst>(I))
       continue;
-    const llvm::Value* P = L->getPointerOperand();
+    llvm::Type* T = llvm::getLoadStoreType(&I);
+    if (!T->isIntegerTy())
+      continue;
+    const llvm::Value* P = llvm::getLoadStorePointerOperand(&I);
     llvm::Type* Declared = nullptr;
     if (const auto* A = llvm::dyn_cast<llvm::AllocaInst>(P))
       Declared = A->getAllocatedType();
@@ -2385,8 +2465,8 @@ void MarkIntegerLoads(llvm::Function& F) {
       // Into an aggregate: a pointer index alone shows only a cast's type.
       if (G->getNumIndices() > 1)
         Declared = G->getResultElementType();
-    if (Declared == L->getType())
-      L->setMetadata(Kind, llvm::MDNode::get(C, {}));
+    if (Declared == T)
+      I.setMetadata(Kind, llvm::MDNode::get(C, {}));
   }
 }
 
