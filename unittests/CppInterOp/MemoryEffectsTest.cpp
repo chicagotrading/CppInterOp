@@ -3548,3 +3548,149 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MixedLevelKinds) {
     EXPECT_TRUE(Writes(ME.Other)) << Describe(ME);
   }
 }
+
+// Integer data that holds an address, copied into a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerDataCarriesAnAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_ydl_g = 0;
+    struct me_ydl_f { uintptr_t a; };
+    inline uintptr_t me_ydl_ga = (uintptr_t)&me_ydl_g;
+    inline const uintptr_t me_ydl_tbl[2] = {(uintptr_t)&me_ydl_g,
+                                            (uintptr_t)&me_ydl_g};
+    __attribute__((noinline)) void me_ydl_fromg(me_ydl_f* f) {
+      f->a = me_ydl_ga;
+    }
+    __attribute__((noinline)) void me_ydl_fromt(me_ydl_f* f, int k) {
+      f->a = me_ydl_tbl[k & 1];
+    }
+    __attribute__((noinline)) uintptr_t me_ydl_rd(const me_ydl_f* s) {
+      return s->a;
+    }
+    __attribute__((noinline)) void me_ydl_st(me_ydl_f* f, const me_ydl_f* s) {
+      f->a = me_ydl_rd(s);
+    }
+    __attribute__((noinline)) void me_ydl_pokem(const me_ydl_f* f) {
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    extern "C" void me_ydl_global(me_ydl_f* f) {
+      me_ydl_fromg(f);
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    extern "C" void me_ydl_table(me_ydl_f* f, int k) {
+      me_ydl_fromt(f, k);
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    extern "C" void me_ydl_ret(me_ydl_f* f) {
+      me_ydl_f s{(uintptr_t)&me_ydl_g};
+      f->a = me_ydl_rd(&s);
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    extern "C" void me_ydl_retcallee(me_ydl_f* f) {
+      me_ydl_f s{(uintptr_t)&me_ydl_g};
+      me_ydl_st(f, &s);
+      me_ydl_pokem(f);
+    }
+    extern "C" void me_ydl_globallocal() {
+      me_ydl_f f{0};
+      me_ydl_fromg(&f);
+      me_ydl_pokem(&f);
+    }
+    extern "C" void me_ydl_inline(me_ydl_f* f) {
+      f->a = me_ydl_ga;
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+  )",
+      {"me_ydl_global", "me_ydl_table", "me_ydl_ret", "me_ydl_retcallee",
+       "me_ydl_globallocal", "me_ydl_inline"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 6u);
+  for (size_t K = 0; K < MEs.size(); ++K) {
+    ASSERT_TRUE(MEs[K].Valid);
+    EXPECT_TRUE(Writes(MEs[K].Other)) << K << "\n" << Describe(MEs[K]);
+  }
+}
+
+// An address that an integer member holds, copied with the struct and then
+// copied back into a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressInACopiedIntegerMember) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_ym_g = 0;
+    struct me_ym_s { uintptr_t a; long n; };
+    __attribute__((noinline)) void me_ym_copy(me_ym_s* d, const me_ym_s* s) {
+      *d = *s;
+    }
+    extern "C" void me_ym_c(me_ym_s* d) {
+      me_ym_s s{(uintptr_t)&me_ym_g, 0};
+      me_ym_copy(d, &s);
+      long* q;
+      std::memcpy(&q, &d->a, sizeof q);
+      *q = 1;
+    }
+  )",
+      {"me_ym_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+}
+
+// Without optimization: an integer argument stored into an integer member,
+// then copied back into a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressInAnIntegerMemberAtO0) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_yo_g = 0;
+    inline uintptr_t me_yo_ga = (uintptr_t)&me_yo_g;
+    struct me_yo_f { uintptr_t a; long* p; };
+    void me_yo_set(me_yo_f* f, uintptr_t v) { f->a = v; }
+    extern "C" void me_yo_c(me_yo_f* f) {
+      me_yo_set(f, me_yo_ga);
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    struct me_yo_s { uintptr_t a; long n; };
+    void me_yo_copy(me_yo_s* d, const me_yo_s* s) { *d = *s; }
+    extern "C" void me_yo_struct(me_yo_s* d) {
+      me_yo_s s{(uintptr_t)&me_yo_g, 0};
+      me_yo_copy(d, &s);
+      long* q;
+      std::memcpy(&q, &d->a, sizeof q);
+      *q = 1;
+    }
+    // Precision: integer data next to a pointer member.
+    extern "C" void me_yo_data(me_yo_f* f, uintptr_t v) {
+      f->a = v;
+      *f->p = 1;
+    }
+  )",
+      {"me_yo_c", "me_yo_struct", "me_yo_data"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[1].Other)) << Describe(MEs[1]);
+  EXPECT_EQ(MEs[2].Other, ModRef::None) << Describe(MEs[2]);
+}

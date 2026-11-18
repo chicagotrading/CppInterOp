@@ -26,11 +26,13 @@
 #include "llvm/Demangle/MicrosoftDemangleNodes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -310,6 +312,11 @@ struct ParamReach {
   // The memory that the parameter reaches may receive a pointer to memory
   // that no parameter or fresh memory accounts for, such as a global.
   bool StoresForeign = false;
+  // It may receive integer data that may hold such an address.
+  bool StoresForeignData = false;
+  // The callee may read integer data of the memory that the parameter
+  // reaches as a pointer, or copy it into other memory.
+  bool ReadsData = false;
 };
 
 // The reachable-memory summary of a function.
@@ -328,7 +335,7 @@ struct Reach {
     R.Other = ModRefInfo::ModRef;
     for (ParamReach& P : R.Params) {
       P = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true, true};
-      P.StoresForeign = true;
+      P.StoresForeign = P.StoresForeignData = P.ReadsData = true;
     }
     R.RetUnknown = true;
     return R;
@@ -357,6 +364,8 @@ struct Reach {
       P.StoresOwn &= Q.StoresOwn;
       P.StoresOwnDeep &= Q.StoresOwnDeep;
       P.StoresForeign |= Q.StoresForeign;
+      P.StoresForeignData |= Q.StoresForeignData;
+      P.ReadsData |= Q.ReadsData;
     }
     RetDirect |= O.RetDirect;
     RetLoaded |= O.RetLoaded;
@@ -375,10 +384,10 @@ struct Reach {
       const ParamReach& Q = B.Params[I];
       if (std::tie(P.Direct, P.Reachable, P.Captured, P.AddressCaptured,
                    P.PointerCaptured, P.StoresOwn, P.StoresOwnDeep,
-                   P.StoresForeign) !=
+                   P.StoresForeign, P.StoresForeignData, P.ReadsData) !=
           std::tie(Q.Direct, Q.Reachable, Q.Captured, Q.AddressCaptured,
                    Q.PointerCaptured, Q.StoresOwn, Q.StoresOwnDeep,
-                   Q.StoresForeign))
+                   Q.StoresForeign, Q.StoresForeignData, Q.ReadsData))
         return false;
     }
     return true;
@@ -450,6 +459,28 @@ constexpr llvm::StringLiteral CharacterCopyKind = "cppinterop.characters";
 constexpr llvm::StringLiteral PointerFreeKind = "cppinterop.pointer-free";
 // The attribute of a call that TrustOpaqueCalls bounds by trust.
 constexpr llvm::StringLiteral TrustedCallAttr = "cppinterop-trusted-call";
+
+// Whether load \p I reads an object of pointer type: its alias tag, from
+// the frontend or from MarkIntegerLoads, names a pointer type. Under the C++
+// object model such a read does not see the bytes of an integer object.
+bool PointerObjectAccess(const llvm::Instruction& I) {
+  if (!I.getType()->isPointerTy())
+    return false;
+  const auto* Tag = I.getMetadata(llvm::LLVMContext::MD_tbaa);
+  if (!Tag || Tag->getNumOperands() < 3)
+    return false;
+  const auto* Type = llvm::dyn_cast<llvm::MDNode>(Tag->getOperand(1));
+  if (!Type || Type->getNumOperands() < 1)
+    return false;
+  const auto* Name = llvm::dyn_cast<llvm::MDString>(Type->getOperand(0));
+  if (!Name)
+    return false;
+  llvm::StringRef S = Name->getString();
+  // "any pointer", "vtable pointer", or "p<depth> <pointee>".
+  return S == "any pointer" || S == "vtable pointer" ||
+         (S.size() > 2 && S[0] == 'p' && llvm::isDigit(S[1]) &&
+          S.drop_front(1).ltrim("0123456789").starts_with(" "));
+}
 
 // The table spells an opaque call as the mangled name of a declaration or as
 // one of these; a leading '!' marks one that no signature bounds.
@@ -651,7 +682,8 @@ private:
     for (unsigned K = R.Params.size(); K < N; ++K) {
       Out.Params[K] = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true,
                        true};
-      Out.Params[K].StoresForeign = true;
+      Out.Params[K].StoresForeign = Out.Params[K].StoresForeignData =
+          Out.Params[K].ReadsData = true;
     }
     return Out;
   }
@@ -686,7 +718,14 @@ private:
       else if (CB.paramHasAttr(K, llvm::Attribute::WriteOnly))
         MR &= ModRefInfo::Mod;
       R.Params[K].Direct = MR;
-      R.Params[K].StoresForeign = llvm::isModSet(MR);
+      R.Params[K].StoresForeign = R.Params[K].StoresForeignData =
+          llvm::isModSet(MR);
+      // A trusted call accesses only what pointers in its arguments reach;
+      // freeing memory reads none of it.
+      const llvm::Function* Callee = CB.getCalledFunction();
+      R.Params[K].ReadsData = MR != ModRefInfo::NoModRef &&
+                              !CB.hasFnAttr(TrustedCallAttr) &&
+                              !(Callee && IsPointerSink(Callee->getName()));
       llvm::CaptureInfo CI = CB.getCaptureInfo(K);
       R.Params[K].Captured = R.Params[K].AddressCaptured =
           R.Params[K].PointerCaptured =
@@ -718,8 +757,8 @@ private:
 class FunctionReach {
 public:
   FunctionReach(ReachAnalysis& RA, const llvm::Function& F)
-      : RA(RA), F(F), N(F.arg_size()), R(N), ForeignIn(N), ForeignOld(N),
-        ForeignNew(N) {}
+      : RA(RA), F(F), N(F.arg_size()), R(N), ForeignIn(N), ForeignData(N),
+        ForeignOld(N), ForeignNew(N) {}
 
   Reach run() {
     // A load from a fresh allocation depends on the stores into it.
@@ -770,9 +809,13 @@ private:
   // Parameters whose memory may receive a pointer to memory that no
   // parameter or known object accounts for: a load from it is Unknown.
   llvm::SmallBitVector ForeignIn;
+  // Parameters whose memory may receive integer data that may hold such an
+  // address: only a load of a pointer object ignores it.
+  llvm::SmallBitVector ForeignData;
   // Objects that may hold such a pointer, and the fresh memory of calls
   // that store it into an argument (condition 6).
-  llvm::SmallPtrSet<const llvm::Value*, 8> ObjForeign, HeldFresh;
+  llvm::SmallPtrSet<const llvm::Value*, 8> ObjForeign, ObjForeignData,
+      HeldFresh;
   // Whether the code may write memory that the analysis does not attribute,
   // and so may write an escaped object.
   bool OtherWrites = false;
@@ -959,7 +1002,9 @@ private:
   // A pointer loaded from memory of origin \p O. A parameter's memory
   // yields its reachable memory; an object yields what is stored into it
   // when that is known, and is Unknown otherwise.
-  Origin loadedFrom(const Origin& O) const {
+  // With \p PointerObject, the load reads an object of pointer type, which
+  // integer data cannot fill.
+  Origin loadedFrom(const Origin& O, bool PointerObject = false) const {
     Origin R(N);
     R.Loaded = O.params();
     R.Unknown = O.unowned();
@@ -970,7 +1015,7 @@ private:
       Owner W = Owners.lookup(A);
       if (W.K == Owner::Param)
         Mem.set(W.P);
-      if (!knownContent(A)) {
+      if (!knownContent(A) || (!PointerObject && ObjForeignData.count(A))) {
         R.Unknown = true;
         continue;
       }
@@ -992,7 +1037,8 @@ private:
         Held.Loaded.set(W.P);
       R.join(Held);
     }
-    if (Mem.anyCommon(ForeignIn))
+    if (Mem.anyCommon(ForeignIn) ||
+        (!PointerObject && Mem.anyCommon(ForeignData)))
       R.Unknown = true;
     return R;
   }
@@ -1014,8 +1060,10 @@ private:
         // argument's memory, as for a null argument.
         if (!Arg.anyParam() && Arg.Objs.empty())
           O.Unknown = true;
-        // The callee may load the result through any number of levels.
-        O.join(reachable(loadedFrom(Arg)));
+        // The callee may load the result through any number of levels, as
+        // pointer objects unless it may read integer data as a pointer.
+        const bool PO = !S.Params[K].ReadsData;
+        O.join(reachable(loadedFrom(Arg, PO), nullptr, PO));
         // The result may be the object itself.
         Origin Self(N);
         Self.Objs = Arg.Objs;
@@ -1031,8 +1079,10 @@ private:
   // taint).
   Origin transferInt(const llvm::Instruction& I) {
     Origin O(N);
+    // Integer data that may hold an address stays data (foreignSource).
     if (const auto* L = llvm::dyn_cast<llvm::LoadInst>(&I))
-      return loadedFrom(originOf(L->getPointerOperand()));
+      return loadedFrom(originOf(L->getPointerOperand()),
+                        /*PointerObject=*/true);
     // The address itself, as the taint keeps it.
     if (llvm::isa<llvm::PtrToIntInst>(I))
       return originOf(I.getOperand(0));
@@ -1056,13 +1106,20 @@ private:
   // Where the pointers that \p V may carry into a store \p S may point. An
   // integer that code loads, or that \p S stores, as an object of integer
   // type holds no address. Any other integer of unknown source may hold one.
-  Origin foreignSource(const llvm::Value* V, const llvm::Instruction& S) const {
+  // \p Data tells whether some of it is integer data of an integer object,
+  // which may hold such an address too.
+  // \p From gets the parameters whose integer data \p V may copy.
+  Origin foreignSource(const llvm::Value* V, const llvm::Instruction& S,
+                       bool& Data, llvm::SmallBitVector* From = nullptr) const {
     llvm::SmallPtrSet<const llvm::Value*, 8> Seen;
+    Data = false;
+    llvm::SmallBitVector Unused(N);
     return foreignSource(V, DataAccess(S) || S.getMetadata(IntegerLoadKind),
-                         Seen);
+                         Data, From ? *From : Unused, Seen);
   }
 
-  Origin foreignSource(const llvm::Value* V, bool DataStore,
+  Origin foreignSource(const llvm::Value* V, bool DataStore, bool& Data,
+                       llvm::SmallBitVector& From,
                        llvm::SmallPtrSetImpl<const llvm::Value*>& Seen) const {
     if (!wide(V->getType()))
       return carried(V);
@@ -1073,10 +1130,15 @@ private:
       return initializerOrigin(C);
     const auto* I = llvm::dyn_cast<llvm::Instruction>(V);
     if (const auto* L = llvm::dyn_cast_or_null<llvm::LoadInst>(I)) {
-      if (L->getMetadata(IntegerLoadKind) || L->getMetadata(PointerFreeKind) ||
-          DataAccess(*L))
-        return O;
-      return loadedFrom(originOf(L->getPointerOperand()));
+      const Origin Src = originOf(L->getPointerOperand());
+      const Origin Bits = loadedFrom(Src, /*PointerObject=*/true);
+      Data |= dataIn(Src);
+      if (!(L->getMetadata(IntegerLoadKind) ||
+            L->getMetadata(PointerFreeKind) || DataAccess(*L)))
+        return Bits;
+      Data |= leadsForeign(Bits) || leadsData(Bits);
+      From |= heldBy(Src);
+      return O;
     }
     if (I && (llvm::isa<llvm::PtrToIntInst>(I) ||
               (I->getOpcode() == llvm::Instruction::Sub &&
@@ -1085,13 +1147,14 @@ private:
     if (I && arithmetic(*I)) {
       for (const llvm::Value* Op : I->operands())
         if (wide(Op->getType()))
-          O.join(foreignSource(Op, DataStore, Seen));
+          O.join(foreignSource(Op, DataStore, Data, From, Seen));
       return O;
     }
     // An argument, a call result or another value: the taint and the
     // origins keep what they know; the rest is unknown.
     O = carried(V);
     O.Unknown |= !DataStore;
+    Data |= DataStore;
     return O;
   }
 
@@ -1118,7 +1181,7 @@ private:
       O.join(originOf(I.getOperand(2)));
       return O;
     case llvm::Instruction::Load:
-      return loadedFrom(originOf(I.getOperand(0)));
+      return loadedFrom(originOf(I.getOperand(0)), PointerObjectAccess(I));
     case llvm::Instruction::ExtractValue:
       return originOf(I.getOperand(0));
     case llvm::Instruction::InsertValue:
@@ -1259,9 +1322,13 @@ private:
       // The call's own fresh memory holds what the call stores.
       if (llvm::isModSet(S.Params[K].Reachable)) {
         O = holdings(O, &CB);
+        // The callee may read integer data as a pointer.
+        const bool RD = S.Params[K].ReadsData;
         if (O.params().anyCommon(ForeignIn) ||
+            (RD && O.params().anyCommon(ForeignData)) ||
             llvm::any_of(O.Objs, [&](const llvm::Value* Ob) {
-              return HoldsUnknown.count(Ob) || objForeign(Ob);
+              return HoldsUnknown.count(Ob) || objForeign(Ob) ||
+                     (RD && ObjForeignData.count(Ob));
             }))
           return false;
       }
@@ -1300,12 +1367,19 @@ private:
 
   // Pointers of origin \p Src, stored into memory of origin \p Dst, may
   // lead to memory that no parameter or known object accounts for.
-  bool storeForeign(const Origin& Src, const Origin& Dst) {
-    if (!leadsForeign(Src))
+  // With \p Data, integer data of \p Src may hold such an address.
+  bool storeForeign(const Origin& Src, const Origin& Dst, bool Data = false) {
+    if (leadsForeign(Src)) {
+      bool Changed = markForeign(heldBy(Dst));
+      for (const llvm::Value* A : Dst.Objs)
+        Changed |= ObjForeign.insert(A).second;
+      return Changed;
+    }
+    if (!Data && !leadsData(Src))
       return false;
-    bool Changed = markForeign(heldBy(Dst));
+    bool Changed = markData(heldBy(Dst));
     for (const llvm::Value* A : Dst.Objs)
-      Changed |= ObjForeign.insert(A).second;
+      Changed |= ObjForeignData.insert(A).second;
     return Changed;
   }
 
@@ -1361,6 +1435,32 @@ private:
            H.params().anyCommon(ForeignIn) ||
            llvm::any_of(H.Objs,
                         [&](const llvm::Value* A) { return objForeign(A); });
+  }
+
+  // Whether pointers of origin \p O may lead to integer data that may hold
+  // such an address.
+  bool leadsData(const Origin& O) const {
+    const Origin H = holdings(O);
+    return H.params().anyCommon(ForeignData) ||
+           llvm::any_of(H.Objs, [&](const llvm::Value* A) {
+             return ObjForeignData.count(A);
+           });
+  }
+
+  // Whether memory of origin \p O may hold integer data that may hold such
+  // an address.
+  bool dataIn(const Origin& O) const {
+    return heldBy(O).anyCommon(ForeignData) ||
+           llvm::any_of(O.Objs, [&](const llvm::Value* A) {
+             return ObjForeignData.count(A) != 0;
+           });
+  }
+
+  bool markData(const llvm::SmallBitVector& P) {
+    if (!P.test(ForeignData))
+      return false;
+    ForeignData |= P;
+    return true;
   }
 
   bool otherWrite(const Origin& Dst) {
@@ -1651,26 +1751,34 @@ private:
           const Origin Src = carried(SI->getValueOperand());
           const Origin Dst = originOf(SI->getPointerOperand());
           Changed |= recordCopy(Src, Dst, &Ptr);
-          Changed |=
-              storeForeign(foreignSource(SI->getValueOperand(), *SI), Dst);
+          bool Data;
+          const Origin FS = foreignSource(SI->getValueOperand(), *SI, Data);
+          Changed |= storeForeign(FS, Dst, Data);
           Changed |= otherWrite(Dst);
         } else if (const auto* MT = llvm::dyn_cast<llvm::MemTransferInst>(&I)) {
           const Origin Src = originOf(MT->getRawSource());
           const Origin Dst = originOf(MT->getRawDest());
           const llvm::SmallBitVector Ptr = pointersLoaded(Src, readOf(*MT));
           Changed |= recordCopy(loadedFrom(Src), Dst, &Ptr);
+          const Origin Bits = loadedFrom(Src);
+          // Data and characters may hold an address as data.
           if (readOf(*MT) == ReadAs::Bytes)
-            Changed |= storeForeign(loadedFrom(Src), Dst);
+            Changed |= storeForeign(Bits, Dst);
+          else
+            Changed |= storeForeign(Origin(N), Dst,
+                                    leadsForeign(Bits) || leadsData(Bits));
           Changed |= otherWrite(Dst);
         } else if (const auto* RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I)) {
-          Changed |= storeForeign(foreignSource(RMW->getValOperand(), I),
-                                  originOf(RMW->getPointerOperand()));
+          bool Data;
+          const Origin FS = foreignSource(RMW->getValOperand(), I, Data);
+          Changed |= storeForeign(FS, originOf(RMW->getPointerOperand()), Data);
           Changed |= otherWrite(originOf(RMW->getPointerOperand()));
           Changed |= exposeOperands(I);
         } else if (const auto* CX =
                        llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
-          Changed |= storeForeign(foreignSource(CX->getNewValOperand(), I),
-                                  originOf(CX->getPointerOperand()));
+          bool Data;
+          const Origin FS = foreignSource(CX->getNewValOperand(), I, Data);
+          Changed |= storeForeign(FS, originOf(CX->getPointerOperand()), Data);
           Changed |= otherWrite(originOf(CX->getPointerOperand()));
           Changed |= exposeOperands(I);
         } else if (const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
@@ -1691,18 +1799,21 @@ private:
       for (const auto& [A, By] : HeldBy) {
         if (objForeign(A))
           Changed |= markForeign(By);
+        else if (ObjForeignData.count(A))
+          Changed |= markData(By);
       }
     }
     return Any;
   }
 
   // The memory reachable from \p O, without what \p Skip holds.
-  Origin reachable(const Origin& O, const llvm::Value* Skip = nullptr) const {
+  Origin reachable(const Origin& O, const llvm::Value* Skip = nullptr,
+                   bool PointerObject = false) const {
     Origin R = O;
     for (bool More = true; More;) {
       Origin Shallow = R;
       llvm::erase(Shallow.Objs, Skip);
-      More = R.join(loadedFrom(Shallow));
+      More = R.join(loadedFrom(Shallow, PointerObject));
     }
     return R;
   }
@@ -1729,15 +1840,41 @@ private:
   }
 
   // Whether the callee may store into the memory of argument \p K another
-  // argument that leads to memory that no parameter accounts for.
-  bool keepsForeign(const llvm::CallBase& CB, const Reach& S, unsigned K) {
+  // argument that leads to memory that no parameter accounts for; with
+  // \p Data, to integer data that may hold such an address.
+  bool keepsForeign(const llvm::CallBase& CB, const Reach& S, unsigned K,
+                    bool Data = false) {
     for (unsigned J = 0; J < CB.arg_size(); ++J) {
       if (J == K || !S.Params[J].PointerCaptured)
         continue;
-      if (leadsForeign(carried(CB.getArgOperand(J))))
+      const Origin C = carried(CB.getArgOperand(J));
+      if (Data ? leadsData(C) : leadsForeign(C))
         return true;
     }
     return false;
+  }
+
+  // Whether the callee may copy integer data that may hold an address from
+  // one argument's memory into another's.
+  bool readsData(const llvm::CallBase& CB, const Reach& S) const {
+    for (unsigned J = 0; J < CB.arg_size(); ++J) {
+      const llvm::Value* A = CB.getArgOperand(J);
+      if (A->getType()->isPointerTy() && S.Params[J].ReadsData &&
+          leadsData(originOf(A)))
+        return true;
+    }
+    return false;
+  }
+
+  // The parameters whose memory a callee or this code may read as integer
+  // data, when \p From is copied as data into \p Dst. A copy within one
+  // parameter's memory moves nothing out of it.
+  void noteDataCopy(const llvm::SmallBitVector& From, const Origin& Dst) {
+    const llvm::SmallBitVector P = Dst.params();
+    const bool Own = Dst.Objs.empty() && !Dst.unowned() && Dst.Consts.empty();
+    for (unsigned K : From.set_bits())
+      if (!Own || P.count() > 1 || (P.any() && !P.test(K)))
+        R.Params[K].ReadsData = true;
   }
 
   bool ownersAtCall(const llvm::CallBase& CB) {
@@ -1791,6 +1928,14 @@ private:
         for (const llvm::Value* Ob : D.Objs)
           Changed |= ObjForeign.insert(Ob).second;
         Changed |= ObjForeign.insert(&CB).second;
+      } else if (!Sink && (S.Params[K].StoresForeignData ||
+                           (Writes && keepsForeign(CB, S, K, true)) ||
+                           (Writes && readsData(CB, S)))) {
+        const Origin D = holdings(O);
+        Changed |= markData(heldBy(D));
+        for (const llvm::Value* Ob : D.Objs)
+          Changed |= ObjForeignData.insert(Ob).second;
+        Changed |= ObjForeignData.insert(&CB).second;
       }
       // Nothing foreign comes in, and nothing of it leaves (condition 6).
       if (!Own)
@@ -1851,7 +1996,9 @@ private:
     return Changed;
   }
 
-  void access(ModRefInfo MR, const Origin& O, bool Reachable) {
+  // With \p ReadsData, the callee may read integer data as a pointer.
+  void access(ModRefInfo MR, const Origin& O, bool Reachable,
+              bool ReadsData = true) {
     if (MR == ModRefInfo::NoModRef)
       return;
     if (!Reachable) {
@@ -1882,9 +2029,10 @@ private:
     for (unsigned I : H.Loaded.set_bits())
       R.Params[I].Reachable |= MR;
     Mem |= H.params();
-    if (Mem.anyCommon(ForeignIn) ||
+    if (Mem.anyCommon(ForeignIn) || (ReadsData && Mem.anyCommon(ForeignData)) ||
         llvm::any_of(H.Objs, [&](const llvm::Value* A) {
-          return HoldsUnknown.count(A) || objForeign(A);
+          return HoldsUnknown.count(A) || objForeign(A) ||
+                 (ReadsData && ObjForeignData.count(A));
         }))
       R.Other |= MR;
   }
@@ -2159,7 +2307,11 @@ private:
       }
       Origin O = originOf(A);
       access(S.Params[K].Direct, O, /*Reachable=*/false);
-      access(S.Params[K].Reachable, O, /*Reachable=*/true);
+      access(S.Params[K].Reachable, O, /*Reachable=*/true,
+             S.Params[K].ReadsData);
+      if (S.Params[K].ReadsData)
+        for (unsigned J : heldBy(holdings(O)).set_bits())
+          R.Params[J].ReadsData = true;
       // Freeing memory stores no pointer.
       if (!Sink && llvm::isModSet(S.Params[K].Direct | S.Params[K].Reachable))
         storeIntoByCall(CB, S, K);
@@ -2338,10 +2490,19 @@ private:
       if (ignored(I))
         continue;
       if (const auto* LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
-        access(ModRefInfo::Ref, originOf(LI->getPointerOperand()), false);
+        const Origin Src = originOf(LI->getPointerOperand());
+        access(ModRefInfo::Ref, Src, false);
+        // A pointer from bytes that may be integer data.
+        if (LI->getType()->isPointerTy() && !PointerObjectAccess(*LI))
+          for (unsigned K : heldBy(Src).set_bits())
+            R.Params[K].ReadsData = true;
       } else if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
         Origin Dst = originOf(SI->getPointerOperand());
         access(ModRefInfo::Mod, Dst, false);
+        bool Data;
+        llvm::SmallBitVector From(N);
+        foreignSource(SI->getValueOperand(), *SI, Data, &From);
+        noteDataCopy(From, Dst);
         captureByCopy(carried(SI->getValueOperand()), Dst,
                       pointersIn(SI->getValueOperand()));
         captureScalar(SI->getValueOperand(), &Dst);
@@ -2351,6 +2512,11 @@ private:
         Origin Dst = originOf(MT->getRawDest());
         access(ModRefInfo::Ref, Src, false);
         access(ModRefInfo::Mod, Dst, false);
+        if (readOf(*MT) == ReadAs::Bytes)
+          for (unsigned K : heldBy(Src).set_bits())
+            R.Params[K].ReadsData = true;
+        else
+          noteDataCopy(heldBy(Src), Dst);
         captureByCopy(loadedFrom(Src), Dst, pointersLoaded(Src, readOf(*MT)));
         storeInto(MT->getMetadata(CharacterCopyKind) ? Origin(N)
                                                      : loadedFrom(Src),
@@ -2360,6 +2526,10 @@ private:
       } else if (const auto* RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I)) {
         Origin Dst = originOf(RMW->getPointerOperand());
         access(ModRefInfo::ModRef, Dst, false);
+        bool Data;
+        llvm::SmallBitVector From(N);
+        foreignSource(RMW->getValOperand(), I, Data, &From);
+        noteDataCopy(From, Dst);
         captureByCopy(carried(RMW->getValOperand()), Dst,
                       pointersIn(RMW->getValOperand()));
         captureScalar(RMW->getValOperand(), &Dst);
@@ -2367,6 +2537,10 @@ private:
       } else if (const auto* CX = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
         Origin Dst = originOf(CX->getPointerOperand());
         access(ModRefInfo::ModRef, Dst, false);
+        bool Data;
+        llvm::SmallBitVector From(N);
+        foreignSource(CX->getNewValOperand(), I, Data, &From);
+        noteDataCopy(From, Dst);
         captureByCopy(carried(CX->getNewValOperand()), Dst,
                       pointersIn(CX->getNewValOperand()));
         captureScalar(CX->getNewValOperand(), &Dst);
@@ -2421,10 +2595,11 @@ private:
     // through that memory may reach it.
     const bool AnyForeign =
         OtherWrites || ForeignIn.any() || !ObjForeign.empty();
-    if (AnyForeign)
-      for (unsigned I = 0; I < N; ++I)
-        if (R.Params[I].PointerCaptured)
-          R.Other |= R.Params[I].Reachable;
+    const bool AnyData = ForeignData.any() || !ObjForeignData.empty();
+    for (unsigned I = 0; I < N; ++I)
+      if (R.Params[I].PointerCaptured &&
+          (AnyForeign || (AnyData && R.Params[I].ReadsData)))
+        R.Other |= R.Params[I].Reachable;
     // Through a captured pointer, code elsewhere may store anything; copied
     // data gives nobody a pointer.
     for (unsigned I = 0; I < N; ++I) {
@@ -2433,6 +2608,8 @@ private:
       R.Params[I].StoresOwnDeep = R.Params[I].StoresOwn && !ForeignNew.test(I);
       R.Params[I].StoresForeign =
           ForeignIn.test(I) || (R.Params[I].PointerCaptured && AnyForeign);
+      R.Params[I].StoresForeignData =
+          ForeignData.test(I) || (R.Params[I].PointerCaptured && AnyData);
     }
   }
 };
@@ -2441,21 +2618,64 @@ Reach ReachAnalysis::analyze(const llvm::Function& F) {
   return FunctionReach(*this, F).run();
 }
 
+// Whether \p P may point into a union: through its GEPs, a local or a
+// global of union type, or a GEP that indexes one.
+bool InUnion(const llvm::Value* P) {
+  auto IsUnion = [](llvm::Type* T) {
+    const auto* ST = llvm::dyn_cast<llvm::StructType>(T);
+    return ST && ST->hasName() && ST->getName().starts_with("union.");
+  };
+  for (;;) {
+    if (const auto* G = llvm::dyn_cast<llvm::GEPOperator>(P)) {
+      if (IsUnion(G->getSourceElementType()))
+        return true;
+      for (auto It = llvm::gep_type_begin(G), E = llvm::gep_type_end(G);
+           It != E; ++It)
+        if (IsUnion(It.getIndexedType()))
+          return true;
+      P = G->getPointerOperand();
+      continue;
+    }
+    if (const auto* A = llvm::dyn_cast<llvm::AllocaInst>(P))
+      return IsUnion(A->getAllocatedType());
+    if (const auto* GV = llvm::dyn_cast<llvm::GlobalVariable>(P))
+      return IsUnion(GV->getValueType());
+    return false;
+  }
+}
+
 // Before optimization, mark an integer load or store of storage that the
-// source declares with that type (a local, a field or element, a global).
-// Condition 6 takes its value as an integer. Optimization drops unknown
-// metadata when it merges or rewrites an access, so the accesses that it
-// makes from a memcpy stay unmarked.
+// source declares with that type (a local, a field or element, a global),
+// and each pointer load. Condition 6 takes an integer value as an integer.
+// Optimization drops unknown metadata when it merges or rewrites an access, so
+// the accesses that it makes from a memcpy stay unmarked.
 void MarkIntegerLoads(llvm::Function& F) {
   llvm::LLVMContext& C = F.getContext();
   const unsigned Kind = C.getMDKindID(IntegerLoadKind);
+  // An alias tag, unlike other metadata, survives when passes merge loads.
+  llvm::MDBuilder B(C);
+  llvm::MDNode* PtrTag = nullptr;
   for (llvm::Instruction& I : llvm::instructions(F)) {
     if (!llvm::isa<llvm::LoadInst>(I) && !llvm::isa<llvm::StoreInst>(I))
       continue;
     llvm::Type* T = llvm::getLoadStoreType(&I);
+    const llvm::Value* P = llvm::getLoadStorePointerOperand(&I);
+    // The frontend loads a pointer only from a glvalue of pointer type. A
+    // union may hold an integer member in the same bytes.
+    if (T->isPointerTy() && llvm::isa<llvm::LoadInst>(I)) {
+      if (InUnion(P))
+        continue;
+      if (!PtrTag) {
+        llvm::MDNode* Root = B.createTBAARoot("cppinterop pointer loads");
+        PtrTag = B.createTBAAStructTagNode(
+            B.createTBAAScalarTypeNode("any pointer", Root),
+            B.createTBAAScalarTypeNode("any pointer", Root), 0);
+      }
+      I.setMetadata(llvm::LLVMContext::MD_tbaa, PtrTag);
+      continue;
+    }
     if (!T->isIntegerTy())
       continue;
-    const llvm::Value* P = llvm::getLoadStorePointerOperand(&I);
     llvm::Type* Declared = nullptr;
     if (const auto* A = llvm::dyn_cast<llvm::AllocaInst>(P))
       Declared = A->getAllocatedType();
@@ -3099,9 +3319,10 @@ bool ParseVariant(llvm::ArrayRef<llvm::StringRef> Fields, SummaryVariant& V) {
     P.StoresOwn = Captured[I] == 'o' || Captured[I] == 's';
     P.StoresOwnDeep = Captured[I] == 'o';
     // The table has no field for it: derive a bound.
-    P.StoresForeign = llvm::isModSet(P.Direct | P.Reachable)
-                          ? !P.StoresOwnDeep
-                          : P.PointerCaptured;
+    P.StoresForeign = P.StoresForeignData =
+        llvm::isModSet(P.Direct | P.Reachable) ? !P.StoresOwnDeep
+                                               : P.PointerCaptured;
+    P.ReadsData = (P.Direct | P.Reachable) != ModRefInfo::NoModRef;
     char C = Ret[I + 1];
     if (C == 'd' || C == 'b')
       V.R.RetDirect.set(I);
