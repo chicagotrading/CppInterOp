@@ -1187,6 +1187,51 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AnalyseOnlyRunsNoInitializer) {
   EXPECT_EQ(Cpp::Evaluate("me_init_runs").unbox<int>(), 11);
 }
 
+// A withdrawn unit that enters a standard header first leaves a session
+// that can declare, look up and analyse again.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WithdrawnUnitEntersAHeader) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  const char* Code = R"(
+    #include <stdexcept>
+    extern "C" int me_hdr_check(int* p) {
+      if (!p)
+        throw std::runtime_error("null");
+      return *p;
+    }
+  )";
+  for (bool Run : {true, false}) {
+    SCOPED_TRACE(Run ? "GetFunctionsMemoryEffects" : "Analyze");
+    TestFixture::CreateInterpreter();
+    std::vector<Cpp::MemoryEffects> MEs =
+        Run ? Cpp::GetFunctionsMemoryEffects(Code, {"me_hdr_check"},
+                                             /*rewind=*/true)
+            : Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_hdr_check"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid);
+    EXPECT_EQ(MEs[0].Params[0], ModRef::Read);
+    EXPECT_FALSE(Cpp::GetFunctionAddress("me_hdr_check"));
+    EXPECT_FALSE(Cpp::GetNamed("runtime_error", Cpp::GetNamed("std")));
+
+    ASSERT_EQ(Cpp::Declare(R"(
+      #include <stdexcept>
+      extern "C" int me_hdr_later(int x) { return x + 1; }
+    )"),
+              0);
+    EXPECT_TRUE(Cpp::GetFunctionAddress("me_hdr_later"));
+    Cpp::DeclRef Std = Cpp::GetNamed("std");
+    ASSERT_TRUE(Std);
+    EXPECT_TRUE(Cpp::GetNamed("runtime_error", Std));
+
+    std::vector<Cpp::MemoryEffects> Again =
+        Run ? Cpp::GetFunctionsMemoryEffects(Code, {"me_hdr_check"},
+                                             /*rewind=*/true)
+            : Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_hdr_check"});
+    ASSERT_EQ(Again.size(), 1u);
+    ASSERT_TRUE(Again[0].Valid);
+    EXPECT_EQ(Again[0].Params[0], ModRef::Read);
+  }
+}
+
 // A unit that does not compile gives invalid effects and leaves nothing:
 // no input, no name, no macro. The error comes first: clang-repl keeps the
 // IR of the definitions before it (llvm/llvm-project#226285).

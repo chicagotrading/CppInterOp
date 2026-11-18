@@ -4827,6 +4827,72 @@ void HideEnumerator(clang::Sema& S, clang::DeclContext* Primary,
     Map->erase(Pos);
 }
 
+using WithdrawnUnits = llvm::SmallPtrSet<clang::TranslationUnitDecl*, 4>;
+
+bool IsWithdrawn(const clang::Decl* D, const WithdrawnUnits& TUs) {
+  return TUs.contains(D->getTranslationUnitDecl());
+}
+
+// A redeclaration replaces the earlier declaration in the lookup. Thus an
+// earlier one of the same unit has no entry, and removeDecl asserts.
+void RemoveMember(clang::DeclContext* DC, clang::Decl* D) {
+  if (auto* ND = llvm::dyn_cast<clang::NamedDecl>(D); ND && ND->getDeclName()) {
+    clang::DeclContext* Sem = ND->getDeclContext();
+    do {
+      if (clang::StoredDeclsMap* Map = Sem->getPrimaryContext()->getLookupPtr())
+        if (Map->find(ND->getDeclName()) == Map->end())
+          (*Map)[ND->getDeclName()].addOrReplaceDecl(ND);
+    } while (Sem->isTransparentContext() && (Sem = Sem->getParent()));
+  }
+  DC->removeDecl(D);
+}
+
+// CleanUpPTU does this for the TU only. The lookup of a reopened namespace
+// also holds local externs, inline namespace members and RemoveMember entries.
+void DropWithdrawnLookups(clang::DeclContext* Primary,
+                          const WithdrawnUnits& TUs) {
+  clang::StoredDeclsMap* Map = Primary->getLookupPtr();
+  if (!Map)
+    return;
+  llvm::SmallVector<clang::DeclarationName, 8> Empty;
+  for (auto& [Name, List] : *Map) {
+    llvm::SmallVector<clang::NamedDecl*, 4> Dead;
+    for (clang::NamedDecl* D : List.getLookupResult())
+      if (IsWithdrawn(D, TUs))
+        Dead.push_back(D);
+    for (clang::NamedDecl* D : Dead)
+      List.remove(D);
+    if (List.isNull())
+      Empty.push_back(Name);
+  }
+  for (clang::DeclarationName Name : Empty)
+    Map->erase(Name);
+}
+
+template <class T> T* KeptRedecl(T* D, const WithdrawnUnits& TUs) {
+  while (D && IsWithdrawn(D, TUs))
+    D = D->getPreviousDecl();
+  return D;
+}
+
+template <class T>
+void KeepLazy(clang::LazyDeclPtr& P, const WithdrawnUnits& TUs) {
+  if (P.isValid() && !P.isOffset())
+    P = KeptRedecl(llvm::cast<T>(P.get(nullptr)), TUs);
+}
+
+// Sema keeps these std declarations outside the lookup.
+void DropWithdrawnStdCaches(clang::Sema& S, const WithdrawnUnits& TUs) {
+  KeepLazy<clang::NamespaceDecl>(S.StdNamespace, TUs);
+  KeepLazy<clang::CXXRecordDecl>(S.StdBadAlloc, TUs);
+  KeepLazy<clang::EnumDecl>(S.StdAlignValT, TUs);
+  S.StdInitializerList = KeptRedecl(S.StdInitializerList, TUs);
+  S.StdTypeIdentity = KeptRedecl(S.StdTypeIdentity, TUs);
+  S.StdCoroutineTraitsCache = KeptRedecl(S.StdCoroutineTraitsCache, TUs);
+  S.StdSourceLocationImplDecl = KeptRedecl(S.StdSourceLocationImplDecl, TUs);
+  S.CXXTypeInfoDecl = KeptRedecl(S.CXXTypeInfoDecl, TUs);
+}
+
 // Undo the inputs after the first \p Keep.
 bool WithdrawInputs(compat::Interpreter& I, size_t Keep) {
   clang::Interpreter& Inner = I;
@@ -4837,8 +4903,10 @@ bool WithdrawInputs(compat::Interpreter& I, size_t Keep) {
   llvm::SmallVector<clang::NamedDecl*, 8> Names;
   llvm::SmallVector<clang::NamedDecl*, 8> TopLevel;
   llvm::SmallVector<std::pair<clang::DeclContext*, clang::Decl*>, 8> Members;
+  WithdrawnUnits TUs;
   for (auto It = std::next(PTUs.begin(), static_cast<std::ptrdiff_t>(Keep));
        It != PTUs.end(); ++It) {
+    TUs.insert(It->TUPart);
     if (S.getLangOpts().CPlusPlus && S.TUScope)
       CollectScopeNames(S, It->TUPart, Names);
     CollectTopLevelNames(It->TUPart, TopLevel);
@@ -4862,7 +4930,24 @@ bool WithdrawInputs(compat::Interpreter& I, size_t Keep) {
   // Innermost first. Since llvm/llvm-project#218149 clang's Undo does this.
   for (auto& [DC, D] : llvm::reverse(Members))
     if (DC->containsDecl(D))
-      DC->removeDecl(D);
+      RemoveMember(DC, D);
+  llvm::SmallPtrSet<clang::DeclContext*, 8> Lookups;
+  auto AddLookups = [&](clang::DeclContext* C) {
+    for (; C; C = C->getParent()) {
+      if (C->isTransparentContext())
+        continue;
+      Lookups.insert(C->getPrimaryContext());
+      if (!C->isInlineNamespace())
+        return;
+    }
+  };
+  for (auto& [DC, D] : Members) {
+    AddLookups(DC);
+    AddLookups(D->getDeclContext());
+  }
+  for (clang::DeclContext* Primary : Lookups)
+    DropWithdrawnLookups(Primary, TUs);
+  DropWithdrawnStdCaches(S, TUs);
   // A redeclaration replaced the earlier declaration in the scope and the
   // lookup; put it back.
   llvm::SmallPtrSet<clang::Decl*, 16> Withdrawn(TopLevel.begin(),
