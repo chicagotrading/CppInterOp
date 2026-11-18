@@ -352,6 +352,167 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_GlobalWriteIsOtherMemory) {
             0u);
 }
 
+// A pointer that code loads from a constant global points where the
+// initializer of that global says.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PointerFromAConstantGlobal) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_cg_a = 0, me_cg_b = 0, me_cg_c = 0, me_cg_d = 0;
+    inline long* const me_cg_tbl[4] = {&me_cg_a, &me_cg_b, &me_cg_c, &me_cg_d};
+    struct me_cg_entry { int k; long* p; };
+    inline const me_cg_entry me_cg_entries[4] = {
+        {1, &me_cg_a}, {2, &me_cg_b}, {3, &me_cg_c}, {4, &me_cg_d}};
+    extern long* const me_cg_ext;
+    extern "C" void me_cg_table(const int* i) { ++*me_cg_tbl[*i & 3]; }
+    extern "C" long me_cg_table_read(const int* i) { return *me_cg_tbl[*i & 3]; }
+    extern "C" void me_cg_struct(const int* i) { ++*me_cg_entries[*i & 3].p; }
+    extern "C" void me_cg_local(const int* i) {
+      static long s0, s1, s2, s3;
+      static long* const t[4] = {&s0, &s1, &s2, &s3};
+      ++*t[*i & 3];
+    }
+    extern "C" void me_cg_plain() { ++me_cg_a; }
+    extern "C" void me_cg_extern() { ++*me_cg_ext; }
+    extern "C" void me_cg_switch(const int* i) {
+      switch (*i & 3) {
+      case 0: ++me_cg_a; break;
+      case 1: ++me_cg_b; break;
+      case 2: ++me_cg_c; break;
+      default: ++me_cg_d; break;
+      }
+    }
+    extern "C" int me_cg_numbers(const int* i) {
+      static const int t[4] = {3, 1, 4, 1};
+      return t[*i & 3];
+    }
+  )",
+      {"me_cg_table", "me_cg_table_read", "me_cg_struct", "me_cg_local",
+       "me_cg_plain", "me_cg_extern", "me_cg_switch", "me_cg_numbers"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 8u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(MEs[0].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[1].Other, ModRef::Read);
+  EXPECT_EQ(MEs[2].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[3].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[4].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[5].Other, ModRef::ReadWrite);
+  EXPECT_EQ(MEs[6].Other, ModRef::ReadWrite);
+  // A table of numbers is constant memory.
+  EXPECT_EQ(MEs[7].Other, ModRef::None);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    EXPECT_FALSE(
+        Writes(ME.ParamsDirect.empty() ? ModRef::None : ME.ParamsDirect[0]));
+}
+
+// A pointer into a constant table, or an address in a constant integer,
+// keeps its content known through a callee and a local object.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ConstantGlobalThroughACallee) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_cc_a = 0, me_cc_b = 0, me_cc_c = 0, me_cc_d = 0;
+    inline long* const me_cc_tbl[4] = {&me_cc_a, &me_cc_b, &me_cc_c, &me_cc_d};
+    struct me_cc_view { long* const* t; };
+    __attribute__((noinline)) void me_cc_bump(long* const* t, int i) {
+      ++*t[i & 3];
+    }
+    __attribute__((noinline)) long* const* me_cc_get() { return me_cc_tbl; }
+    __attribute__((noinline)) void me_cc_bump_view(const me_cc_view* v, int i) {
+      ++*v->t[i & 3];
+    }
+    extern "C" void me_cc_call(const int* i) { me_cc_bump(me_cc_tbl, *i); }
+    extern "C" void me_cc_result(const int* i) { ++*me_cc_get()[*i & 3]; }
+    extern "C" void me_cc_object(const int* i) {
+      me_cc_view v{me_cc_tbl};
+      me_cc_bump_view(&v, *i);
+    }
+    struct me_cc_ref { long* p; };
+    __attribute__((noinline)) void me_cc_bump_ref(const me_cc_ref* r) {
+      ++*r->p;
+    }
+    extern "C" void me_cc_global() {
+      me_cc_ref r{&me_cc_a};
+      me_cc_bump_ref(&r);
+    }
+  )",
+      {"me_cc_call", "me_cc_result", "me_cc_object", "me_cc_global"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(Writes(ME.Other));
+  }
+}
+
+// Only a declaration of type data counts as constant by its name: a
+// definition with such a name is inspected as any other global.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TypeDataNameIsNotEnough) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    extern "C" { long _ZTVme_tn_a = 0, _ZTVme_tn_b = 0, _ZTVme_tn_c = 0; }
+    inline long* const me_tn_tbl[4] = {&_ZTVme_tn_a, &_ZTVme_tn_b,
+                                       &_ZTVme_tn_c, &_ZTVme_tn_a};
+    extern "C" void me_tn_name(const int* i) { ++*me_tn_tbl[*i & 3]; }
+    inline long me_tn_e = 0, me_tn_f = 0, me_tn_g = 0, me_tn_h = 0;
+    extern long* const me_tn_asm_tbl[4] asm("_ZTSme_tn_table");
+    long* const me_tn_asm_tbl[4] = {&me_tn_e, &me_tn_f, &me_tn_g, &me_tn_h};
+    extern "C" void me_tn_asm(const int* i) { ++*me_tn_asm_tbl[*i & 3]; }
+    inline long* const me_tn_in0[2] = {&me_tn_e, &me_tn_f};
+    inline long* const me_tn_in1[2] = {&me_tn_g, &me_tn_h};
+    inline long* const* const me_tn_out[2] = {me_tn_in0, me_tn_in1};
+    extern "C" void me_tn_chain(const int* i) {
+      ++*me_tn_out[*i & 1][(*i >> 1) & 1];
+    }
+  )",
+      {"me_tn_name", "me_tn_asm", "me_tn_chain"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 3u);
+  for (size_t I = 0; I < MEs.size(); ++I) {
+    ASSERT_TRUE(MEs[I].Valid);
+    EXPECT_TRUE(Writes(MEs[I].Other)) << I;
+  }
+}
+
+// A vtable and the type information it points to are constant data of the
+// C++ runtime, so an object that holds a vtable pointer stays local.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_VtablePointerIsConstantData) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("expects the Itanium names of vtables and type information");
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_vt_base {
+      virtual ~me_vt_base() {}
+      virtual int f() const { return 1; }
+      long* q = nullptr;
+    };
+    struct me_vt_derived : me_vt_base {
+      int f() const override { return 2; }
+    };
+    __attribute__((noinline)) long me_vt_read(const me_vt_base* b) {
+      return *b->q;
+    }
+    extern "C" long me_vt_local(const long* x) {
+      long v = *x;
+      me_vt_derived d;
+      d.q = &v;
+      return me_vt_read(&d);
+    }
+  )",
+      {"me_vt_local"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Other, ModRef::None);
+}
+
 TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ExternalCallIsOpaque) {
   SKIP_WITHOUT_MEMORY_EFFECTS();
   TestFixture::CreateInterpreter();
@@ -1623,6 +1784,213 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressArithmeticOfAFreshBuffer) 
   EXPECT_EQ(ME.Other, ModRef::None);
   EXPECT_FALSE(ME.Captured[0]);
   EXPECT_FALSE(ME.AddressCaptured[1]);
+}
+
+// A sort of a local copy is recursive; it writes only the copy.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SortedCopyOfAMember) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("libc++ inlines its throws around out-of-line exception "
+                 "constructors, which are opaque calls");
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("#include <algorithm>\n#include <vector>"), 0);
+  Cpp::MemoryEffects ME = Cpp::GetFunctionMemoryEffects(R"(
+    struct me_sc_window {
+      double q = 0.5;
+      unsigned long n = 0;
+      std::vector<double> init;
+      double median() const {
+        if (n == 0)
+          return 0.0;
+        std::vector<double> v = init;
+        std::sort(v.begin(), v.end());
+        return v[static_cast<unsigned long>(q * v.size())];
+      }
+    };
+    extern "C" double me_sorted_copy(const me_sc_window* w) {
+      return w->median();
+    }
+  )",
+                                                        "me_sorted_copy");
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
+  EXPECT_EQ(ME.Other, ModRef::None);
+  EXPECT_FALSE(Writes(ME.ParamsDirect[0]));
+  EXPECT_FALSE(Writes(ME.ParamsReachable[0]));
+}
+
+// A recursive call has the effects of its callee at any depth.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RecursiveCalls) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    long me_rc_g = 0;
+    long* me_rc_kept = nullptr;
+    __attribute__((noinline)) void me_rc_count(const int* n) {
+      if (*n > 0) {
+        int m = *n - 1;
+        me_rc_count(&m);
+      } else {
+        ++me_rc_g;
+      }
+    }
+    __attribute__((noinline)) void me_rc_keep(long* p, const int* n) {
+      if (*n > 0) {
+        int m = *n - 1;
+        me_rc_keep(p, &m);
+      } else {
+        me_rc_kept = p;
+      }
+    }
+    __attribute__((noinline)) void me_rc_odd(long* p, const int* n);
+    __attribute__((noinline)) void me_rc_even(long* p, const int* n) {
+      if (*n > 0) {
+        int m = *n - 1;
+        me_rc_odd(p, &m);
+      }
+    }
+    __attribute__((noinline)) void me_rc_odd(long* p, const int* n) {
+      if (*n > 0) {
+        int m = *n - 1;
+        me_rc_even(p, &m);
+      } else {
+        *p = 1;
+      }
+    }
+    __attribute__((noinline)) long me_rc_sum(const long* p, const int* n) {
+      if (*n <= 0)
+        return 0;
+      int m = *n - 1;
+      return p[m] + me_rc_sum(p, &m);
+    }
+    extern "C" void me_rc_count_top(const int* n) { me_rc_count(n); }
+    extern "C" void me_rc_keep_top(long* p, const int* n) { me_rc_keep(p, n); }
+    extern "C" void me_rc_even_top(long* p, const int* n) { me_rc_even(p, n); }
+    extern "C" long me_rc_sum_top(const long* p, const int* n) {
+      return me_rc_sum(p, n);
+    }
+  )",
+      {"me_rc_count_top", "me_rc_keep_top", "me_rc_even_top", "me_rc_sum_top"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other));
+  EXPECT_TRUE(MEs[1].Captured[0]);
+  EXPECT_TRUE(Writes(MEs[2].ParamsDirect[0]));
+  EXPECT_FALSE(MEs[2].Captured[0]);
+  EXPECT_EQ(MEs[3].Other, ModRef::None);
+  EXPECT_EQ(MEs[3].ParamsDirect[0], ModRef::Read);
+  EXPECT_FALSE(MEs[3].Captured[0]);
+}
+
+// A recursive call that returns a pointer: a global or another argument
+// reaches the result only after more than one round of the fixpoint.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RecursivePointerResults) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_rp_g = 0;
+    __attribute__((noinline)) long* me_rp_pick(long* p, int d) {
+      if (d <= 0)
+        return p;
+      long* a = me_rp_pick(&me_rp_g, d - 1);
+      long* b = me_rp_pick(p, d - 2);
+      return (d & 1) ? a : b;
+    }
+    extern "C" void me_rp_ret(long* p, int d) { *me_rp_pick(p, d) = 1; }
+    __attribute__((noinline)) long* me_rp_rot4(long* a0, long* a1, long* a2,
+                                               long* a3, int d) {
+      if (d <= 0)
+        return a0;
+      long* x = me_rp_rot4(a1, a2, a3, a0, d - 1);
+      long* y = me_rp_rot4(a1, a2, a3, a0, d - 2);
+      return (d & 1) ? x : y;
+    }
+    extern "C" void me_rp_rot4_top(long* a0, long* a1, long* a2, long* a3,
+                                   int d) {
+      *me_rp_rot4(a0, a1, a2, a3, d) = 1;
+    }
+    __attribute__((noinline)) long* me_rp_rot10(long* a0, long* a1, long* a2,
+        long* a3, long* a4, long* a5, long* a6, long* a7, long* a8,
+        long* a9, int d) {
+      if (d <= 0)
+        return a0;
+      long* x = me_rp_rot10(a1, a2, a3, a4, a5, a6, a7, a8, a9, a0, d - 1);
+      long* y = me_rp_rot10(a1, a2, a3, a4, a5, a6, a7, a8, a9, a0, d - 2);
+      return (d & 1) ? x : y;
+    }
+    extern "C" void me_rp_rot10_top(long* a0, long* a1, long* a2, long* a3,
+        long* a4, long* a5, long* a6, long* a7, long* a8, long* a9, int d) {
+      *me_rp_rot10(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, d) = 1;
+    }
+    // The global reaches the result only at depth 2.
+    __attribute__((noinline)) long* me_rp_b(long* p, int d);
+    __attribute__((noinline)) long* me_rp_a(long* p, int d) {
+      if (d <= 0)
+        return p;
+      long* x = me_rp_b(p, d - 1);
+      long* y = me_rp_b(p, d - 2);
+      return (d & 1) ? x : y;
+    }
+    __attribute__((noinline)) long* me_rp_b(long* p, int d) {
+      if (d <= 0)
+        return p;
+      long* x = me_rp_a(&me_rp_g, d - 1);
+      long* y = me_rp_a(p, d - 2);
+      return (d & 1) ? x : y;
+    }
+    extern "C" void me_rp_b_top(long* p, int d) { *me_rp_b(p, d) = 1; }
+    extern "C" void me_rp_a_top(long* p, int d) { *me_rp_a(p, d) = 1; }
+  )",
+      {"me_rp_ret", "me_rp_rot4_top", "me_rp_rot10_top", "me_rp_b_top",
+       "me_rp_a_top"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 5u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other));
+  for (int K = 0; K < 4; ++K)
+    EXPECT_TRUE(Writes(MEs[1].ParamsDirect[K]) || Writes(MEs[1].Other)) << K;
+  for (int K = 0; K < 10; ++K)
+    EXPECT_TRUE(Writes(MEs[2].ParamsDirect[K]) || Writes(MEs[2].Other)) << K;
+  EXPECT_TRUE(Writes(MEs[3].Other));
+  EXPECT_TRUE(Writes(MEs[4].Other));
+}
+
+// The difference of two addresses is an address when one of them is null,
+// so a callee that stores it may store a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_DifferenceWithANullBase) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  ASSERT_EQ(Cpp::Declare("#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_nb_range { long* b; long* e; };
+    struct me_nb_out { long n; long* p; };
+    __attribute__((noinline)) void me_nb_diff(me_nb_out* o,
+                                              const me_nb_range* r) {
+      o->n = reinterpret_cast<long>(r->e) - reinterpret_cast<long>(r->b);
+    }
+    // With r->b == nullptr, o.n is the address r->e.
+    extern "C" void me_nb_write(const me_nb_range* r) {
+      me_nb_out o{0, nullptr};
+      me_nb_diff(&o, r);
+      long* p;
+      std::memcpy(&p, &o.n, sizeof p);
+      *p = 1;
+    }
+  )",
+      {"me_nb_write"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other) || Writes(MEs[0].ParamsReachable[0]));
 }
 
 // A lookup that returns a copy through a temporary: the callee builds the
