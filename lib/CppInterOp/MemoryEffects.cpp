@@ -289,6 +289,9 @@ struct ParamReach {
   bool StoresOwn = false;
   // Also every address that it stores into that fresh memory.
   bool StoresOwnDeep = false;
+  // The memory that the parameter reaches may receive a pointer to memory
+  // that no parameter or fresh memory accounts for, such as a global.
+  bool StoresForeign = false;
 };
 
 // The reachable-memory summary of a function.
@@ -305,8 +308,10 @@ struct Reach {
   static Reach conservative(unsigned N) {
     Reach R(N);
     R.Other = ModRefInfo::ModRef;
-    for (ParamReach& P : R.Params)
+    for (ParamReach& P : R.Params) {
       P = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true, true};
+      P.StoresForeign = true;
+    }
     R.RetUnknown = true;
     return R;
   }
@@ -333,6 +338,7 @@ struct Reach {
       P.PointerCaptured |= Q.PointerCaptured;
       P.StoresOwn &= Q.StoresOwn;
       P.StoresOwnDeep &= Q.StoresOwnDeep;
+      P.StoresForeign |= Q.StoresForeign;
     }
     RetDirect |= O.RetDirect;
     RetLoaded |= O.RetLoaded;
@@ -350,9 +356,11 @@ struct Reach {
       const ParamReach& P = A.Params[I];
       const ParamReach& Q = B.Params[I];
       if (std::tie(P.Direct, P.Reachable, P.Captured, P.AddressCaptured,
-                   P.PointerCaptured, P.StoresOwn, P.StoresOwnDeep) !=
+                   P.PointerCaptured, P.StoresOwn, P.StoresOwnDeep,
+                   P.StoresForeign) !=
           std::tie(Q.Direct, Q.Reachable, Q.Captured, Q.AddressCaptured,
-                   Q.PointerCaptured, Q.StoresOwn, Q.StoresOwnDeep))
+                   Q.PointerCaptured, Q.StoresOwn, Q.StoresOwnDeep,
+                   Q.StoresForeign))
         return false;
     }
     return true;
@@ -622,9 +630,11 @@ private:
     Out.Params.resize(N);
     Out.RetDirect.resize(N);
     Out.RetLoaded.resize(N);
-    for (unsigned K = R.Params.size(); K < N; ++K)
+    for (unsigned K = R.Params.size(); K < N; ++K) {
       Out.Params[K] = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true,
                        true};
+      Out.Params[K].StoresForeign = true;
+    }
     return Out;
   }
 
@@ -658,6 +668,7 @@ private:
       else if (CB.paramHasAttr(K, llvm::Attribute::WriteOnly))
         MR &= ModRefInfo::Mod;
       R.Params[K].Direct = MR;
+      R.Params[K].StoresForeign = llvm::isModSet(MR);
       llvm::CaptureInfo CI = CB.getCaptureInfo(K);
       R.Params[K].Captured = R.Params[K].AddressCaptured =
           R.Params[K].PointerCaptured =
@@ -689,7 +700,8 @@ private:
 class FunctionReach {
 public:
   FunctionReach(ReachAnalysis& RA, const llvm::Function& F)
-      : RA(RA), F(F), N(F.arg_size()), R(N), ForeignOld(N), ForeignNew(N) {}
+      : RA(RA), F(F), N(F.arg_size()), R(N), ForeignIn(N), ForeignOld(N),
+        ForeignNew(N) {}
 
   Reach run() {
     // A load from a fresh allocation depends on the stores into it.
@@ -735,6 +747,17 @@ private:
   // Parameters whose memory at the call (Old), or whose fresh memory (New),
   // may receive a pointer of another origin.
   llvm::SmallBitVector ForeignOld, ForeignNew;
+  // Per object: the parameters whose memory may hold a pointer to it.
+  llvm::DenseMap<const llvm::Value*, llvm::SmallBitVector> HeldBy;
+  // Parameters whose memory may receive a pointer to memory that no
+  // parameter or known object accounts for: a load from it is Unknown.
+  llvm::SmallBitVector ForeignIn;
+  // Objects that may hold such a pointer, and the fresh memory of calls
+  // that store it into an argument (condition 6).
+  llvm::SmallPtrSet<const llvm::Value*, 8> ObjForeign, HeldFresh;
+  // Whether the code may write memory that the analysis does not attribute,
+  // and so may write an escaped object.
+  bool OtherWrites = false;
   // Per scalar: the parameters whose address it may carry (from ptrtoint).
   llvm::DenseMap<const llvm::Value*, llvm::SmallBitVector> Taint;
   llvm::DenseMap<const llvm::Value*, llvm::SmallVector<const llvm::Value*, 2>>
@@ -919,9 +942,13 @@ private:
     Origin R(N);
     R.Loaded = O.params();
     R.Unknown = O.unowned();
+    llvm::SmallBitVector Mem = O.params();
     for (const llvm::GlobalVariable* G : O.Consts)
       R.join(contentOf(G));
     for (const llvm::Value* A : O.Objs) {
+      Owner W = Owners.lookup(A);
+      if (W.K == Owner::Param)
+        Mem.set(W.P);
       if (!knownContent(A)) {
         R.Unknown = true;
         continue;
@@ -940,11 +967,12 @@ private:
       if (HC != HoldsConsts.end())
         Held.Consts.assign(HC->second.begin(), HC->second.end());
       // Code that writes the owner's reachable memory may store into it.
-      auto W = Owners.find(A);
-      if (W != Owners.end() && W->second.K == Owner::Param)
-        Held.Loaded.set(W->second.P);
+      if (W.K == Owner::Param)
+        Held.Loaded.set(W.P);
       R.join(Held);
     }
+    if (Mem.anyCommon(ForeignIn))
+      R.Unknown = true;
     return R;
   }
 
@@ -965,7 +993,8 @@ private:
         // argument's memory, as for a null argument.
         if (!Arg.anyParam() && Arg.Objs.empty())
           O.Unknown = true;
-        O.join(loadedFrom(Arg));
+        // The callee may load the result through any number of levels.
+        O.join(reachable(loadedFrom(Arg)));
         // The result may be the object itself.
         Origin Self(N);
         Self.Objs = Arg.Objs;
@@ -1144,12 +1173,23 @@ private:
     if (S.Other != ModRefInfo::NoModRef)
       return false;
     llvm::SmallBitVector Seen(N);
-    for (const llvm::Value* A : CB.args()) {
+    for (unsigned K = 0; K < CB.arg_size(); ++K) {
+      const llvm::Value* A = CB.getArgOperand(K);
       if (!A->getType()->isPointerTy())
         continue;
       Origin O = originOf(A);
       if (O.unowned() || !O.Consts.empty())
         return false;
+      // The callee may store through any level of the memory it may write.
+      // The call's own fresh memory holds what the call stores.
+      if (llvm::isModSet(S.Params[K].Reachable)) {
+        O = holdings(O, &CB);
+        if (O.params().anyCommon(ForeignIn) ||
+            llvm::any_of(O.Objs, [&](const llvm::Value* Ob) {
+              return HoldsUnknown.count(Ob) || objForeign(Ob);
+            }))
+          return false;
+      }
       Seen |= O.params();
     }
     if (Seen.count() > 1)
@@ -1172,6 +1212,95 @@ private:
     return W;
   }
 
+  // The parameters whose memory may be memory of origin \p D.
+  llvm::SmallBitVector heldBy(const Origin& D) const {
+    llvm::SmallBitVector P = D.params();
+    for (const llvm::Value* A : D.Objs) {
+      auto It = HeldBy.find(A);
+      if (It != HeldBy.end())
+        P |= It->second;
+    }
+    return P;
+  }
+
+  // Pointers of origin \p Src, stored into memory of origin \p Dst, may
+  // lead to memory that no parameter or known object accounts for.
+  bool storeForeign(const Origin& Src, const Origin& Dst) {
+    if (!leadsForeign(Src))
+      return false;
+    bool Changed = markForeign(heldBy(Dst));
+    for (const llvm::Value* A : Dst.Objs)
+      Changed |= ObjForeign.insert(A).second;
+    return Changed;
+  }
+
+  // Whether object \p A may hold a pointer to memory that no parameter or
+  // known object accounts for. The content of fresh memory that a callee
+  // returns is not known.
+  bool objForeign(const llvm::Value* A) const {
+    if (ObjForeign.count(A) ||
+        !(freshAllocation(A) || FreshCalls.count(A) || HeldFresh.count(A)) ||
+        (OtherWrites && Owners.lookup(A).K == Owner::Escaped))
+      return true;
+    auto HC = HoldsConsts.find(A);
+    return HC != HoldsConsts.end() && !HC->second.empty();
+  }
+
+  // The objects that \p O leads to through any number of levels, and the
+  // parameters whose memory they hold pointers to, without \p Skip.
+  Origin holdings(const Origin& O, const llvm::Value* Skip = nullptr) const {
+    Origin R = O;
+    llvm::erase(R.Objs, Skip);
+    llvm::SmallPtrSet<const llvm::Value*, 8> Seen;
+    if (Skip)
+      Seen.insert(Skip);
+    llvm::SmallVector<const llvm::Value*, 8> Work(O.Objs.begin(), O.Objs.end());
+    while (!Work.empty()) {
+      const llvm::Value* A = Work.pop_back_val();
+      if (!Seen.insert(A).second)
+        continue;
+      Origin Held(N);
+      // Data that is no pointer leads nowhere.
+      if (auto H = HoldsPtr.find(A); H != HoldsPtr.end())
+        Held.Loaded |= H->second;
+      if (auto HA = HoldsAddr.find(A); HA != HoldsAddr.end())
+        Held.Direct |= HA->second;
+      if (auto HO = HoldsObjs.find(A); HO != HoldsObjs.end()) {
+        Held.Objs.assign(HO->second.begin(), HO->second.end());
+        llvm::erase(Held.Objs, Skip);
+        Work.append(HO->second.begin(), HO->second.end());
+      }
+      Owner W = Owners.lookup(A);
+      if (W.K == Owner::Param)
+        Held.Loaded.set(W.P);
+      R.join(Held);
+    }
+    return R;
+  }
+
+  // Whether pointers of origin \p O may lead, through any number of levels,
+  // to memory that no parameter or known object accounts for.
+  bool leadsForeign(const Origin& O) const {
+    const Origin H = holdings(O);
+    return H.unowned() || !H.Consts.empty() ||
+           H.params().anyCommon(ForeignIn) ||
+           llvm::any_of(H.Objs,
+                        [&](const llvm::Value* A) { return objForeign(A); });
+  }
+
+  bool otherWrite(const Origin& Dst) {
+    if (OtherWrites || !Dst.unowned())
+      return false;
+    return OtherWrites = true;
+  }
+
+  bool markForeign(const llvm::SmallBitVector& P) {
+    if (!P.test(ForeignIn))
+      return false;
+    ForeignIn |= P;
+    return true;
+  }
+
   // Pointers with origin \p Src are copied into memory with origin \p Dst
   // (a pointer store, or a memcpy of bytes that may hold pointers). \p Ptr
   // has the parameters whose data may be a pointer; null for all.
@@ -1182,14 +1311,27 @@ private:
         !Src.unowned())
       return false;
     Owner W = ownerOf(Dst);
-    for (const llvm::Value* A : Src.Objs)
+    const llvm::SmallBitVector By = heldBy(Dst);
+    for (const llvm::Value* A : Src.Objs) {
       Changed |= Owners[A].join(W);
+      llvm::SmallBitVector& HB = HeldBy.try_emplace(A, N).first->second;
+      if (By.test(HB)) {
+        HB |= By;
+        Changed = true;
+      }
+    }
     // Through memory whose content is not known, any code may reach them.
-    if (Dst.unowned() ||
-        llvm::any_of(Dst.Objs, [&](const llvm::Value* B) {
+    // Only a write that the analysis does not attribute may store a foreign
+    // pointer there.
+    if (Dst.unowned() || llvm::any_of(Dst.Objs, [&](const llvm::Value* B) {
           return !knownContent(B);
-        }))
-      Changed |= expose(Src);
+        })) {
+      const bool Foreign = (Dst.unowned() && OtherWrites) ||
+                           llvm::any_of(Dst.Objs, [&](const llvm::Value* B) {
+                             return objForeign(B);
+                           });
+      Changed |= expose(Src, Foreign);
+    }
     for (const llvm::Value* A : Dst.Objs) {
       llvm::SmallVector<const llvm::Value*, 2>& HO = HoldsObjs[A];
       for (const llvm::Value* B : Src.Objs) {
@@ -1340,13 +1482,18 @@ private:
 
   // The objects of \p O and those they hold, transitively, may change
   // through writes that the analysis does not see.
-  bool expose(const Origin& O) {
+  // With \p Foreign, the writes may store any pointer; without, only those
+  // that a callee's summary allows.
+  bool expose(const Origin& O, bool Foreign = true) {
     bool Changed = false;
     llvm::SmallVector<const llvm::Value*, 8> Work(O.Objs.begin(),
                                                   O.Objs.end());
     while (!Work.empty()) {
       const llvm::Value* A = Work.pop_back_val();
-      if (!Exposed.insert(A).second)
+      bool New = Exposed.insert(A).second;
+      if (Foreign)
+        New |= ObjForeign.insert(A).second;
+      if (!New)
         continue;
       Changed = true;
       auto It = HoldsObjs.find(A);
@@ -1426,17 +1573,36 @@ private:
         Changed |= escapeAddresses(I);
         if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
           const llvm::SmallBitVector Ptr = pointersIn(SI->getValueOperand());
-          Changed |= recordCopy(carried(SI->getValueOperand()),
-                                originOf(SI->getPointerOperand()), &Ptr);
+          const Origin Src = carried(SI->getValueOperand());
+          const Origin Dst = originOf(SI->getPointerOperand());
+          Changed |= recordCopy(Src, Dst, &Ptr);
+          Changed |= storeForeign(Src, Dst);
+          Changed |= otherWrite(Dst);
         } else if (const auto* MT = llvm::dyn_cast<llvm::MemTransferInst>(&I)) {
           const Origin Src = originOf(MT->getRawSource());
+          const Origin Dst = originOf(MT->getRawDest());
           const llvm::SmallBitVector Ptr = pointersLoaded(Src, readOf(*MT));
-          Changed |=
-              recordCopy(loadedFrom(Src), originOf(MT->getRawDest()), &Ptr);
+          Changed |= recordCopy(loadedFrom(Src), Dst, &Ptr);
+          if (!MT->getMetadata(CharacterCopyKind))
+            Changed |= storeForeign(loadedFrom(Src), Dst);
+          Changed |= otherWrite(Dst);
+        } else if (const auto* RMW = llvm::dyn_cast<llvm::AtomicRMWInst>(&I)) {
+          Changed |= storeForeign(carried(RMW->getValOperand()),
+                                  originOf(RMW->getPointerOperand()));
+          Changed |= otherWrite(originOf(RMW->getPointerOperand()));
+          Changed |= exposeOperands(I);
+        } else if (const auto* CX =
+                       llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
+          Changed |= storeForeign(carried(CX->getNewValOperand()),
+                                  originOf(CX->getPointerOperand()));
+          Changed |= otherWrite(originOf(CX->getPointerOperand()));
+          Changed |= exposeOperands(I);
         } else if (const auto* CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
           if (ignored(I) || llvm::isa<llvm::MemIntrinsic>(I))
             continue;
           Changed |= ownersAtCall(*CB);
+          if (!OtherWrites && llvm::isModSet(callee(*CB).Other))
+            Changed = OtherWrites = true;
         } else if (const auto* RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
           if (const llvm::Value* V = RI->getReturnValue())
             for (const llvm::Value* A : carried(V).Objs)
@@ -1444,6 +1610,11 @@ private:
         } else {
           Changed |= exposeOperands(I);
         }
+      }
+      // A parameter that holds an object of foreign content reaches it.
+      for (const auto& [A, By] : HeldBy) {
+        if (objForeign(A))
+          Changed |= markForeign(By);
       }
     }
     return Any;
@@ -1467,6 +1638,7 @@ private:
                  bool Deep) {
     bool Changed =
         Deep ? FreshCalls.insert(&CB).second : HoldsUnknown.insert(&CB).second;
+    Changed |= HeldFresh.insert(&CB).second;
     Origin Self = reachable(O, &CB);
     Origin Fresh(N);
     Fresh.Objs.push_back(&CB);
@@ -1478,6 +1650,18 @@ private:
       Dst.join(Fresh);
     Changed |= recordCopy(Self, Dst);
     return Changed;
+  }
+
+  // Whether the callee may store into the memory of argument \p K another
+  // argument that leads to memory that no parameter accounts for.
+  bool keepsForeign(const llvm::CallBase& CB, const Reach& S, unsigned K) {
+    for (unsigned J = 0; J < CB.arg_size(); ++J) {
+      if (J == K || !S.Params[J].PointerCaptured)
+        continue;
+      if (leadsForeign(carried(CB.getArgOperand(J))))
+        return true;
+    }
+    return false;
   }
 
   bool ownersAtCall(const llvm::CallBase& CB) {
@@ -1510,8 +1694,6 @@ private:
         continue;
       }
       Origin O = originOf(A);
-      Params |= O.params();
-      Addresses |= O.Direct;
       AnyCaptured |= S.Params[K].Captured;
       // Freeing an object leaves no content to load.
       const bool Writes =
@@ -1521,11 +1703,25 @@ private:
       const bool Own = Writes && S.Params[K].StoresOwn &&
                        !S.Params[K].PointerCaptured && !S.RetFresh;
       if (Writes && !Own)
-        Changed |= expose(O);
+        Changed |= expose(O, /*Foreign=*/false);
+      const bool Through = S.Params[K].Reachable != ModRefInfo::NoModRef;
+      const Origin Deep = Through ? holdings(O) : O;
+      Params |= Deep.params();
+      Addresses |= Deep.Direct;
+      if (!Sink &&
+          (S.Params[K].StoresForeign || (Writes && keepsForeign(CB, S, K)))) {
+        const Origin D = holdings(O);
+        Changed |= markForeign(heldBy(D));
+        for (const llvm::Value* Ob : D.Objs)
+          Changed |= ObjForeign.insert(Ob).second;
+        Changed |= ObjForeign.insert(&CB).second;
+      }
+      // Nothing foreign comes in, and nothing of it leaves (condition 6).
+      if (!Own)
+        for (const llvm::Value* Ob : Deep.Objs)
+          if (!llvm::is_contained(Touched, Ob))
+            Touched.push_back(Ob);
       for (const llvm::Value* Ob : O.Objs) {
-        // Nothing foreign comes in, and nothing of it leaves (condition 6).
-        if (!Own)
-          Touched.push_back(Ob);
         if (!Internal && S.Params[K].Captured)
           Changed |= Owners[Ob].join(Owner{Owner::Escaped, 0});
         // A callee that writes it may store pointers of unknown origin.
@@ -1547,6 +1743,11 @@ private:
       W.join(Owners[Ob]);
     for (const llvm::Value* Ob : Touched) {
       Changed |= Owners[Ob].join(W);
+      llvm::SmallBitVector& HB = HeldBy.try_emplace(Ob, N).first->second;
+      if (Params.test(HB)) {
+        HB |= Params;
+        Changed = true;
+      }
       llvm::SmallVector<const llvm::Value*, 2>& HO = HoldsObjs[Ob];
       for (const llvm::Value* Other : Touched) {
         auto It = std::lower_bound(HO.begin(), HO.end(), Other);
@@ -1577,28 +1778,39 @@ private:
   void access(ModRefInfo MR, const Origin& O, bool Reachable) {
     if (MR == ModRefInfo::NoModRef)
       return;
-    for (unsigned I : O.Direct.set_bits())
-      (Reachable ? R.Params[I].Reachable : R.Params[I].Direct) |= MR;
-    for (unsigned I : O.Loaded.set_bits())
-      R.Params[I].Reachable |= MR;
-    if (O.Global || O.Unknown)
-      R.Other |= MR;
-    if (!Reachable)
-      return;
-    // Not inert: a constant reaches memory that changes.
-    if (!O.Consts.empty())
-      R.Other |= MR;
-    // Memory reachable from an object: whatever it holds.
-    for (const llvm::Value* A : O.Objs) {
-      auto It = Holds.find(A);
-      if (It != Holds.end())
-        for (unsigned I : It->second.set_bits())
-          R.Params[I].Reachable |= MR;
-      auto HC = HoldsConsts.find(A);
-      if (HoldsUnknown.count(A) ||
-          (HC != HoldsConsts.end() && !HC->second.empty()))
+    if (!Reachable) {
+      for (unsigned I : O.Direct.set_bits())
+        R.Params[I].Direct |= MR;
+      for (unsigned I : O.Loaded.set_bits())
+        R.Params[I].Reachable |= MR;
+      if (O.unowned())
         R.Other |= MR;
+      return;
     }
+    llvm::SmallBitVector Mem = O.params();
+    for (unsigned I : Mem.set_bits())
+      R.Params[I].Reachable |= MR;
+    // Not inert: a constant reaches memory that changes.
+    if (O.unowned() || !O.Consts.empty())
+      R.Other |= MR;
+    // Every level of memory that the objects lead to. A held address of a
+    // parameter leads to its own object.
+    Origin Objs(N);
+    Objs.Objs = O.Objs;
+    for (const llvm::Value* A : O.Objs)
+      if (auto It = Holds.find(A); It != Holds.end())
+        Objs.Loaded |= It->second;
+    const Origin H = holdings(Objs);
+    for (unsigned I : H.Direct.set_bits())
+      R.Params[I].Direct |= MR;
+    for (unsigned I : H.Loaded.set_bits())
+      R.Params[I].Reachable |= MR;
+    Mem |= H.params();
+    if (Mem.anyCommon(ForeignIn) ||
+        llvm::any_of(H.Objs, [&](const llvm::Value* A) {
+          return HoldsUnknown.count(A) || objForeign(A);
+        }))
+      R.Other |= MR;
   }
 
   // Pointers of origin \p O escape: the parameters' own objects for Direct,
@@ -2126,12 +2338,23 @@ private:
         if (Exposes(A, I))
           R.Params[I].Captured = R.Params[I].AddressCaptured =
               R.Params[I].PointerCaptured = true;
+    // Code that holds a captured pointer may store into the parameter's
+    // memory any foreign pointer that this code stores, and a later access
+    // through that memory may reach it.
+    const bool AnyForeign =
+        OtherWrites || ForeignIn.any() || !ObjForeign.empty();
+    if (AnyForeign)
+      for (unsigned I = 0; I < N; ++I)
+        if (R.Params[I].PointerCaptured)
+          R.Other |= R.Params[I].Reachable;
     // Through a captured pointer, code elsewhere may store anything; copied
     // data gives nobody a pointer.
     for (unsigned I = 0; I < N; ++I) {
       R.Params[I].StoresOwn =
           !ForeignOld.test(I) && !R.Params[I].PointerCaptured;
       R.Params[I].StoresOwnDeep = R.Params[I].StoresOwn && !ForeignNew.test(I);
+      R.Params[I].StoresForeign =
+          ForeignIn.test(I) || (R.Params[I].PointerCaptured && AnyForeign);
     }
   }
 };
@@ -2795,6 +3018,10 @@ bool ParseVariant(llvm::ArrayRef<llvm::StringRef> Fields, SummaryVariant& V) {
     P.AddressCaptured = Captured[I] == 'c';
     P.StoresOwn = Captured[I] == 'o' || Captured[I] == 's';
     P.StoresOwnDeep = Captured[I] == 'o';
+    // The table has no field for it: derive a bound.
+    P.StoresForeign = llvm::isModSet(P.Direct | P.Reachable)
+                          ? !P.StoresOwnDeep
+                          : P.PointerCaptured;
     char C = Ret[I + 1];
     if (C == 'd' || C == 'b')
       V.R.RetDirect.set(I);
