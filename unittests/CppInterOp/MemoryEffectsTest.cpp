@@ -1199,37 +1199,164 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WithdrawnUnitEntersAHeader) {
       return *p;
     }
   )";
-  for (bool Run : {true, false}) {
-    SCOPED_TRACE(Run ? "GetFunctionsMemoryEffects" : "Analyze");
-    TestFixture::CreateInterpreter();
-    std::vector<Cpp::MemoryEffects> MEs =
-        Run ? Cpp::GetFunctionsMemoryEffects(Code, {"me_hdr_check"},
-                                             /*rewind=*/true)
-            : Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_hdr_check"});
-    ASSERT_EQ(MEs.size(), 1u);
-    ASSERT_TRUE(MEs[0].Valid);
-    EXPECT_EQ(MEs[0].Params[0], ModRef::Read);
-    EXPECT_FALSE(Cpp::GetFunctionAddress("me_hdr_check"));
-    EXPECT_FALSE(Cpp::GetNamed("runtime_error", Cpp::GetNamed("std")));
+  // From C++17 on, the runtime unit declares std first.
+  for (const char* Std : {"-std=c++14", "-std=c++17", "-std=c++20"})
+    for (bool Run : {true, false}) {
+      SCOPED_TRACE(std::string(Std) +
+                   (Run ? " GetFunctionsMemoryEffects" : " Analyze"));
+      TestFixture::CreateInterpreter({Std});
+      std::vector<Cpp::MemoryEffects> MEs =
+          Run ? Cpp::GetFunctionsMemoryEffects(Code, {"me_hdr_check"},
+                                               /*rewind=*/true)
+              : Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_hdr_check"});
+      ASSERT_EQ(MEs.size(), 1u);
+      ASSERT_TRUE(MEs[0].Valid);
+      EXPECT_EQ(MEs[0].Params[0], ModRef::Read);
+      EXPECT_FALSE(Cpp::GetFunctionAddress("me_hdr_check"));
+      EXPECT_FALSE(Cpp::GetNamed("runtime_error", Cpp::GetNamed("std")));
 
-    ASSERT_EQ(Cpp::Declare(R"(
+      ASSERT_EQ(Cpp::Declare(R"(
       #include <stdexcept>
       extern "C" int me_hdr_later(int x) { return x + 1; }
     )"),
-              0);
-    EXPECT_TRUE(Cpp::GetFunctionAddress("me_hdr_later"));
-    Cpp::DeclRef Std = Cpp::GetNamed("std");
-    ASSERT_TRUE(Std);
-    EXPECT_TRUE(Cpp::GetNamed("runtime_error", Std));
+                0);
+      EXPECT_TRUE(Cpp::GetFunctionAddress("me_hdr_later"));
+      Cpp::DeclRef Std = Cpp::GetNamed("std");
+      ASSERT_TRUE(Std);
+      EXPECT_TRUE(Cpp::GetNamed("runtime_error", Std));
 
-    std::vector<Cpp::MemoryEffects> Again =
-        Run ? Cpp::GetFunctionsMemoryEffects(Code, {"me_hdr_check"},
-                                             /*rewind=*/true)
-            : Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_hdr_check"});
-    ASSERT_EQ(Again.size(), 1u);
-    ASSERT_TRUE(Again[0].Valid);
-    EXPECT_EQ(Again[0].Params[0], ModRef::Read);
-  }
+      std::vector<Cpp::MemoryEffects> Again =
+          Run ? Cpp::GetFunctionsMemoryEffects(Code, {"me_hdr_check"},
+                                               /*rewind=*/true)
+              : Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_hdr_check"});
+      ASSERT_EQ(Again.size(), 1u);
+      ASSERT_TRUE(Again[0].Valid);
+      EXPECT_EQ(Again[0].Params[0], ModRef::Read);
+    }
+}
+
+// An out-of-line member definition is lexically in the withdrawn unit; a
+// local extern in its body must not stay in the namespace lookup.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WithdrawnOutOfLineLocalExtern) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare(R"(
+    namespace me_ool_ns { struct C { int f(); }; }
+  )"),
+            0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    int me_ool_ns::C::f() { extern int me_ool_leaked; return me_ool_leaked; }
+    extern "C" int me_ool_probe(int* p) { return *p; }
+  )",
+      {"me_ool_probe"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(Cpp::Declare("namespace me_ool_ns { double me_ool_leaked; }"), 0);
+}
+
+// Kept declarations whose semantic context differs from the lexical one stay.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WithdrawKeepsSemanticMembers) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare(R"(
+    namespace me_sem_ns {
+    struct C { int f(); friend int me_sem_friend(C); };
+    int me_sem_friend(C);
+    }
+    int me_sem_ns::C::f() { extern int me_sem_kept_extern; return 1; }
+  )"),
+            0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    namespace me_sem_ns { int me_sem_probe_value = 1; }
+    extern "C" int me_sem_probe(int* p) { return *p; }
+  )",
+      {"me_sem_probe"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(Cpp::Declare(R"(
+    int me_sem_kept_extern = 3;
+    int me_sem_use(me_sem_ns::C c) { return me_sem_friend(c) + c.f(); }
+  )"),
+            0);
+  EXPECT_NE(Cpp::Declare("namespace me_sem_ns { double me_sem_friend; }",
+                         /*silent=*/true),
+            0);
+}
+
+// C++20 caches the comparison category types of <compare>.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_WithdrawnUnitEntersCompare) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter({"-std=c++20"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    #include <compare>
+    extern "C" int me_cmp_probe(int* p) { return (*p <=> 3) < 0; }
+  )",
+      {"me_cmp_probe"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(Cpp::Declare(R"(
+    #include <compare>
+    extern "C" int me_cmp_later(int x) { return (x <=> 3) < 0; }
+  )"),
+            0);
+  EXPECT_TRUE(Cpp::GetFunctionAddress("me_cmp_later"));
+}
+
+// Disabled: the withdrawn anonymous namespace stays the anonymous namespace
+// of me_an_ns, so a later one is not visible.
+TYPED_TEST(CPPINTEROP_TEST_MODE, DISABLED_MemoryEffects_WithdrawnAnonymousNs) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("namespace me_an_ns { int kept = 1; }"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    namespace me_an_ns { namespace { int old_v = 1; } }
+    extern "C" int me_an_probe(int* p) { return *p; }
+  )",
+      {"me_an_probe"});
+  ASSERT_TRUE(MEs[0].Valid);
+  ASSERT_EQ(Cpp::Declare("namespace me_an_ns { namespace { int new_v = 2; } }"),
+            0);
+  EXPECT_EQ(Cpp::Declare("int me_an_use = me_an_ns::new_v;"), 0);
+}
+
+// Disabled: the withdrawn explicit specialization stays registered in the kept
+// template.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           DISABLED_MemoryEffects_WithdrawnExplicitSpecialization) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("template <class T> struct MeSpecC { int v = 1; };"),
+            0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    template <> struct MeSpecC<int> { int v = 2; };
+    extern "C" int me_spec_probe(int* p) { return *p; }
+  )",
+      {"me_spec_probe"});
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(Cpp::Declare("template <> struct MeSpecC<int> { int v = 3; };"), 0);
+}
+
+// Disabled: a kept forward declaration of a class keeps the definition data of
+// the withdrawn definition.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           DISABLED_MemoryEffects_WithdrawnDefinitionOfKeptClass) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("namespace std { class bad_alloc; }"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    namespace std { class bad_alloc { public: int x; }; }
+    extern "C" int me_fwd_probe(int* p) { return *p; }
+  )",
+      {"me_fwd_probe"});
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(
+      Cpp::Declare("namespace std { class bad_alloc { public: int y; }; }"), 0);
 }
 
 // A unit that does not compile gives invalid effects and leaves nothing:

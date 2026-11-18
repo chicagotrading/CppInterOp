@@ -4792,6 +4792,11 @@ void CutChainAfter(clang::Decl* P) {
     TND->setPreviousDecl(nullptr);
   } else if (auto* NS = llvm::dyn_cast<clang::NamespaceDecl>(P)) {
     NS->setPreviousDecl(nullptr);
+  } else if (auto* TD = llvm::dyn_cast<clang::TagDecl>(P);
+             TD && !llvm::isa<clang::CXXRecordDecl>(TD)) {
+    // A class shares its definition data outside the chain; a cut is not
+    // enough there.
+    TD->setPreviousDecl(nullptr);
   }
 }
 
@@ -4829,8 +4834,13 @@ void HideEnumerator(clang::Sema& S, clang::DeclContext* Primary,
 
 using WithdrawnUnits = llvm::SmallPtrSet<clang::TranslationUnitDecl*, 4>;
 
+// Decide by the lexical unit: an out-of-line definition in a withdrawn unit
+// has a kept semantic parent.
 bool IsWithdrawn(const clang::Decl* D, const WithdrawnUnits& TUs) {
-  return TUs.contains(D->getTranslationUnitDecl());
+  const clang::DeclContext* DC = D->getLexicalDeclContext();
+  while (DC && !llvm::isa<clang::TranslationUnitDecl>(DC))
+    DC = llvm::cast<clang::Decl>(DC)->getLexicalDeclContext();
+  return DC && TUs.contains(llvm::cast<clang::TranslationUnitDecl>(DC));
 }
 
 // A redeclaration replaces the earlier declaration in the lookup. Thus an
@@ -4881,8 +4891,31 @@ void KeepLazy(clang::LazyDeclPtr& P, const WithdrawnUnits& TUs) {
     P = KeptRedecl(llvm::cast<T>(P.get(nullptr)), TUs);
 }
 
+ALLOW_ACCESS(clang::ComparisonCategories, Data,
+             llvm::DenseMap<char, clang::ComparisonCategoryInfo>);
+ALLOW_ACCESS(clang::ComparisonCategories, StdNS, clang::NamespaceDecl*);
+ALLOW_ACCESS(clang::Sema, FullyCheckedComparisonCategories,
+             llvm::SmallBitVector);
+
+// operator<=> finds the std comparison categories through this cache.
+void DropWithdrawnComparisonCategories(clang::Sema& S,
+                                       const WithdrawnUnits& TUs) {
+  clang::ComparisonCategories& Cats = S.getASTContext().CompCategories;
+  auto& Data = ACCESS(Cats, Data);
+  clang::NamespaceDecl*& StdNS = ACCESS(Cats, StdNS);
+  bool Stale = StdNS && IsWithdrawn(StdNS, TUs);
+  for (auto& [Kind, Info] : Data)
+    Stale |= Info.Record && IsWithdrawn(Info.Record, TUs);
+  if (!Stale)
+    return;
+  Data.clear();
+  StdNS = nullptr;
+  (ACCESS(S, FullyCheckedComparisonCategories)).reset();
+}
+
 // Sema keeps these std declarations outside the lookup.
 void DropWithdrawnStdCaches(clang::Sema& S, const WithdrawnUnits& TUs) {
+  DropWithdrawnComparisonCategories(S, TUs);
   KeepLazy<clang::NamespaceDecl>(S.StdNamespace, TUs);
   KeepLazy<clang::CXXRecordDecl>(S.StdBadAlloc, TUs);
   KeepLazy<clang::EnumDecl>(S.StdAlignValT, TUs);
@@ -4941,10 +4974,20 @@ bool WithdrawInputs(compat::Interpreter& I, size_t Keep) {
         return;
     }
   };
+  // Local externs and friends of an out-of-line definition go to the lookup
+  // of its semantic parents.
+  auto AddSemanticParents = [&](clang::Decl* D) {
+    for (clang::DeclContext* C = D->getDeclContext();
+         C && !C->isTranslationUnit(); C = C->getParent())
+      if (!C->isTransparentContext())
+        Lookups.insert(C->getPrimaryContext());
+  };
   for (auto& [DC, D] : Members) {
     AddLookups(DC);
-    AddLookups(D->getDeclContext());
+    AddSemanticParents(D);
   }
+  for (clang::NamedDecl* ND : TopLevel)
+    AddSemanticParents(ND);
   for (clang::DeclContext* Primary : Lookups)
     DropWithdrawnLookups(Primary, TUs);
   DropWithdrawnStdCaches(S, TUs);
@@ -4956,7 +4999,8 @@ bool WithdrawInputs(compat::Interpreter& I, size_t Keep) {
     Withdrawn.insert(D);
   auto Previous = [&](clang::Decl* D) {
     clang::Decl* Prev = D->getPreviousDecl();
-    while (Prev && Withdrawn.contains(Prev))
+    // A friend of a withdrawn class can be the first declaration.
+    while (Prev && (Withdrawn.contains(Prev) || IsWithdrawn(Prev, TUs)))
       Prev = Prev->getPreviousDecl();
     return llvm::dyn_cast_or_null<clang::NamedDecl>(Prev);
   };
