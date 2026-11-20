@@ -3694,3 +3694,48 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressInAnIntegerMemberAtO0) {
   EXPECT_TRUE(Writes(MEs[1].Other)) << Describe(MEs[1]);
   EXPECT_EQ(MEs[2].Other, ModRef::None) << Describe(MEs[2]);
 }
+
+// A trusted opaque call stores no pointer to other memory into its
+// arguments; an analysed callee is not trusted.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustCoversStoredPointers) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    inline long me_tc_g = 0;
+    void me_tc_fill(long** p);
+    extern "C" void me_tc_opaque(long** p) {
+      me_tc_fill(p);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_tc_set(long** p) { *p = &me_tc_g; }
+    extern "C" void me_tc_body(long** p) {
+      me_tc_set(p);
+      **p = 1;
+    }
+    struct me_tc_v { long a, b, c, d; };
+    void me_tc_fillv(long** p, me_tc_v v);
+    extern "C" void me_tc_unbounded(long** p) {
+      me_tc_fillv(p, {});
+      **p = 1;
+    }
+  )",
+      {"me_tc_opaque", "me_tc_body", "me_tc_unbounded"});
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  // Untrusted: the opaque call may store any pointer into *p.
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  // Trusted: the same fields as without the stored-pointer tracking.
+  EXPECT_EQ(MEs[0].TrustedOther, ModRef::None) << Describe(MEs[0]);
+  EXPECT_EQ(MEs[0].TrustedParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_EQ(MEs[0].TrustedParamsReachable[0], ModRef::Write);
+  EXPECT_FALSE(MEs[0].TrustedCaptured[0]);
+  // The analysed callee stores the global's address in both variants.
+  EXPECT_TRUE(Writes(MEs[1].Other)) << Describe(MEs[1]);
+  EXPECT_TRUE(Writes(MEs[1].TrustedOther)) << Describe(MEs[1]);
+  // A class by value: the signature does not bound the call.
+  EXPECT_FALSE(AllBounded(MEs[2])) << OpaqueNames(MEs[2]);
+  EXPECT_TRUE(Writes(MEs[2].TrustedOther)) << Describe(MEs[2]);
+}

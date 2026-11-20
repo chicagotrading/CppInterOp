@@ -459,6 +459,9 @@ constexpr llvm::StringLiteral CharacterCopyKind = "cppinterop.characters";
 constexpr llvm::StringLiteral PointerFreeKind = "cppinterop.pointer-free";
 // The attribute of a call that TrustOpaqueCalls bounds by trust.
 constexpr llvm::StringLiteral TrustedCallAttr = "cppinterop-trusted-call";
+// The attribute of a trusted call that its signature bounds: it stores no
+// pointer to other memory into the memory that its arguments reach.
+constexpr llvm::StringLiteral TrustedStoresAttr = "cppinterop-trusted-stores";
 
 // Whether load \p I reads an object of pointer type: its alias tag, from
 // the frontend or from MarkIntegerLoads, names a pointer type. Under the C++
@@ -719,7 +722,7 @@ private:
         MR &= ModRefInfo::Mod;
       R.Params[K].Direct = MR;
       R.Params[K].StoresForeign = R.Params[K].StoresForeignData =
-          llvm::isModSet(MR);
+          llvm::isModSet(MR) && !CB.hasFnAttr(TrustedStoresAttr);
       // A trusted call accesses only what pointers in its arguments reach;
       // freeing memory reads none of it.
       const llvm::Function* Callee = CB.getCalledFunction();
@@ -3123,7 +3126,10 @@ bool BoundBySignature(llvm::Function& F) {
 // Every call with no body or summary is assumed to access only memory
 // through its arguments, to keep no copy of them except in a pointer
 // result, and not to write through a parameter that its signature makes
-// const. Returns the mangled names that the signature cannot bound.
+// const. A call that its signature bounds is also assumed to store no pointer
+// to other memory, or integer data with such an address, into the memory
+// that its arguments reach. Returns the mangled names that the signature
+// cannot bound.
 llvm::StringSet<> TrustOpaqueCalls(llvm::Module& M) {
   const llvm::MemoryEffects ArgOnly =
       llvm::MemoryEffects::inaccessibleOrArgMemOnly();
@@ -3147,6 +3153,8 @@ llvm::StringSet<> TrustOpaqueCalls(llvm::Module& M) {
         Bound(F);
         if (!BoundBySignature(F))
           Unbounded.insert(F.getName());
+        else
+          F.addFnAttr(TrustedStoresAttr);
       }
       continue;
     }
