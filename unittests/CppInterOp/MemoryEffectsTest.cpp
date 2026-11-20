@@ -3939,3 +3939,81 @@ TYPED_TEST(CPPINTEROP_TEST_MODE,
   EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
   EXPECT_TRUE(Writes(MEs[0].TrustedOther)) << Describe(MEs[0]);
 }
+
+// A table entry for a member that writes only an integer of its object. An
+// entry without the stored-pointer flags is read conservatively; an entry
+// from the current summarizer carries them.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryCarriesForeignStores) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  const std::string Fields =
+      llvm::utohexstr(llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::ModRef)
+                          .toIntValue()) +
+      "\t-c-.\tmn\tnn\t..\tn\t...";
+  const char* Code = R"(
+    struct me_sf_pol {
+      float f;
+      mutable unsigned long next;
+      unsigned long need(unsigned long n) const;
+    };
+    struct me_sf_tab { long* p; me_sf_pol pol; };
+    extern "C" void me_sf_c(me_sf_tab* t, const unsigned long* n) {
+      (void)t->pol.need(*n);
+      *t->p = 1;
+    }
+  )";
+  for (const char* Flags : {"", "000"}) {
+    TestFixture::CreateInterpreter({"-O2"});
+    std::string Table =
+        SummaryHeader() + "_ZNK9me_sf_pol4needEm\t" + Fields + Flags + "\t.\n";
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1) << Flags;
+    std::vector<Cpp::MemoryEffects> MEs =
+        Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_sf_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid);
+    EXPECT_TRUE(MEs[0].Opaque.empty()) << OpaqueNames(MEs[0]);
+    EXPECT_TRUE(Writes(MEs[0].ParamsReachable[0])) << Describe(MEs[0]);
+    if (*Flags)
+      EXPECT_EQ(MEs[0].Other, ModRef::None) << Describe(MEs[0]);
+    else
+      EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  }
+}
+
+// The summarizer writes the stored-pointer flags. A model declaration that
+// writes its argument stores no foreign pointer only when it says so.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryWritesForeignStores) {
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare i64 @me_sw_model(ptr captures(none), i64) memory(argmem: readwrite)
+    declare i64 @me_sw_bound(ptr captures(none), i64) memory(argmem: readwrite) "cppinterop-trusted-stores"
+    define i64 @me_sw_any(ptr %this, i64 %n) {
+      %r = call i64 @me_sw_model(ptr %this, i64 %n)
+      ret i64 %r
+    }
+    define i64 @me_sw_own(ptr %this, i64 %n) {
+      %r = call i64 @me_sw_bound(ptr %this, i64 %n)
+      ret i64 %r
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  // The result field: kind, two origins, two flag digits, other memory.
+  auto Flags = [&](llvm::StringRef Name) {
+    std::vector<std::string> Row = RowOf(Table, Name);
+    return Row.size() == 9u && Row[7].size() == 6u ? Row[7].substr(3) : Table;
+  };
+  const std::string Any = Flags("me_sw_any");
+  const std::string Own = Flags("me_sw_own");
+  ASSERT_EQ(Any.size(), 3u) << Table;
+  ASSERT_EQ(Own.size(), 3u) << Table;
+  // A base-32 digit; bit 0 says that the parameter may receive one.
+  auto Bits = [](char C) {
+    return llvm::StringRef("0123456789abcdefghijklmnopqrstuv").find(C);
+  };
+  EXPECT_TRUE(Bits(Any[0]) & 1) << Table;
+  EXPECT_FALSE(Bits(Own[0]) & 1) << Table;
+  EXPECT_EQ(Own[2], '0') << Table;
+}

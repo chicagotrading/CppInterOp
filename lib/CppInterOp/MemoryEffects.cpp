@@ -318,8 +318,10 @@ struct ParamReach {
   // It may receive integer data that may hold such an address.
   bool StoresForeignData = false;
   // The callee may read integer data of the memory that the parameter
-  // reaches as a pointer, or copy it into other memory.
+  // reaches as a pointer.
   bool ReadsData = false;
+  // It may copy such data into other memory.
+  bool CopiesData = false;
 };
 
 // The reachable-memory summary of a function.
@@ -342,7 +344,7 @@ struct Reach {
     R.OtherForeign = true;
     for (ParamReach& P : R.Params) {
       P = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true, true};
-      P.StoresForeign = P.StoresForeignData = P.ReadsData = true;
+      P.StoresForeign = P.StoresForeignData = P.ReadsData = P.CopiesData = true;
     }
     R.RetUnknown = true;
     return R;
@@ -374,6 +376,7 @@ struct Reach {
       P.StoresForeignShallow &= Q.StoresForeignShallow;
       P.StoresForeignData |= Q.StoresForeignData;
       P.ReadsData |= Q.ReadsData;
+      P.CopiesData |= Q.CopiesData;
     }
     RetDirect |= O.RetDirect;
     RetLoaded |= O.RetLoaded;
@@ -395,11 +398,11 @@ struct Reach {
       if (std::tie(P.Direct, P.Reachable, P.Captured, P.AddressCaptured,
                    P.PointerCaptured, P.StoresOwn, P.StoresOwnDeep,
                    P.StoresForeign, P.StoresForeignShallow, P.StoresForeignData,
-                   P.ReadsData) !=
+                   P.ReadsData, P.CopiesData) !=
           std::tie(Q.Direct, Q.Reachable, Q.Captured, Q.AddressCaptured,
                    Q.PointerCaptured, Q.StoresOwn, Q.StoresOwnDeep,
                    Q.StoresForeign, Q.StoresForeignShallow, Q.StoresForeignData,
-                   Q.ReadsData))
+                   Q.ReadsData, Q.CopiesData))
         return false;
     }
     return true;
@@ -472,7 +475,8 @@ constexpr llvm::StringLiteral PointerFreeKind = "cppinterop.pointer-free";
 // The attribute of a call that TrustOpaqueCalls bounds by trust.
 constexpr llvm::StringLiteral TrustedCallAttr = "cppinterop-trusted-call";
 // The attribute of a trusted call that its signature bounds: it stores no
-// pointer to other memory into the memory that its arguments reach.
+// pointer to other memory into the memory that its arguments reach. A model
+// declaration of a summary may state it too.
 constexpr llvm::StringLiteral TrustedStoresAttr = "cppinterop-trusted-stores";
 
 // Whether load \p I reads an object of pointer type: its alias tag, from
@@ -698,7 +702,7 @@ private:
       Out.Params[K] = {ModRefInfo::ModRef, ModRefInfo::ModRef, true, true,
                        true};
       Out.Params[K].StoresForeign = Out.Params[K].StoresForeignData =
-          Out.Params[K].ReadsData = true;
+          Out.Params[K].ReadsData = Out.Params[K].CopiesData = true;
     }
     return Out;
   }
@@ -742,8 +746,9 @@ private:
           llvm::isModSet(MR) && !CB.hasFnAttr(TrustedStoresAttr) && !Runtime;
       // A trusted call accesses only what pointers in its arguments reach;
       // freeing memory reads none of it.
-      R.Params[K].ReadsData = MR != ModRefInfo::NoModRef &&
-                              !CB.hasFnAttr(TrustedCallAttr) && !Runtime;
+      R.Params[K].ReadsData = R.Params[K].CopiesData =
+          MR != ModRefInfo::NoModRef && !CB.hasFnAttr(TrustedCallAttr) &&
+          !Runtime;
       llvm::CaptureInfo CI = CB.getCaptureInfo(K);
       R.Params[K].Captured = R.Params[K].AddressCaptured =
           R.Params[K].PointerCaptured =
@@ -826,6 +831,8 @@ private:
   // Parameters whose memory at the call (Old), or whose fresh memory (New),
   // may receive a pointer of another origin.
   llvm::SmallBitVector ForeignOld, ForeignNew;
+  // Per object: the parameters whose integer data the code may copy into it.
+  llvm::DenseMap<const llvm::Value*, llvm::SmallBitVector> DataFrom;
   // Per object: the parameters whose memory may hold a pointer to it.
   llvm::DenseMap<const llvm::Value*, llvm::SmallBitVector> HeldBy;
   // Parameters whose memory may receive a pointer to memory that no
@@ -1169,7 +1176,7 @@ private:
             L->getMetadata(PointerFreeKind) || DataAccess(*L)))
         return Bits;
       Data |= leadsForeign(Bits) || leadsData(Bits);
-      From |= heldBy(Src);
+      From |= dataSources(Src);
       return O;
     }
     if (I && (llvm::isa<llvm::PtrToIntInst>(I) ||
@@ -1931,7 +1938,8 @@ private:
   bool readsData(const llvm::CallBase& CB, const Reach& S) const {
     for (unsigned J = 0; J < CB.arg_size(); ++J) {
       const llvm::Value* A = CB.getArgOperand(J);
-      if (A->getType()->isPointerTy() && S.Params[J].ReadsData &&
+      if (A->getType()->isPointerTy() &&
+          (S.Params[J].ReadsData || S.Params[J].CopiesData) &&
           leadsData(originOf(A)))
         return true;
     }
@@ -1941,12 +1949,62 @@ private:
   // The parameters whose memory a callee or this code may read as integer
   // data, when \p From is copied as data into \p Dst. A copy within one
   // parameter's memory moves nothing out of it.
+  // An object keeps the copy in this code (DataFrom); only a read of it as a
+  // pointer, or a copy on into other memory, counts.
   void noteDataCopy(const llvm::SmallBitVector& From, const Origin& Dst) {
-    const llvm::SmallBitVector P = Dst.params();
-    const bool Own = Dst.Objs.empty() && !Dst.unowned() && Dst.Consts.empty();
+    // An object that a parameter holds, or that leaves, is memory of others.
+    const llvm::SmallBitVector P = heldBy(Dst);
+    const bool Other = Dst.unowned() || !Dst.Consts.empty() ||
+                       llvm::any_of(Dst.Objs, [&](const llvm::Value* A) {
+                         Owner W = Owners.lookup(A);
+                         return W.K == Owner::Escaped || W.K == Owner::Returned;
+                       });
     for (unsigned K : From.set_bits())
-      if (!Own || P.count() > 1 || (P.any() && !P.test(K)))
-        R.Params[K].ReadsData = true;
+      if (Other || P.count() > 1 || (P.any() && !P.test(K)))
+        R.Params[K].CopiesData = true;
+  }
+
+  // The parameters whose memory, or whose integer data copied into an
+  // object, memory of origin \p O holds.
+  llvm::SmallBitVector dataSources(const Origin& O) const {
+    llvm::SmallBitVector P = heldBy(O);
+    for (const llvm::Value* A : O.Objs)
+      if (auto It = DataFrom.find(A); It != DataFrom.end())
+        P |= It->second;
+    return P;
+  }
+
+  // Where this code copies integer data of a parameter's memory into its
+  // objects.
+  void computeDataFrom() {
+    for (bool Changed = true; Changed;) {
+      Changed = false;
+      for (const llvm::Instruction& I : llvm::instructions(F)) {
+        llvm::SmallBitVector From(N);
+        Origin Dst(N);
+        if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+          bool Data;
+          foreignSource(SI->getValueOperand(), *SI, Data, &From);
+          Dst = originOf(SI->getPointerOperand());
+        } else if (const auto* MT = llvm::dyn_cast<llvm::MemTransferInst>(&I)) {
+          if (readOf(*MT) == ReadAs::Bytes)
+            continue;
+          From = dataSources(originOf(MT->getRawSource()));
+          Dst = originOf(MT->getRawDest());
+        } else {
+          continue;
+        }
+        if (From.none())
+          continue;
+        for (const llvm::Value* A : Dst.Objs) {
+          llvm::SmallBitVector& D = DataFrom.try_emplace(A, N).first->second;
+          if (From.test(D)) {
+            D |= From;
+            Changed = true;
+          }
+        }
+      }
+    }
   }
 
   // A trusted call that its signature bounds stores into the objects of
@@ -2450,9 +2508,10 @@ private:
       access(S.Params[K].Direct, O, /*Reachable=*/false);
       access(S.Params[K].Reachable, O, /*Reachable=*/true,
              S.Params[K].ReadsData);
-      if (S.Params[K].ReadsData)
-        for (unsigned J : heldBy(holdings(O)).set_bits())
-          R.Params[J].ReadsData = true;
+      for (unsigned J : dataSources(holdings(O)).set_bits()) {
+        R.Params[J].ReadsData |= S.Params[K].ReadsData;
+        R.Params[J].CopiesData |= S.Params[K].CopiesData;
+      }
       // Freeing memory stores no pointer.
       if (!Sink && llvm::isModSet(S.Params[K].Direct | S.Params[K].Reachable))
         storeIntoByCall(CB, S, K);
@@ -2620,6 +2679,7 @@ private:
   }
 
   void collect() {
+    computeDataFrom();
     // Condition 6 in the caller: an integer argument that goes nowhere
     // cannot become a pointer in any memory.
     for (const llvm::Argument& A : F.args())
@@ -2635,7 +2695,7 @@ private:
         access(ModRefInfo::Ref, Src, false);
         // A pointer from bytes that may be integer data.
         if (LI->getType()->isPointerTy() && !PointerObjectAccess(*LI))
-          for (unsigned K : heldBy(Src).set_bits())
+          for (unsigned K : dataSources(Src).set_bits())
             R.Params[K].ReadsData = true;
       } else if (const auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
         Origin Dst = originOf(SI->getPointerOperand());
@@ -2654,10 +2714,10 @@ private:
         access(ModRefInfo::Ref, Src, false);
         access(ModRefInfo::Mod, Dst, false);
         if (readOf(*MT) == ReadAs::Bytes)
-          for (unsigned K : heldBy(Src).set_bits())
+          for (unsigned K : dataSources(Src).set_bits())
             R.Params[K].ReadsData = true;
         else
-          noteDataCopy(heldBy(Src), Dst);
+          noteDataCopy(dataSources(Src), Dst);
         captureByCopy(loadedFrom(Src), Dst, pointersLoaded(Src, readOf(*MT)));
         storeInto(MT->getMetadata(CharacterCopyKind) ? Origin(N)
                                                      : loadedFrom(Src),
@@ -3412,7 +3472,28 @@ char CaptureChar(const llvm::Argument& A) {
   return '.';
 }
 
+// The stored-pointer flags of a parameter as one base-32 digit.
+enum ForeignBits : unsigned {
+  StoresForeignBit = 1,
+  ShallowBit = 2,
+  StoresDataBit = 4,
+  ReadsDataBit = 8,
+  CopiesDataBit = 16,
+};
+
+constexpr llvm::StringLiteral FlagDigits = "0123456789abcdefghijklmnopqrstuv";
+
+char ForeignChar(const ParamReach& P) {
+  unsigned B = (P.StoresForeign ? StoresForeignBit : 0) |
+               (P.StoresForeignShallow ? ShallowBit : 0) |
+               (P.StoresForeignData ? StoresDataBit : 0) |
+               (P.ReadsData ? ReadsDataBit : 0) |
+               (P.CopiesData ? CopiesDataBit : 0);
+  return FlagDigits[B];
+}
+
 // The seven table fields of one variant of a function.
+
 std::string VariantFields(const llvm::Function& F, ReachAnalysis& RA) {
   const Reach& R = RA.of(F);
   std::string Params, Direct, Reachable, Captured, Ret;
@@ -3450,6 +3531,11 @@ std::string VariantFields(const llvm::Function& F, ReachAnalysis& RA) {
   }
   char RetKind =
       R.RetFresh ? (R.RetUnknown ? 'b' : 'f') : (R.RetUnknown ? 'u' : '.');
+  // After the result: per parameter, which pointers it may receive and read
+  // (ForeignBits), then whether the writes of other memory may store one.
+  for (const llvm::Argument& A : F.args())
+    Ret += ForeignChar(R.Params[A.getArgNo()]);
+  Ret += R.OtherForeign ? '1' : '0';
   return llvm::utohexstr(F.getMemoryEffects().toIntValue()) + "\t" + Params +
          "\t" + Direct + "\t" + Reachable + "\t" + Captured + "\t" +
          AccessChar(R.Other) + "\t" + RetKind + Ret;
@@ -3461,8 +3547,10 @@ bool ParseVariant(llvm::ArrayRef<llvm::StringRef> Fields, SummaryVariant& V) {
   llvm::StringRef Params = Fields[1], Direct = Fields[2], Reachable = Fields[3],
                   Captured = Fields[4], Other = Fields[5], Ret = Fields[6];
   const size_t N = Direct.size();
+  // An entry of an older summarizer has no stored-pointer flags.
+  const bool Flags = Ret.size() == 2 * N + 2;
   if (Params.size() != 2 * N || Reachable.size() != N || Captured.size() != N ||
-      Other.size() != 1 || Ret.size() != N + 1)
+      Other.size() != 1 || (Ret.size() != N + 1 && !Flags))
     return false;
   V.R = Reach(N);
   for (size_t I = 0; I < N; ++I) {
@@ -3476,11 +3564,23 @@ bool ParseVariant(llvm::ArrayRef<llvm::StringRef> Fields, SummaryVariant& V) {
     P.AddressCaptured = Captured[I] == 'c';
     P.StoresOwn = Captured[I] == 'o' || Captured[I] == 's';
     P.StoresOwnDeep = Captured[I] == 'o';
-    // The table has no field for it: derive a bound.
-    P.StoresForeign = P.StoresForeignData =
-        llvm::isModSet(P.Direct | P.Reachable) ? !P.StoresOwnDeep
-                                               : P.PointerCaptured;
-    P.ReadsData = (P.Direct | P.Reachable) != ModRefInfo::NoModRef;
+    if (Flags) {
+      const size_t B = FlagDigits.find(Ret[N + 1 + I]);
+      if (B == llvm::StringRef::npos)
+        return false;
+      P.StoresForeign = B & StoresForeignBit;
+      P.StoresForeignShallow = B & ShallowBit;
+      P.StoresForeignData = B & StoresDataBit;
+      P.ReadsData = B & ReadsDataBit;
+      P.CopiesData = B & CopiesDataBit;
+    } else {
+      // No flags: derive a bound.
+      P.StoresForeign = P.StoresForeignData =
+          llvm::isModSet(P.Direct | P.Reachable) ? !P.StoresOwnDeep
+                                                 : P.PointerCaptured;
+      P.ReadsData = P.CopiesData =
+          (P.Direct | P.Reachable) != ModRefInfo::NoModRef;
+    }
     char C = Ret[I + 1];
     if (C == 'd' || C == 'b')
       V.R.RetDirect.set(I);
@@ -3491,7 +3591,13 @@ bool ParseVariant(llvm::ArrayRef<llvm::StringRef> Fields, SummaryVariant& V) {
   V.R.RetUnknown = Ret[0] == 'u' || Ret[0] == 'b';
   if (!ParseAccess(Other[0], V.R.Other))
     return false;
-  V.R.OtherForeign = llvm::isModSet(V.R.Other);
+  if (!Flags) {
+    V.R.OtherForeign = llvm::isModSet(V.R.Other);
+    return true;
+  }
+  if (Ret.back() != '0' && Ret.back() != '1')
+    return false;
+  V.R.OtherForeign = Ret.back() == '1';
   return true;
 }
 
