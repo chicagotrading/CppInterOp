@@ -1756,11 +1756,16 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_FreshAllocationContent) {
   EXPECT_TRUE(Writes(Known.ParamsReachable[0]));
   EXPECT_FALSE(Known.Captured[0]);
 
-  // The callee may store any pointer into the allocation.
+  // Untrusted, the callee may store any pointer into the allocation.
+  // Trusted, it stores only pointers into the memory that its argument
+  // reaches: the allocation, which holds a pointer into *t.
   const Cpp::MemoryEffects& Filled = MEs[1];
   ASSERT_TRUE(Filled.Valid);
   EXPECT_TRUE(Mentions(Filled, "me_fill"));
-  EXPECT_TRUE(Writes(Filled.TrustedOther));
+  EXPECT_TRUE(Writes(Filled.Other));
+  EXPECT_TRUE(Writes(Filled.TrustedParamsDirect[0]) ||
+              Writes(Filled.TrustedParamsReachable[0]))
+      << Describe(Filled);
 }
 
 // A pointer into a parameter's memory that leaves in an aggregate result,
@@ -3737,5 +3742,55 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustCoversStoredPointers) {
   EXPECT_TRUE(Writes(MEs[1].TrustedOther)) << Describe(MEs[1]);
   // A class by value: the signature does not bound the call.
   EXPECT_FALSE(AllBounded(MEs[2])) << OpaqueNames(MEs[2]);
+  EXPECT_TRUE(Writes(MEs[2].TrustedOther)) << Describe(MEs[2]);
+}
+
+// A local that a trusted call fills holds pointers into the call's argument
+// memory or fresh memory, not into other memory.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedCallFillsALocal) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_tf_l { long* p; };
+    void me_tf_init(me_tf_l* l);
+    void me_tf_from(me_tf_l* l, long* q);
+    struct me_tf_v { long a, b, c, d; };
+    void me_tf_initv(me_tf_l* l, me_tf_v v);
+    __attribute__((noinline)) void me_tf_touch(long** o) { **o = 1; }
+    extern "C" void me_tf_own(long** out) {
+      me_tf_l l;
+      me_tf_init(&l);
+      *out = l.p;
+      me_tf_touch(out);
+    }
+    extern "C" void me_tf_arg(long* q) {
+      me_tf_l l;
+      me_tf_from(&l, q);
+      *l.p = 1;
+    }
+    extern "C" void me_tf_unbounded(long** out) {
+      me_tf_l l;
+      me_tf_initv(&l, {});
+      *out = l.p;
+      me_tf_touch(out);
+    }
+  )",
+      {"me_tf_own", "me_tf_arg", "me_tf_unbounded"});
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  // As without the stored-pointer tracking.
+  EXPECT_EQ(MEs[0].TrustedOther, ModRef::None) << Describe(MEs[0]);
+  EXPECT_FALSE(MEs[0].TrustedCaptured[0]) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  // l.p may point into q's memory.
+  EXPECT_TRUE(Writes(MEs[1].TrustedParamsDirect[0]) ||
+              Writes(MEs[1].TrustedParamsReachable[0]) ||
+              Writes(MEs[1].TrustedOther))
+      << Describe(MEs[1]);
+  EXPECT_TRUE(Writes(MEs[1].Other)) << Describe(MEs[1]);
+  // The signature does not bound the call.
   EXPECT_TRUE(Writes(MEs[2].TrustedOther)) << Describe(MEs[2]);
 }

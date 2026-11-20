@@ -760,8 +760,8 @@ private:
 class FunctionReach {
 public:
   FunctionReach(ReachAnalysis& RA, const llvm::Function& F)
-      : RA(RA), F(F), N(F.arg_size()), R(N), ForeignIn(N), ForeignData(N),
-        ForeignOld(N), ForeignNew(N) {}
+      : RA(RA), F(F), N(F.arg_size()), R(N), ForeignOld(N), ForeignNew(N),
+        ForeignIn(N), ForeignData(N) {}
 
   Reach run() {
     // A load from a fresh allocation depends on the stores into it.
@@ -1880,6 +1880,45 @@ private:
         R.Params[K].ReadsData = true;
   }
 
+  // A trusted call that its signature bounds stores into the objects of
+  // \p Dst only pointers into the memory that its arguments reach, or into
+  // fresh memory, which stands for that memory too. Returns false where the
+  // arguments reach memory that no parameter or known object accounts for.
+  bool trustedFill(const llvm::CallBase& CB, const Origin& Dst, bool& Changed) {
+    if (!CB.hasFnAttr(TrustedStoresAttr))
+      return false;
+    Origin Src(N);
+    for (const llvm::Value* A : CB.args())
+      if (A->getType()->isPointerTy())
+        Src.join(holdings(originOf(A)));
+    if (leadsForeign(Src) || leadsData(Src))
+      return false;
+    Src.Loaded |= Src.Direct;
+    for (const llvm::Value* Ob : Dst.Objs) {
+      for (auto* Map : {&Holds, &HoldsPtr}) {
+        llvm::SmallBitVector& H = Map->try_emplace(Ob, N).first->second;
+        if (Src.Loaded.test(H)) {
+          H |= Src.Loaded;
+          Changed = true;
+        }
+      }
+      llvm::SmallBitVector& HA = HoldsAddr.try_emplace(Ob, N).first->second;
+      if (Src.Direct.test(HA)) {
+        HA |= Src.Direct;
+        Changed = true;
+      }
+      llvm::SmallVector<const llvm::Value*, 2>& HO = HoldsObjs[Ob];
+      for (const llvm::Value* B : Src.Objs) {
+        auto It = std::lower_bound(HO.begin(), HO.end(), B);
+        if (It == HO.end() || *It != B) {
+          HO.insert(It, B);
+          Changed = true;
+        }
+      }
+    }
+    return true;
+  }
+
   bool ownersAtCall(const llvm::CallBase& CB) {
     const Reach& S = callee(CB);
     bool Changed = false;
@@ -1918,10 +1957,11 @@ private:
       // gives nobody a pointer to store through.
       const bool Own = Writes && S.Params[K].StoresOwn &&
                        !S.Params[K].PointerCaptured && !S.RetFresh;
-      if (Writes && !Own)
-        Changed |= expose(O, /*Foreign=*/false);
       const bool Through = S.Params[K].Reachable != ModRefInfo::NoModRef;
       const Origin Deep = Through ? holdings(O) : O;
+      const bool Filled = Writes && !Own && trustedFill(CB, Deep, Changed);
+      if (Writes && !Own && !Filled)
+        Changed |= expose(O, /*Foreign=*/false);
       Params |= Deep.params();
       Addresses |= Deep.Direct;
       if (!Sink &&
@@ -1949,7 +1989,7 @@ private:
         if (!Internal && S.Params[K].Captured)
           Changed |= Owners[Ob].join(Owner{Owner::Escaped, 0});
         // A callee that writes it may store pointers of unknown origin.
-        if (!Internal && Writes && !Own)
+        if (!Internal && Writes && !Own && !Filled)
           Changed |= HoldsUnknown.insert(Ob).second;
       }
       if (Own)
