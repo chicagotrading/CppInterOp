@@ -761,7 +761,7 @@ class FunctionReach {
 public:
   FunctionReach(ReachAnalysis& RA, const llvm::Function& F)
       : RA(RA), F(F), N(F.arg_size()), R(N), ForeignOld(N), ForeignNew(N),
-        ForeignIn(N), ForeignData(N) {}
+        ForeignIn(N), ForeignData(N), ParamHolds(N, llvm::SmallBitVector(N)) {}
 
   Reach run() {
     // A load from a fresh allocation depends on the stores into it.
@@ -815,6 +815,9 @@ private:
   // Parameters whose memory may receive integer data that may hold such an
   // address: only a load of a pointer object ignores it.
   llvm::SmallBitVector ForeignData;
+  // Per parameter: the parameters whose reachable memory a trusted call may
+  // have copied pointers into from it.
+  std::vector<llvm::SmallBitVector> ParamHolds;
   // Objects that may hold such a pointer, and the fresh memory of calls
   // that store it into an argument (condition 6).
   llvm::SmallPtrSet<const llvm::Value*, 8> ObjForeign, ObjForeignData,
@@ -1010,6 +1013,8 @@ private:
   Origin loadedFrom(const Origin& O, bool PointerObject = false) const {
     Origin R(N);
     R.Loaded = O.params();
+    for (unsigned P : O.params().set_bits())
+      R.Loaded |= ParamHolds[P];
     R.Unknown = O.unowned();
     llvm::SmallBitVector Mem = O.params();
     for (const llvm::GlobalVariable* G : O.Consts)
@@ -1426,6 +1431,13 @@ private:
       if (W.K == Owner::Param)
         Held.Loaded.set(W.P);
       R.join(Held);
+    }
+    for (bool More = true; More;) {
+      llvm::SmallBitVector P = R.Loaded;
+      for (unsigned I : R.params().set_bits())
+        P |= ParamHolds[I];
+      More = P.test(R.Loaded);
+      R.Loaded |= P;
     }
     return R;
   }
@@ -1891,9 +1903,23 @@ private:
     for (const llvm::Value* A : CB.args())
       if (A->getType()->isPointerTy())
         Src.join(holdings(originOf(A)));
-    if (leadsForeign(Src) || leadsData(Src))
+    if (leadsForeign(Src)) {
+      Changed |= markForeign(Dst.params());
       return false;
+    }
+    if (leadsData(Src)) {
+      Changed |= markData(Dst.params());
+      return false;
+    }
     Src.Loaded |= Src.Direct;
+    // A parameter's memory may receive pointers into any argument's memory.
+    for (unsigned P : heldBy(Dst).set_bits()) {
+      llvm::SmallBitVector& H = ParamHolds[P];
+      if (Src.Loaded.test(H)) {
+        H |= Src.Loaded;
+        Changed = true;
+      }
+    }
     for (const llvm::Value* Ob : Dst.Objs) {
       for (auto* Map : {&Holds, &HoldsPtr}) {
         llvm::SmallBitVector& H = Map->try_emplace(Ob, N).first->second;
@@ -2633,6 +2659,12 @@ private:
         if (Exposes(A, I))
           R.Params[I].Captured = R.Params[I].AddressCaptured =
               R.Params[I].PointerCaptured = true;
+    // A trusted call that copies pointers of one parameter's memory into
+    // another's makes that memory reachable from elsewhere (condition 2).
+    for (unsigned P = 0; P < N; ++P)
+      for (unsigned Q : ParamHolds[P].set_bits())
+        if (Q != P)
+          R.Params[Q].Captured = R.Params[Q].PointerCaptured = true;
     // Code that holds a captured pointer may store into the parameter's
     // memory any foreign pointer that this code stores, and a later access
     // through that memory may reach it.

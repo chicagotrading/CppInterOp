@@ -3794,3 +3794,67 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedCallFillsALocal) {
   // The signature does not bound the call.
   EXPECT_TRUE(Writes(MEs[2].TrustedOther)) << Describe(MEs[2]);
 }
+
+// A trusted call may copy pointers from one argument's memory into another
+// argument's memory, but it keeps no copy of an argument itself.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedCallFillsAParameter) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    void me_fp_mv(long** r, long* const* qq);
+    struct me_fp_in { long* p; };
+    struct me_fp_out { me_fp_in* in; };
+    void me_fp_deep(me_fp_out* r, const me_fp_out* s);
+    // *r = *qq: the write lands in the memory that qq reaches.
+    extern "C" void me_fp_pp(long** r, long* const* qq) {
+      me_fp_mv(r, qq);
+      **r = 1;
+    }
+    // r->in = s->in: the write lands in the memory that s reaches.
+    extern "C" void me_fp_member(me_fp_out* r, const me_fp_out* s) {
+      me_fp_deep(r, s);
+      *r->in->p = 1;
+    }
+  )",
+      {"me_fp_pp", "me_fp_member"});
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(AllBounded(ME)) << OpaqueNames(ME);
+    EXPECT_TRUE(Writes(ME.TrustedParamsReachable[1]) || Writes(ME.TrustedOther))
+        << Describe(ME);
+    // The pointers of qq's memory now also live in r's memory.
+    EXPECT_TRUE(ME.TrustedCaptured[1]) << Describe(ME);
+  }
+}
+
+// The trusted fill of a fresh allocation, without a store into the table.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedFillOfFreshMemory) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_ff_table { int** slots; int own; };
+    void me_ff_fill(int** slots);
+    extern "C" void me_ff_c(me_ff_table* t) {
+      int** fresh = new int*[2];
+      fresh[0] = &t->own;
+      me_ff_fill(fresh);
+      *fresh[1] = 1;
+      delete[] fresh;
+    }
+  )",
+      {"me_ff_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  // fresh[1] points into the allocation or into *t, not into other memory.
+  // Through &t->own the callee may also reach what *t holds.
+  EXPECT_EQ(MEs[0].TrustedOther, ModRef::None) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].TrustedParamsDirect[0])) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].TrustedParamsReachable[0])) << Describe(MEs[0]);
+}
