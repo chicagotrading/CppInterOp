@@ -4228,3 +4228,34 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_OldReadOnlyEntryCopiesNothing) {
   EXPECT_EQ(MEs[0].Other, ModRef::None) << Describe(MEs[0]);
   EXPECT_FALSE(MEs[0].Captured[0]) << Describe(MEs[0]);
 }
+
+// A string from a table entry, copied by characters into memory that holds
+// integer data of a global: the characters are no pointers.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CharacterCopyIntoDataMemory) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  SKIP_ON_LIBCXX("expects the string layout of libstdc++");
+  TestFixture::CreateInterpreter({"-O0", "-std=c++20"});
+  const std::string Table =
+      SummaryHeader() +
+      "_Z10me_cd_makeB5cxx11i\tFF\t-.-.\twn\tnn\too\tn\t...220\t.\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+  ASSERT_EQ(Cpp::Declare("#include <string>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    inline long me_cd_g = 0;
+    struct me_cd_box { long n; std::string s; };
+    std::string me_cd_make(int k);
+    me_cd_box me_cd_get(int k) {
+      const std::string s = me_cd_make(k);
+      return me_cd_box{me_cd_g, s};
+    }
+    extern "C" void me_cd_c(void* out, const int* k) {
+      ::new (out) me_cd_box(me_cd_get(*k));
+    }
+  )",
+      {"me_cd_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_FALSE(Writes(MEs[0].TrustedOther)) << Describe(MEs[0]);
+}

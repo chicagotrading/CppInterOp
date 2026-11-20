@@ -1858,8 +1858,12 @@ private:
           const Origin Src = originOf(MT->getRawSource());
           const Origin Dst = originOf(MT->getRawDest());
           const llvm::SmallBitVector Ptr = pointersLoaded(Src, readOf(*MT));
-          Changed |= recordCopy(loadedFrom(Src), Dst, &Ptr);
           const Origin Bits = loadedFrom(Src);
+          // Characters and pointer-free data hold no pointer; integer data
+          // that may hold an address is tracked apart (storeForeign).
+          const bool Data = readOf(*MT) != ReadAs::Bytes;
+          Changed |= recordCopy(
+              Data ? loadedFrom(Src, /*PointerObject=*/true) : Bits, Dst, &Ptr);
           // Data and characters may hold an address as data.
           if (readOf(*MT) == ReadAs::Bytes)
             Changed |= storeForeign(Bits, Dst);
@@ -2042,11 +2046,32 @@ private:
   bool trustedFill(const llvm::CallBase& CB, const Origin& Dst, bool& Changed) {
     if (!CB.hasFnAttr(TrustedStoresAttr))
       return false;
-    Origin Src(N);
-    // The call reads no integer data as a pointer.
-    for (const llvm::Value* A : CB.args())
-      if (A->getType()->isPointerTy())
-        Src.join(holdings(originOf(A), nullptr, /*Typed=*/true));
+    // The call reads no integer data as a pointer. It keeps no copy of an
+    // argument, so it stores only what the arguments' memory holds.
+    Origin Src(N), Held(N);
+    for (const llvm::Value* A : CB.args()) {
+      if (!A->getType()->isPointerTy())
+        continue;
+      const Origin O = originOf(A);
+      Src.join(holdings(O, nullptr, /*Typed=*/true));
+      Origin C(N);
+      C.Loaded = O.params();
+      for (const llvm::Value* Ob : O.Objs) {
+        if (auto H = HoldsTyped.find(Ob); H != HoldsTyped.end())
+          C.Loaded |= H->second;
+        if (auto H = HoldsAddr.find(Ob); H != HoldsAddr.end())
+          C.Direct |= H->second;
+        if (auto H = HoldsObjs.find(Ob); H != HoldsObjs.end())
+          for (const llvm::Value* B : H->second)
+            if (!llvm::is_contained(C.Objs, B))
+              C.Objs.push_back(B);
+        Owner W = Owners.lookup(Ob);
+        if (W.K == Owner::Param)
+          C.Loaded.set(W.P);
+      }
+      llvm::sort(C.Objs);
+      Held.join(holdings(C, nullptr, /*Typed=*/true));
+    }
     if (leadsForeign(Src)) {
       ForeignDeep |= Dst.Loaded.any();
       Changed |= markForeign(Dst.params(), Dst.Loaded.any());
@@ -2057,6 +2082,7 @@ private:
       Changed |= markData(Dst.params());
       return false;
     }
+    Src = Held;
     Src.Loaded |= Src.Direct;
     // A parameter's memory may receive pointers into any argument's memory.
     for (unsigned P : heldBy(Dst).set_bits()) {
