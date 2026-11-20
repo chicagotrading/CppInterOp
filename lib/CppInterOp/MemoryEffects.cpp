@@ -774,15 +774,23 @@ private:
   }
 
   Reach analyze(const llvm::Function& F);
+
+public:
+  // The effects of \p F for its own caller, who passes integers that may
+  // hold any address. A summary for other calls leaves them to the caller.
+  Reach top(const llvm::Function& F);
 };
 
 // The analysis of one function body.
 class FunctionReach {
 public:
-  FunctionReach(ReachAnalysis& RA, const llvm::Function& F)
-      : RA(RA), F(F), N(F.arg_size()), R(N), ForeignOld(N), ForeignNew(N),
-        ForeignIn(N), ForeignInDeep(N), ForeignData(N),
-        ParamHolds(N, llvm::SmallBitVector(N)) {}
+  // With \p OwnIntegers, an integer parameter may hold any address. Without,
+  // the caller checks the integers that it passes (keepsForeign).
+  FunctionReach(ReachAnalysis& RA, const llvm::Function& F,
+                bool OwnIntegers = false)
+      : RA(RA), F(F), N(F.arg_size()), OwnIntegers(OwnIntegers), R(N),
+        ForeignOld(N), ForeignNew(N), ForeignIn(N), ForeignInDeep(N),
+        ForeignData(N), ParamHolds(N, llvm::SmallBitVector(N)) {}
 
   Reach run() {
     // A load from a fresh allocation depends on the stores into it.
@@ -799,6 +807,7 @@ private:
   ReachAnalysis& RA;
   const llvm::Function& F;
   const unsigned N;
+  const bool OwnIntegers;
   Reach R;
   llvm::DenseMap<const llvm::Value*, Origin> Origins;
   llvm::DenseMap<const llvm::CallBase*, Reach> Calls;
@@ -1192,6 +1201,8 @@ private:
     // An argument, a call result or another value: the taint and the
     // origins keep what they know; the rest is unknown.
     O = carried(V);
+    if (llvm::isa<llvm::Argument>(V) && !OwnIntegers)
+      return O;
     O.Unknown |= !DataStore;
     Data |= DataStore;
     return O;
@@ -1926,7 +1937,11 @@ private:
     for (unsigned J = 0; J < CB.arg_size(); ++J) {
       if (J == K || !S.Params[J].PointerCaptured)
         continue;
-      const Origin C = carried(CB.getArgOperand(J));
+      const llvm::Value* A = CB.getArgOperand(J);
+      if (OwnIntegers && llvm::isa<llvm::Argument>(A) &&
+          !A->getType()->isPointerTy())
+        return true;
+      const Origin C = carried(A);
       if (Data ? leadsData(C) : leadsForeign(C))
         return true;
     }
@@ -2831,6 +2846,11 @@ Reach ReachAnalysis::analyze(const llvm::Function& F) {
   return FunctionReach(*this, F).run();
 }
 
+Reach ReachAnalysis::top(const llvm::Function& F) {
+  of(F);
+  return FunctionReach(*this, F, /*OwnIntegers=*/true).run();
+}
+
 // Whether \p P may point into a union: through its GEPs, a local or a
 // global of union type, or a GEP that indexes one.
 bool InUnion(const llvm::Value* P) {
@@ -3413,7 +3433,7 @@ struct Variant {
 
 Variant ReadVariant(const llvm::Function& F, ReachAnalysis& RA) {
   Variant V;
-  const Reach& R = RA.of(F);
+  const Reach R = RA.top(F);
   V.Other = ToModRef(R.Other);
   Cpp::ModRef ArgMem =
       ToModRef(F.getMemoryEffects().getModRef(llvm::IRMemLocation::ArgMem));

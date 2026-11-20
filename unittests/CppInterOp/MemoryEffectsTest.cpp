@@ -4017,3 +4017,103 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryWritesForeignStores) {
   EXPECT_FALSE(Bits(Own[0]) & 1) << Table;
   EXPECT_EQ(Own[2], '0') << Table;
 }
+
+// A callee stores its integer argument into heap memory of its object. At
+// -O0 no type proves it data; the caller knows the integer it passes.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerArgumentIntoAWindow) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt, "-std=c++20"});
+    ASSERT_EQ(Cpp::Declare("#include <algorithm>\n#include <cmath>\n"
+                           "#include <cstdint>\n#include <limits>\n"
+                           "#include <stdexcept>\n#include <vector>"),
+              0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      namespace me_iw_ns {
+      template <class T, std::size_t C> struct Ring {
+        Ring() { m_buffer.resize(C); }
+        std::size_t size() const { return m_write - m_read; }
+        bool empty() const { return m_write == m_read; }
+        T& operator[](std::size_t i) { return m_buffer[(m_read + i) & (C - 1)]; }
+        void push_back(const T& v) {
+          m_buffer[m_write & (C - 1)] = v;
+          if (++m_write - m_read > C)
+            ++m_read;
+        }
+        T pop_front() {
+          if (empty())
+            throw std::runtime_error("pop_front on an empty buffer");
+          return m_buffer[m_read++ & (C - 1)];
+        }
+        std::vector<T> m_buffer;
+        std::size_t m_write = 0, m_read = 0;
+      };
+      struct Window {
+        struct Rec { std::int64_t t{}; double v{}; };
+        void update(std::int64_t now, double value, double ms) {
+          if (now > 0 && value != 0) m_buffer.push_back({now, value});
+          while (m_buffer.size() > 1 && now - m_buffer[1].t >= ms * 1e6)
+            m_buffer.pop_front();
+          m_value = m_buffer[0].v;
+          m_age = std::clamp(double(now - m_buffer[0].t), 0.0, ms * 1e6);
+        }
+        Ring<Rec, 1024> m_buffer;
+        double m_value{}, m_age{};
+      };
+      struct State { bool off; double value, age; Window w; };
+      }
+      extern "C" void me_iw_c(me_iw_ns::State* s, const std::int64_t* now,
+                              const double* v, const double* ms) {
+        if (s->off) return;
+        s->w.update(*now, *v, *ms);
+        s->value = s->w.m_value;
+        s->age = s->w.m_age;
+      }
+    )",
+        {"me_iw_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid) << Opt;
+    EXPECT_EQ(MEs[0].TrustedOther, ModRef::None) << Opt << Describe(MEs[0]);
+    EXPECT_FALSE(MEs[0].TrustedCaptured[0]) << Opt << Describe(MEs[0]);
+    EXPECT_TRUE(Writes(MEs[0].TrustedParamsReachable[0])) << Opt;
+  }
+}
+
+// The out-of-line rehash policy of a hash set, from a table entry with the
+// stored-pointer flags: inserting into a set of integers is no foreign write.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_HashSetWithPolicyEntries) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  SKIP_ON_LIBCXX("expects the out-of-line rehash policy of libstdc++");
+  const std::string E = llvm::utohexstr(
+      llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::ModRef).toIntValue());
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt, "-std=c++20"});
+    const std::string Table =
+        SummaryHeader() +
+        "_ZNKSt8__detail20_Prime_rehash_policy14_M_need_rehashEmmm\t" + E +
+        "\t-c-.-.-.\tmnnn\tnnnn\t....\tn\t.....00000\t.\n" +
+        "_ZNKSt8__detail20_Prime_rehash_policy11_M_next_bktEm\t" + E +
+        "\t-c-.\tmn\tnn\t..\tn\t...000\t.\n";
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 2);
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <unordered_set>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      struct me_hs_state { bool off; std::unordered_set<std::uint64_t> ids; };
+      extern "C" void me_hs_c(me_hs_state* s, const bool* clear,
+                              const std::uint64_t* id) {
+        if (s->off) return;
+        if (*clear) s->ids.clear();
+        s->ids.insert(*id);
+      }
+    )",
+        {"me_hs_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid) << Opt;
+    EXPECT_TRUE(MEs[0].Opaque.empty()) << OpaqueNames(MEs[0]);
+    EXPECT_EQ(MEs[0].Other, ModRef::None) << Opt << Describe(MEs[0]);
+    EXPECT_FALSE(MEs[0].Captured[0]) << Opt << Describe(MEs[0]);
+    EXPECT_TRUE(Writes(MEs[0].ParamsReachable[0])) << Opt;
+  }
+}
