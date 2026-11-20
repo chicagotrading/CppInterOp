@@ -3858,3 +3858,84 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedFillOfFreshMemory) {
   EXPECT_TRUE(Writes(MEs[0].TrustedParamsDirect[0])) << Describe(MEs[0]);
   EXPECT_TRUE(Writes(MEs[0].TrustedParamsReachable[0])) << Describe(MEs[0]);
 }
+
+// A getter that returns a string and may throw: the exception runtime and a
+// trusted string allocation add no effect on the receiver.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ThrowingGetterOfAString) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("expects the string layout of libstdc++");
+  TestFixture::CreateInterpreter({"-O2", "-std=c++20"});
+  ASSERT_EQ(Cpp::Declare("#include <new>\n#include <optional>\n"
+                         "#include <stdexcept>\n#include <string>\n"
+                         "#include <vector>"),
+            0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_tg_sym {
+      std::vector<std::string> m;
+      std::optional<std::string> p1(int s, long u) const {
+        if (u < 0 || u >= (long)m.size()) throw std::runtime_error("no p1");
+        if (s < 0) return std::nullopt;
+        return m[u];
+      }
+      std::string name(long k) const {
+        if (k < 0) throw std::runtime_error("neg");
+        return m[k];
+      }
+    };
+    struct me_tg_api {
+      const me_tg_sym& s;
+      std::optional<std::string> get(int a, long u) const { return s.p1(a, u); }
+    };
+    extern "C" void me_tg_discard(const me_tg_api* r, int* a, long* u) {
+      (void)(*r).get(*a, *u);
+    }
+    extern "C" void me_tg_keep(const me_tg_api* r, int* a, long* u, void* out) {
+      ::new (out) std::optional<std::string>((*r).get(*a, *u));
+    }
+    extern "C" void me_tg_name(const me_tg_sym* c, long* k, void* out) {
+      ::new (out) std::string(c->name(*k));
+    }
+  )",
+      {"me_tg_discard", "me_tg_keep", "me_tg_name"});
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_FALSE(MEs[0].TrustedCaptured[0]) << Describe(MEs[0]);
+  EXPECT_EQ(MEs[1].TrustedOther, ModRef::None) << Describe(MEs[1]);
+  // A trusted allocation of the result may return unknown memory, which the
+  // copy writes; nothing reads other memory.
+  EXPECT_FALSE(static_cast<unsigned>(MEs[2].TrustedOther) &
+               static_cast<unsigned>(ModRef::Read))
+      << Describe(MEs[2]);
+  EXPECT_EQ(MEs[2].TrustedParamsReachable[0], ModRef::Read) << Describe(MEs[2]);
+}
+
+// A parameter captured into a local holder; a callee stores a global through
+// the holder. The capture post-pass must not need the holder's object.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           MemoryEffects_ForeignStoreThroughALocalHolder) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_lh_g = 0;
+    struct me_lh_h { long** p; };
+    __attribute__((noinline)) void me_lh_put(const me_lh_h* h) {
+      *h->p = &me_lh_g;
+    }
+    extern "C" void me_lh_c(long** p) {
+      me_lh_h h{p};
+      me_lh_put(&h);
+      **p = 1;
+    }
+  )",
+      {"me_lh_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].TrustedOther)) << Describe(MEs[0]);
+}
