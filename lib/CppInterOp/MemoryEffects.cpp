@@ -479,6 +479,14 @@ constexpr llvm::StringLiteral TrustedCallAttr = "cppinterop-trusted-call";
 // declaration of a summary may state it too.
 constexpr llvm::StringLiteral TrustedStoresAttr = "cppinterop-trusted-stores";
 
+// Whether \p V is a load of an integer object.
+bool DataLoad(const llvm::Value* V) {
+  const auto* L = llvm::dyn_cast<llvm::LoadInst>(V);
+  return L && L->getType()->isIntegerTy() &&
+         (L->getMetadata(IntegerLoadKind) || L->getMetadata(PointerFreeKind) ||
+          DataAccess(*L));
+}
+
 // Whether load \p I reads an object of pointer type: its alias tag, from
 // the frontend or from MarkIntegerLoads, names a pointer type. Under the C++
 // object model such a read does not see the bytes of an integer object.
@@ -1137,9 +1145,13 @@ private:
     if (I.getOpcode() == llvm::Instruction::Sub && intOrigin(I.getOperand(0)) &&
         intOrigin(I.getOperand(1)))
       return O; // the difference of two addresses
+    // A computation on integer data is data; a copy keeps what it copies.
+    const bool Computes =
+        !llvm::isa<llvm::PHINode>(I) && !llvm::isa<llvm::SelectInst>(I) &&
+        !llvm::isa<llvm::FreezeInst>(I) && !llvm::isa<llvm::CastInst>(I);
     if (arithmetic(I))
       for (const llvm::Value* Op : I.operands())
-        if (wide(Op->getType()))
+        if (wide(Op->getType()) && !(Computes && DataLoad(Op)))
           O.join(originOf(Op));
     return O;
   }
@@ -1916,7 +1928,8 @@ private:
     bool Changed =
         Deep ? FreshCalls.insert(&CB).second : HoldsUnknown.insert(&CB).second;
     Changed |= HeldFresh.insert(&CB).second;
-    Origin Self = reachable(O, &CB);
+    // Integer data that may hold an address is tracked apart (ObjForeignData).
+    Origin Self = reachable(O, &CB, /*PointerObject=*/true);
     Origin Fresh(N);
     Fresh.Objs.push_back(&CB);
     Self.join(Fresh);
@@ -2472,7 +2485,7 @@ private:
   void storeIntoByCall(const llvm::CallBase& CB, const Reach& S, unsigned K) {
     Origin Dst = originOf(CB.getArgOperand(K));
     if (llvm::isModSet(S.Params[K].Reachable))
-      Dst = reachable(Dst);
+      Dst = reachable(Dst, nullptr, /*PointerObject=*/true);
     auto [Old, New] = memoryOf(Dst);
     if (!S.Params[K].StoresOwn)
       ForeignOld |= Old;
@@ -3613,6 +3626,17 @@ bool ParseVariant(llvm::ArrayRef<llvm::StringRef> Fields, SummaryVariant& V) {
     return false;
   if (!Flags) {
     V.R.OtherForeign = llvm::isModSet(V.R.Other);
+    // Without any write, the callee stores and copies nothing; a captured
+    // pointer gets no foreign store during the call either.
+    bool AnyWrite = llvm::isModSet(V.R.Other);
+    for (const ParamReach& P : V.R.Params)
+      AnyWrite |= llvm::isModSet(P.Direct | P.Reachable);
+    for (ParamReach& P : V.R.Params) {
+      P.CopiesData &= AnyWrite;
+      if (!llvm::isModSet(P.Direct | P.Reachable))
+        P.StoresForeign = P.StoresForeignData =
+            P.PointerCaptured && llvm::isModSet(V.R.Other);
+    }
     return true;
   }
   if (Ret.back() != '0' && Ret.back() != '1')

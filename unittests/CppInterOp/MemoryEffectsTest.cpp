@@ -4117,3 +4117,114 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_HashSetWithPolicyEntries) {
     EXPECT_TRUE(Writes(MEs[0].ParamsReachable[0])) << Opt;
   }
 }
+
+// Two handles: integer data of one handle's memory added into the memory of
+// the other is no copy of a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SumOfTwoHandles) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      struct me_sh_impl { long v = 0; };
+      inline me_sh_impl me_sh_g;
+      struct me_sh_handle { me_sh_impl* impl = &me_sh_g; };
+      inline long me_sh_poke(const me_sh_handle& a, const me_sh_handle& b) {
+        a.impl->v += b.impl->v;
+        return a.impl->v;
+      }
+      extern "C" void me_sh_c(const me_sh_handle* a, const me_sh_handle* b) {
+        (void)me_sh_poke(*a, *b);
+      }
+    )",
+        {"me_sh_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid) << Opt;
+    EXPECT_FALSE(MEs[0].Captured[1]) << Opt << Describe(MEs[0]);
+    EXPECT_EQ(MEs[0].ParamsReachable[1], ModRef::Read) << Opt;
+    EXPECT_TRUE(Writes(MEs[0].ParamsReachable[0])) << Opt;
+  }
+}
+
+// A table entry of a function that copies integer data of a global into
+// the object it returns. The caller frees the buffer of the result.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ResultFilledFromAGlobal) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %S = type { ptr, i64, i64 }
+    @me_rg_g = global %S zeroinitializer
+    declare noalias ptr @_Znwm(i64)
+    define void @_Z10me_rg_copyv(ptr sret(%S) %r) {
+      %np = getelementptr i8, ptr @me_rg_g, i64 8
+      %n = load i64, ptr %np, !tbaa !1, !cppinterop.integer !5
+      %b = call ptr @_Znwm(i64 %n)
+      store ptr %b, ptr %r, !tbaa !4
+      %rn = getelementptr i8, ptr %r, i64 8
+      store i64 %n, ptr %rn, !tbaa !1, !cppinterop.integer !5
+      %rc = getelementptr i8, ptr %r, i64 16
+      store i64 %n, ptr %rc, !tbaa !1, !cppinterop.integer !5
+      ret void
+    }
+    !0 = !{!"me root"}
+    !2 = !{!"long", !0, i64 0}
+    !1 = !{!2, !2, i64 0}
+    !3 = !{!"any pointer", !0, i64 0}
+    !4 = !{!3, !3, i64 0}
+    !5 = !{}
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  // The integer marks are what MarkIntegerLoads gives the -O0 code.
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1) << Table;
+  ASSERT_EQ(Cpp::Declare("#include <new>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_rg_s { char* p; long n; long c; };
+    me_rg_s me_rg_copy();
+    extern "C" void me_rg_c() {
+      me_rg_s s = me_rg_copy();
+      ::operator delete(s.p, s.c);
+    }
+  )",
+      {"me_rg_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(MEs[0].Opaque.empty()) << OpaqueNames(MEs[0]);
+  // The read of the global; the buffer is fresh memory.
+  EXPECT_EQ(MEs[0].Other, ModRef::Read) << Table << Describe(MEs[0]);
+}
+
+// An old-format entry of a function that writes nothing stores and copies
+// nothing.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_OldReadOnlyEntryCopiesNothing) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  TestFixture::CreateInterpreter({"-O2"});
+  const std::string E = llvm::utohexstr(
+      (llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::Ref) |
+       llvm::MemoryEffects::inaccessibleMemOnly(llvm::ModRefInfo::ModRef))
+          .toIntValue());
+  const std::string Table = SummaryHeader() + "_Z9me_or_logPKcRKl\t" + E +
+                            "\trcrc\trr\trr\t..\tn\t...\t.\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    void me_or_log(const char* fmt, const long& v);
+    struct me_or_box { long* p; long n; };
+    extern "C" void me_or_c(me_or_box* b, const long* v) {
+      b->n = *v;
+      me_or_log("{}", b->n);
+      *b->p = 1;
+    }
+  )",
+      {"me_or_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Other, ModRef::None) << Describe(MEs[0]);
+  EXPECT_FALSE(MEs[0].Captured[0]) << Describe(MEs[0]);
+}
