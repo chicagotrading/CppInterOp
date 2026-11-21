@@ -969,6 +969,17 @@ private:
     return O;
   }
 
+  // Whether an integer object in \p C may hold an address.
+  static bool integerAddress(const llvm::Constant* C) {
+    if (C->getType()->isPointerTy() || llvm::isa<llvm::ConstantData>(C))
+      return false;
+    if (llvm::isa<llvm::ConstantAggregate>(C))
+      return llvm::any_of(C->operands(), [](const llvm::Value* Op) {
+        return integerAddress(llvm::cast<llvm::Constant>(Op));
+      });
+    return true;
+  }
+
   // The memory that a load from constant global \p GV may point to.
   Origin contentOf(const llvm::GlobalVariable* GV) const {
     if (!GV->hasDefinitiveInitializer()) {
@@ -1460,21 +1471,27 @@ private:
   // Pointers of origin \p Src, stored into memory of origin \p Dst, may
   // lead to memory that no parameter or known object accounts for.
   // With \p Data, integer data of \p Src may hold such an address.
-  bool storeForeign(const Origin& Src, const Origin& Dst, bool Data = false) {
+  // With \p Integer, the store writes an integer or an integer object.
+  bool storeForeign(const Origin& Src, const Origin& Dst, bool Data = false,
+                    bool Integer = false) {
     // Only a store through a loaded or unknown pointer may reach a captured
     // parameter's memory through the capture; an object is no parameter's.
     const bool Deep = Dst.Loaded.any() || Dst.unowned() || !Dst.Consts.empty();
+    bool Changed = false;
     if (leadsForeign(Src)) {
       ForeignDeep |= Deep;
-      bool Changed = markForeign(heldBy(Dst), Deep);
+      Changed |= markForeign(heldBy(Dst), Deep);
       for (const llvm::Value* A : Dst.Objs)
         Changed |= ObjForeign.insert(A).second;
-      return Changed;
-    }
-    if (!Data && !leadsData(Src))
+      // An address in an integer object is also integer data: a copy of
+      // that data, and arithmetic on it, carry the address.
+      if (!Integer)
+        return Changed;
+    } else if (!Data && !leadsData(Src)) {
       return false;
+    }
     DataDeep |= Deep;
-    bool Changed = markData(heldBy(Dst));
+    Changed |= markData(heldBy(Dst));
     for (const llvm::Value* A : Dst.Objs)
       Changed |= ObjForeignData.insert(A).second;
     return Changed;
@@ -1549,6 +1566,11 @@ private:
   bool leadsData(const Origin& O) const {
     const Origin H = holdings(O);
     return H.params().anyCommon(ForeignData) ||
+           llvm::any_of(H.Consts,
+                        [](const llvm::GlobalVariable* G) {
+                          return !G->hasDefinitiveInitializer() ||
+                                 integerAddress(G->getInitializer());
+                        }) ||
            llvm::any_of(H.Objs, [&](const llvm::Value* A) {
              return ObjForeignData.count(A);
            });
@@ -1880,7 +1902,11 @@ private:
           Changed |= recordCopy(Src, Dst, &Ptr, Data);
           bool FData;
           const Origin FS = foreignSource(SI->getValueOperand(), *SI, FData);
-          Changed |= storeForeign(FS, Dst, FData);
+          // Passes may store an address as a pointer into an integer object.
+          Changed |=
+              storeForeign(FS, Dst, FData,
+                           SI->getValueOperand()->getType()->isIntegerTy() ||
+                               DataAccess(*SI));
           Changed |= otherWrite(Dst, FS, FData);
         } else if (const auto* MT = llvm::dyn_cast<llvm::MemTransferInst>(&I)) {
           const Origin Src = originOf(MT->getRawSource());

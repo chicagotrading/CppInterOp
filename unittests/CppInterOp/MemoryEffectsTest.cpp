@@ -4454,3 +4454,99 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MergedIntegerLoadStaysData) {
   ASSERT_EQ(Row.size(), 9u) << Table;
   EXPECT_EQ(Row[5][0], 's') << Table;
 }
+
+// A local holds an address as an integer. A callee stores a sum or a
+// tagged form of it into the argument, and the caller reads the argument
+// back as a pointer and writes through it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ArithmeticOnAnAddressInData) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_ad_g[8] = {};
+      struct me_ad_f { uintptr_t a; };
+      __attribute__((noinline)) void me_ad_addk(me_ad_f* d, const me_ad_f* s) {
+        d->a = s->a + 8;
+      }
+      __attribute__((noinline)) void me_ad_tag(me_ad_f* d, const me_ad_f* s) {
+        d->a = (s->a & ~uintptr_t(7)) | 1;
+      }
+      __attribute__((noinline)) void me_ad_poke(const void* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      __attribute__((noinline)) void me_ad_untag(const me_ad_f* d) {
+        *reinterpret_cast<long*>(d->a & ~uintptr_t(7)) = 1;
+      }
+      extern "C" void me_ad_sum(me_ad_f* d) {
+        me_ad_f s{(uintptr_t)&me_ad_g[0]};
+        me_ad_addk(d, &s);
+        me_ad_poke(d);
+      }
+      extern "C" void me_ad_tagged(me_ad_f* d) {
+        me_ad_f s{(uintptr_t)&me_ad_g[0]};
+        me_ad_tag(d, &s);
+        me_ad_untag(d);
+      }
+    )",
+        {"me_ad_sum", "me_ad_tagged"});
+    ASSERT_EQ(MEs.size(), 2u);
+    for (const Cpp::MemoryEffects& ME : MEs) {
+      ASSERT_TRUE(ME.Valid) << Opt;
+      EXPECT_TRUE(Writes(ME.Other)) << Opt << Describe(ME);
+      EXPECT_TRUE(Writes(ME.TrustedOther)) << Opt << Describe(ME);
+    }
+  }
+}
+
+// As above, with the callee as a table entry that the summarizer writes
+// from its -O0 body.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ArithmeticOnAnAddressInATable) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %F = type { i64 }
+    define void @me_at_addk(ptr %d, ptr %s) optnone noinline {
+      %dp = alloca ptr
+      %sp = alloca ptr
+      store ptr %d, ptr %dp
+      store ptr %s, ptr %sp
+      %s1 = load ptr, ptr %sp
+      %sa = getelementptr inbounds %F, ptr %s1, i32 0, i32 0
+      %v = load i64, ptr %sa
+      %w = add i64 %v, 8
+      %d1 = load ptr, ptr %dp
+      %da = getelementptr inbounds %F, ptr %d1, i32 0, i32 0
+      store i64 %w, ptr %da
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  TestFixture::CreateInterpreter({"-O0"});
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1) << Table;
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    inline long me_at_g[8] = {};
+    struct me_at_f { uintptr_t a; };
+    extern "C" void me_at_addk(me_at_f* d, const me_at_f* s);
+    extern "C" void me_at_c(me_at_f* d) {
+      me_at_f s{(uintptr_t)&me_at_g[0]};
+      me_at_addk(d, &s);
+      long* q;
+      std::memcpy(&q, d, sizeof q);
+      *q = 1;
+    }
+  )",
+      {"me_at_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Table << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].TrustedOther)) << Table << Describe(MEs[0]);
+}
