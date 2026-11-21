@@ -1184,9 +1184,17 @@ private:
         !llvm::isa<llvm::FreezeInst>(I) && !llvm::isa<llvm::CastInst>(I);
     if (arithmetic(I))
       for (const llvm::Value* Op : I.operands())
-        if (wide(Op->getType()) && !(Computes && DataLoad(Op)))
+        if (wide(Op->getType()) && !(Computes && plainData(Op)))
           O.join(originOf(Op));
     return O;
+  }
+
+  // Whether \p V is a load of an integer object whose memory holds no
+  // integer data that may hold an address.
+  bool plainData(const llvm::Value* V) const {
+    return DataLoad(V) &&
+           !dataIn(
+               originOf(llvm::cast<llvm::LoadInst>(V)->getPointerOperand()));
   }
 
   // Whether the integer \p V may carry an address that the origins know.
@@ -2012,6 +2020,17 @@ private:
       if (OwnIntegers && llvm::isa<llvm::Argument>(A) &&
           !A->getType()->isPointerTy())
         return true;
+      if (Data && !A->getType()->isPointerTy()) {
+        // The callee keeps the integer as an integer object: any address
+        // that it may carry is integer data there.
+        bool FD = false;
+        llvm::SmallBitVector From(N);
+        llvm::SmallPtrSet<const llvm::Value*, 8> Seen;
+        const Origin FS = foreignSource(A, /*DataStore=*/true, FD, From, Seen);
+        if (FD || leadsForeign(FS) || leadsData(FS))
+          return true;
+        continue;
+      }
       const Origin C = carried(A);
       if (Data ? leadsData(C) : leadsForeign(C))
         return true;
@@ -2232,9 +2251,11 @@ private:
         for (const llvm::Value* Ob : D.Objs)
           Changed |= ObjForeign.insert(Ob).second;
         Changed |= ObjForeign.insert(&CB).second;
-      } else if (!Sink && (S.Params[K].StoresForeignData ||
-                           (Writes && keepsForeign(CB, S, K, true)) ||
-                           (Writes && readsData(CB, S)))) {
+      }
+      // An address that the callee stores as an integer is also integer data.
+      if (!Sink && (S.Params[K].StoresForeignData ||
+                    (Writes && keepsForeign(CB, S, K, true)) ||
+                    (Writes && readsData(CB, S)))) {
         const Origin D = holdings(O);
         DataDeep = true;
         Changed |= markData(heldBy(D));

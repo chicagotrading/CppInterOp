@@ -4550,3 +4550,243 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ArithmeticOnAnAddressInATable) {
   EXPECT_TRUE(Writes(MEs[0].Other)) << Table << Describe(MEs[0]);
   EXPECT_TRUE(Writes(MEs[0].TrustedOther)) << Table << Describe(MEs[0]);
 }
+
+// A callee puts an address into an integer object, or passes it on as an
+// integer result or argument. Another callee adds to it. The caller reads
+// the result back as a pointer and writes through it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressDataFromCallees) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_cd_g[8] = {};
+      struct me_cd_f { uintptr_t a; };
+      struct me_cd_big { uintptr_t a; long pad[8]; };
+      __attribute__((noinline)) void me_cd_seta(me_cd_f* f, uintptr_t a) {
+        f->a = a;
+      }
+      __attribute__((noinline)) void me_cd_seta2(me_cd_f* f, uintptr_t a) {
+        me_cd_seta(f, a);
+      }
+      __attribute__((noinline)) void me_cd_addk(me_cd_f* d,
+                                                const me_cd_f* s) {
+        d->a = s->a + 8;
+      }
+      __attribute__((noinline)) void me_cd_addb(me_cd_f* d,
+                                                const me_cd_big* s) {
+        d->a = s->a + 8;
+      }
+      __attribute__((noinline)) void me_cd_fill(me_cd_big* d) {
+        me_cd_big t{};
+        t.a = (uintptr_t)&me_cd_g[0];
+        std::memcpy(d, &t, sizeof t);
+      }
+      __attribute__((noinline)) uintptr_t me_cd_rd(const me_cd_f* s) {
+        return s->a;
+      }
+      __attribute__((noinline)) void me_cd_add8(me_cd_f* d, uintptr_t v) {
+        d->a = v + 8;
+      }
+      __attribute__((noinline)) void me_cd_poke(const void* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      extern "C" void me_cd_set(me_cd_f* d) {
+        me_cd_f s{0};
+        me_cd_seta(&s, (uintptr_t)&me_cd_g[0]);
+        me_cd_addk(d, &s);
+        me_cd_poke(d);
+      }
+      extern "C" void me_cd_set2(me_cd_f* d) {
+        me_cd_f s{0};
+        me_cd_seta2(&s, (uintptr_t)&me_cd_g[0]);
+        me_cd_addk(d, &s);
+        me_cd_poke(d);
+      }
+      extern "C" void me_cd_copy(me_cd_f* d) {
+        me_cd_big s;
+        me_cd_fill(&s);
+        me_cd_addb(d, &s);
+        me_cd_poke(d);
+      }
+      extern "C" void me_cd_split(me_cd_f* d) {
+        me_cd_f s{(uintptr_t)&me_cd_g[0]};
+        me_cd_add8(d, me_cd_rd(&s));
+        me_cd_poke(d);
+      }
+    )",
+        {"me_cd_set", "me_cd_set2", "me_cd_copy", "me_cd_split"});
+    ASSERT_EQ(MEs.size(), 4u);
+    for (size_t K = 0; K < MEs.size(); ++K) {
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+      EXPECT_TRUE(Writes(MEs[K].Other)) << Opt << " " << K << Describe(MEs[K]);
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Describe(MEs[K]);
+    }
+  }
+}
+
+// The callees above as table entries that the summarizer writes from their
+// -O0 bodies.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressDataThroughTables) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %struct.me_ct_f = type { i64 }
+    %struct.me_ct_big = type { i64, [8 x i64] }
+    @me_ct_g = global [8 x i64] zeroinitializer
+    define void @me_ct_seta(ptr %f, i64 %a) optnone noinline {
+    entry:
+      %f.addr = alloca ptr
+      %a.addr = alloca i64
+      store ptr %f, ptr %f.addr
+      store i64 %a, ptr %a.addr
+      %0 = load i64, ptr %a.addr
+      %1 = load ptr, ptr %f.addr
+      %a1 = getelementptr inbounds nuw %struct.me_ct_f, ptr %1, i32 0, i32 0
+      store i64 %0, ptr %a1
+      ret void
+    }
+    define void @me_ct_seta2(ptr %f, i64 %a) optnone noinline {
+    entry:
+      %f.addr = alloca ptr
+      %a.addr = alloca i64
+      store ptr %f, ptr %f.addr
+      store i64 %a, ptr %a.addr
+      %0 = load ptr, ptr %f.addr
+      %1 = load i64, ptr %a.addr
+      call void @me_ct_seta(ptr %0, i64 %1)
+      ret void
+    }
+    define void @me_ct_addk(ptr %d, ptr %s) optnone noinline {
+    entry:
+      %d.addr = alloca ptr
+      %s.addr = alloca ptr
+      store ptr %d, ptr %d.addr
+      store ptr %s, ptr %s.addr
+      %0 = load ptr, ptr %s.addr
+      %a = getelementptr inbounds nuw %struct.me_ct_f, ptr %0, i32 0, i32 0
+      %1 = load i64, ptr %a
+      %add = add i64 %1, 8
+      %2 = load ptr, ptr %d.addr
+      %a1 = getelementptr inbounds nuw %struct.me_ct_f, ptr %2, i32 0, i32 0
+      store i64 %add, ptr %a1
+      ret void
+    }
+    define void @me_ct_addb(ptr %d, ptr %s) optnone noinline {
+    entry:
+      %d.addr = alloca ptr
+      %s.addr = alloca ptr
+      store ptr %d, ptr %d.addr
+      store ptr %s, ptr %s.addr
+      %0 = load ptr, ptr %s.addr
+      %a = getelementptr inbounds nuw %struct.me_ct_big, ptr %0, i32 0, i32 0
+      %1 = load i64, ptr %a
+      %add = add i64 %1, 8
+      %2 = load ptr, ptr %d.addr
+      %a1 = getelementptr inbounds nuw %struct.me_ct_f, ptr %2, i32 0, i32 0
+      store i64 %add, ptr %a1
+      ret void
+    }
+    define void @me_ct_fill(ptr %d) optnone noinline {
+    entry:
+      %d.addr = alloca ptr
+      %t = alloca %struct.me_ct_big
+      store ptr %d, ptr %d.addr
+      call void @llvm.memset.p0.i64(ptr %t, i8 0, i64 72, i1 false)
+      %a = getelementptr inbounds nuw %struct.me_ct_big, ptr %t, i32 0, i32 0
+      store i64 ptrtoint (ptr @me_ct_g to i64), ptr %a
+      %0 = load ptr, ptr %d.addr
+      call void @llvm.memcpy.p0.p0.i64(ptr %0, ptr %t, i64 72, i1 false)
+      ret void
+    }
+    declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
+    declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+    define i64 @me_ct_rd(ptr %s) optnone noinline {
+    entry:
+      %s.addr = alloca ptr
+      store ptr %s, ptr %s.addr
+      %0 = load ptr, ptr %s.addr
+      %a = getelementptr inbounds nuw %struct.me_ct_f, ptr %0, i32 0, i32 0
+      %1 = load i64, ptr %a
+      ret i64 %1
+    }
+    define void @me_ct_add8(ptr %d, i64 %v) optnone noinline {
+    entry:
+      %d.addr = alloca ptr
+      %v.addr = alloca i64
+      store ptr %d, ptr %d.addr
+      store i64 %v, ptr %v.addr
+      %0 = load i64, ptr %v.addr
+      %add = add i64 %0, 8
+      %1 = load ptr, ptr %d.addr
+      %a = getelementptr inbounds nuw %struct.me_ct_f, ptr %1, i32 0, i32 0
+      store i64 %add, ptr %a
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 7) << Table;
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_ct_h[8] = {};
+      extern "C" {
+      struct me_ct_f { uintptr_t a; };
+      struct me_ct_big { uintptr_t a; long pad[8]; };
+      void me_ct_seta(me_ct_f* f, uintptr_t a);
+      void me_ct_seta2(me_ct_f* f, uintptr_t a);
+      void me_ct_addk(me_ct_f* d, const me_ct_f* s);
+      void me_ct_addb(me_ct_f* d, const me_ct_big* s);
+      void me_ct_fill(me_ct_big* d);
+      uintptr_t me_ct_rd(const me_ct_f* s);
+      void me_ct_add8(me_ct_f* d, uintptr_t v);
+      void me_ct_poke(const me_ct_f* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      void me_ct_set(me_ct_f* d) {
+        me_ct_f s{0};
+        me_ct_seta(&s, (uintptr_t)&me_ct_h[0]);
+        me_ct_addk(d, &s);
+        me_ct_poke(d);
+      }
+      void me_ct_set2(me_ct_f* d) {
+        me_ct_f s{0};
+        me_ct_seta2(&s, (uintptr_t)&me_ct_h[0]);
+        me_ct_addk(d, &s);
+        me_ct_poke(d);
+      }
+      void me_ct_copy(me_ct_f* d) {
+        me_ct_big s;
+        me_ct_fill(&s);
+        me_ct_addb(d, &s);
+        me_ct_poke(d);
+      }
+      void me_ct_split(me_ct_f* d) {
+        me_ct_f s{(uintptr_t)&me_ct_h[0]};
+        me_ct_add8(d, me_ct_rd(&s));
+        me_ct_poke(d);
+      }
+      }
+    )",
+        {"me_ct_set", "me_ct_set2", "me_ct_copy", "me_ct_split"});
+    ASSERT_EQ(MEs.size(), 4u);
+    for (size_t K = 0; K < MEs.size(); ++K) {
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+      EXPECT_TRUE(Writes(MEs[K].Other))
+          << Opt << " " << K << Table << Describe(MEs[K]);
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Describe(MEs[K]);
+    }
+  }
+}
