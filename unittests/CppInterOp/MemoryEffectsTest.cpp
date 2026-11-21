@@ -4000,15 +4000,16 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryWritesForeignStores) {
                                                               Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
   std::string Table = CppInternal::SummarizeMemoryEffects(*M);
-  // The result field: kind, two origins, two flag digits, other memory.
+  // The result field: kind, two origins, two flag digits, other memory,
+  // the result flag.
   auto Flags = [&](llvm::StringRef Name) {
     std::vector<std::string> Row = RowOf(Table, Name);
-    return Row.size() == 9u && Row[7].size() == 6u ? Row[7].substr(3) : Table;
+    return Row.size() == 9u && Row[7].size() == 7u ? Row[7].substr(3) : Table;
   };
   const std::string Any = Flags("me_sw_any");
   const std::string Own = Flags("me_sw_own");
-  ASSERT_EQ(Any.size(), 3u) << Table;
-  ASSERT_EQ(Own.size(), 3u) << Table;
+  ASSERT_EQ(Any.size(), 4u) << Table;
+  ASSERT_EQ(Own.size(), 4u) << Table;
   // A base-32 digit; bit 0 says that the parameter may receive one.
   auto Bits = [](char C) {
     return llvm::StringRef("0123456789abcdefghijklmnopqrstuv").find(C);
@@ -4297,8 +4298,9 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_LengthFromAConstantView) {
   const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
   std::vector<std::string> Row = RowOf(Table, "_Z10me_lv_namei");
   ASSERT_EQ(Row.size(), 9u) << Table;
-  // Kind, two origins, then the flags of the result and of the integer.
-  ASSERT_EQ(Row[7].size(), 6u) << Table;
+  // Kind, two origins, the flags of the result and of the integer, other
+  // memory, then the result flag.
+  ASSERT_EQ(Row[7].size(), 7u) << Table;
   const size_t Bits =
       llvm::StringRef("0123456789abcdefghijklmnopqrstuv").find(Row[7][3]);
   EXPECT_FALSE(Bits & 1) << Table;
@@ -4789,4 +4791,205 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressDataThroughTables) {
           << Opt << " " << K << Describe(MEs[K]);
     }
   }
+}
+
+// Models of the rehash policy: each passes its integer arguments to a
+// trusted declaration and returns its integer result. A summary says that
+// the result holds no address, so a hash set that keeps the bucket count
+// and the size of a state with two inline layers stays clean.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_HashSetWithModeledPolicy) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  SKIP_ON_LIBCXX("expects the out-of-line rehash policy of libstdc++");
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare i64 @me_hm_policy(ptr captures(none), i64)
+        memory(argmem: readwrite) nounwind willreturn
+        "cppinterop-trusted-stores"
+    define i64 @_ZNKSt8__detail20_Prime_rehash_policy11_M_next_bktEm(
+        ptr %this, i64 %n) {
+      %r = call i64 @me_hm_policy(ptr %this, i64 %n)
+      ret i64 %r
+    }
+    define { i8, i64 }
+    @_ZNKSt8__detail20_Prime_rehash_policy14_M_need_rehashEmmm(
+        ptr %this, i64 %b, i64 %e, i64 %i) {
+      %s = add i64 %e, %i
+      %r = call i64 @me_hm_policy(ptr %this, i64 %s)
+      %c = icmp ugt i64 %r, %b
+      %f = zext i1 %c to i8
+      %p = insertvalue { i8, i64 } undef, i8 %f, 0
+      %q = insertvalue { i8, i64 } %p, i64 %r, 1
+      ret { i8, i64 } %q
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt, "-std=c++20"});
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 2) << Table;
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <new>\n"
+                           "#include <type_traits>\n#include <unordered_set>"),
+              0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      struct me_hm_state { bool off; std::unordered_set<std::uint64_t> ids; };
+      inline void me_hm_0(me_hm_state& s, const bool& clear,
+                          const bool& add, const std::uint64_t& id) {
+        if (clear) s.ids.clear();
+        if (add) s.ids.insert(id);
+      }
+      inline void me_hm_1(const bool& bad, me_hm_state& s, const bool& clear,
+                          const bool& add, const std::uint64_t& id) {
+        if (bad) s.off = true;
+        if (s.off) return;
+        me_hm_0(s, clear, add, id);
+      }
+      template <class F> inline void me_hm_sink(void* out, F f) {
+        using R = decltype(f());
+        if constexpr (std::is_void_v<R>) f();
+        else ::new (out) std::remove_cv_t<R>(f());
+      }
+      extern "C" void me_hm_d(const bool* bad, me_hm_state* s,
+                              const bool* clear, const bool* add,
+                              const std::uint64_t* id) {
+        me_hm_1(*bad, *s, *clear, *add, *id);
+      }
+      extern "C" void me_hm_k(const bool* bad, me_hm_state* s,
+                              const bool* clear, const bool* add,
+                              const std::uint64_t* id, void* out) {
+        me_hm_sink(out, [&]() -> decltype(auto) {
+          return me_hm_1(*bad, *s, *clear, *add, *id);
+        });
+      }
+    )",
+        {"me_hm_d", "me_hm_k"});
+    ASSERT_EQ(MEs.size(), 2u);
+    for (const Cpp::MemoryEffects& ME : MEs) {
+      ASSERT_TRUE(ME.Valid) << Opt;
+      EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
+      EXPECT_EQ(ME.Other, ModRef::None) << Opt << Table << Describe(ME);
+      EXPECT_FALSE(ME.Captured[1]) << Opt << Describe(ME);
+      EXPECT_TRUE(Writes(ME.ParamsReachable[1])) << Opt;
+    }
+  }
+}
+
+// A table entry without the result flag: its integer result may hold any
+// address. A callee that keeps it marks the memory, and a read of that
+// memory as a pointer writes other memory.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_OldEntryResultMayHoldAnAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  const std::string E = llvm::utohexstr(
+      llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::Ref).toIntValue());
+  for (const char* Flag : {"", "0"}) {
+    TestFixture::CreateInterpreter({"-O2"});
+    const std::string Table = SummaryHeader() + "me_or_get\t" + E +
+                              "\t-c\tr\tn\t.\tn\t..00" + Flag + "\t.\n";
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      extern "C" std::uintptr_t me_or_get(const long* p);
+      struct me_or_f { std::uintptr_t a; };
+      __attribute__((noinline)) void me_or_seta(me_or_f* f, std::uintptr_t a) {
+        f->a = a;
+      }
+      extern "C" void me_or_c(me_or_f* d, const long* p) {
+        me_or_seta(d, me_or_get(p) + 8);
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+    )",
+        {"me_or_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid);
+    EXPECT_EQ(Writes(MEs[0].Other), *Flag == 0) << Flag << Describe(MEs[0]);
+  }
+}
+
+// Under trust, an opaque call may return what its arguments carry: an
+// address passed in as an integer, or integer data of memory that holds an
+// address. Its result from a plain integer holds none.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedResultCarriesArguments) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_tr2_g[8] = {};
+      struct me_tr2_f { std::uintptr_t a; };
+      extern "C" std::uintptr_t me_tr2_mix(std::uintptr_t v);
+      extern "C" std::uintptr_t me_tr2_read(const me_tr2_f* s);
+      __attribute__((noinline)) void me_tr2_seta(me_tr2_f* f,
+                                                 std::uintptr_t a) {
+        f->a = a;
+      }
+      __attribute__((noinline)) void me_tr2_poke(const me_tr2_f* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      extern "C" void me_tr2_arg(me_tr2_f* d) {
+        me_tr2_seta(d, me_tr2_mix((std::uintptr_t)&me_tr2_g[0]));
+        me_tr2_poke(d);
+      }
+      extern "C" void me_tr2_mem(me_tr2_f* d) {
+        me_tr2_f s{(std::uintptr_t)&me_tr2_g[0]};
+        me_tr2_seta(d, me_tr2_read(&s));
+        me_tr2_poke(d);
+      }
+      extern "C" void me_tr2_plain(me_tr2_f* d) {
+        me_tr2_seta(d, me_tr2_mix(42));
+        me_tr2_poke(d);
+      }
+    )",
+        {"me_tr2_arg", "me_tr2_mem", "me_tr2_plain"});
+    ASSERT_EQ(MEs.size(), 3u);
+    for (size_t K = 0; K < 2; ++K) {
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Describe(MEs[K]);
+    }
+    ASSERT_TRUE(MEs[2].Valid) << Opt;
+    // At -O0 the write through the copied pointer reads as other memory for
+    // a reason that this case does not test.
+    if (Opt[2] == '2')
+      EXPECT_FALSE(Writes(MEs[2].TrustedOther)) << Opt << Describe(MEs[2]);
+  }
+}
+
+// A model declaration may state that its integer result holds no address.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ModelResultHoldsNoAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare i64 @me_mr_model(ptr captures(none), i64)
+        memory(argmem: read) nounwind willreturn
+    declare i64 @me_mr_clean(ptr captures(none), i64)
+        memory(argmem: read) nounwind willreturn
+        "cppinterop-result-no-address"
+    define i64 @me_mr_hash(ptr %p, i64 %n) {
+      %r = call i64 @me_mr_model(ptr %p, i64 %n)
+      ret i64 %r
+    }
+    define i64 @me_mr_hash_clean(ptr %p, i64 %n) {
+      %r = call i64 @me_mr_clean(ptr %p, i64 %n)
+      ret i64 %r
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  std::vector<std::string> Plain = RowOf(Table, "me_mr_hash");
+  std::vector<std::string> Clean = RowOf(Table, "me_mr_hash_clean");
+  ASSERT_EQ(Plain.size(), 9u) << Table;
+  ASSERT_EQ(Clean.size(), 9u) << Table;
+  EXPECT_EQ(Plain[7].back(), '1') << Table;
+  EXPECT_EQ(Clean[7].back(), '0') << Table;
 }
