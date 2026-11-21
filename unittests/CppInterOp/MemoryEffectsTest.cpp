@@ -4374,3 +4374,83 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ResultThroughInlineLayers) {
     EXPECT_FALSE(ME.TrustedCaptured[0]) << Describe(ME);
   }
 }
+
+// At -O0, a result string copies a local string or a string that the
+// receiver points to. Each copy loads the length twice, and optimization
+// merges the loads. A merged load still reads an integer object: it holds no
+// pointer, and the result holds only its own pointers.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MergedIntegerLoadStaysData) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  ASSERT_EQ(CppInternal::LoadMemoryEffectsSummaries(
+                SummaryHeader() + "me_ml_make\tFFF\t-.-.\twn\tnn\toc\tn\t" +
+                "...220\t.\n"),
+            1);
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %S = type { ptr, i64, [16 x i8] }
+    declare noalias ptr @_Znwm(i64)
+    declare void @_ZdlPvm(ptr, i64)
+    declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+    declare void @me_ml_make(ptr sret(%S), i8)
+    define linkonce_odr ptr @_ZNSt11char_traitsIcE4copyEPcPKcm(ptr %d, ptr %s,
+        i64 %n) optnone noinline {
+      call void @llvm.memcpy.p0.p0.i64(ptr %d, ptr %s, i64 %n, i1 false)
+      ret ptr %d
+    }
+    define i64 @me_ml_size(ptr %s) optnone noinline {
+      %l = getelementptr inbounds %S, ptr %s, i32 0, i32 1
+      %n = load i64, ptr %l
+      ret i64 %n
+    }
+    define void @me_ml_copy(ptr %r, ptr %s) optnone noinline {
+      %rb = getelementptr inbounds %S, ptr %r, i32 0, i32 2
+      store ptr %rb, ptr %r
+      %p = load ptr, ptr %s
+      %n1 = call i64 @me_ml_size(ptr %s)
+      %n2 = call i64 @me_ml_size(ptr %s)
+      %big = icmp ugt i64 %n1, 15
+      br i1 %big, label %heap, label %copy
+    heap:
+      %size = add i64 %n1, 1
+      %h = call ptr @_Znwm(i64 %size)
+      store ptr %h, ptr %r
+      store i64 %n2, ptr %rb
+      br label %copy
+    copy:
+      %d = load ptr, ptr %r
+      call ptr @_ZNSt11char_traitsIcE4copyEPcPKcm(ptr %d, ptr %p, i64 %n1)
+      %rl = getelementptr inbounds %S, ptr %r, i32 0, i32 1
+      store i64 %n2, ptr %rl
+      ret void
+    }
+    define void @me_ml_get(ptr noalias sret(%S) %r, ptr %this, i8 %k)
+        optnone noinline {
+      %s = alloca %S
+      %own = icmp eq i8 %k, 0
+      br i1 %own, label %mine, label %local
+    mine:
+      %t = load ptr, ptr %this
+      call void @me_ml_copy(ptr %r, ptr %t)
+      ret void
+    local:
+      call void @me_ml_make(ptr sret(%S) %s, i8 %k)
+      call void @me_ml_copy(ptr %r, ptr %s)
+      %p = load ptr, ptr %s
+      %sb = getelementptr inbounds %S, ptr %s, i32 0, i32 2
+      %short = icmp eq ptr %p, %sb
+      br i1 %short, label %done, label %free
+    free:
+      call void @_ZdlPvm(ptr %p, i64 16)
+      br label %done
+    done:
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  std::vector<std::string> Row = RowOf(Table, "me_ml_get");
+  ASSERT_EQ(Row.size(), 9u) << Table;
+  EXPECT_EQ(Row[5][0], 's') << Table;
+}

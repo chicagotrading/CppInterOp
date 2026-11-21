@@ -479,11 +479,33 @@ constexpr llvm::StringLiteral TrustedCallAttr = "cppinterop-trusted-call";
 // declaration of a summary may state it too.
 constexpr llvm::StringLiteral TrustedStoresAttr = "cppinterop-trusted-stores";
 
+// The alias type of the accesses that MarkIntegerLoads marks. Unlike other
+// metadata, an alias tag survives when passes merge two such loads.
+constexpr llvm::StringLiteral IntegerTagName = "cppinterop integer";
+
+// Whether MarkIntegerLoads marks \p I as an access of an integer object.
+bool IntegerMarked(const llvm::Instruction& I) {
+  // A pass that changes the access type keeps the tag.
+  if (!(llvm::isa<llvm::LoadInst>(I) || llvm::isa<llvm::StoreInst>(I)) ||
+      !llvm::getLoadStoreType(&I)->isIntegerTy())
+    return false;
+  if (I.getMetadata(IntegerLoadKind))
+    return true;
+  const auto* Tag = I.getMetadata(llvm::LLVMContext::MD_tbaa);
+  if (!Tag || Tag->getNumOperands() < 3)
+    return false;
+  const auto* Type = llvm::dyn_cast<llvm::MDNode>(Tag->getOperand(1));
+  const auto* Name = Type && Type->getNumOperands() > 0
+                         ? llvm::dyn_cast<llvm::MDString>(Type->getOperand(0))
+                         : nullptr;
+  return Name && Name->getString() == IntegerTagName;
+}
+
 // Whether \p V is a load of an integer object.
 bool DataLoad(const llvm::Value* V) {
   const auto* L = llvm::dyn_cast<llvm::LoadInst>(V);
   return L && L->getType()->isIntegerTy() &&
-         (L->getMetadata(IntegerLoadKind) || L->getMetadata(PointerFreeKind) ||
+         (IntegerMarked(*L) || L->getMetadata(PointerFreeKind) ||
           DataAccess(*L));
 }
 
@@ -1174,8 +1196,8 @@ private:
     llvm::SmallPtrSet<const llvm::Value*, 8> Seen;
     Data = false;
     llvm::SmallBitVector Unused(N);
-    return foreignSource(V, DataAccess(S) || S.getMetadata(IntegerLoadKind),
-                         Data, From ? *From : Unused, Seen);
+    return foreignSource(V, DataAccess(S) || IntegerMarked(S), Data,
+                         From ? *From : Unused, Seen);
   }
 
   Origin foreignSource(const llvm::Value* V, bool DataStore, bool& Data,
@@ -1193,8 +1215,8 @@ private:
       const Origin Src = originOf(L->getPointerOperand());
       const Origin Bits = loadedFrom(Src, /*PointerObject=*/true);
       Data |= dataIn(Src);
-      if (!(L->getMetadata(IntegerLoadKind) ||
-            L->getMetadata(PointerFreeKind) || DataAccess(*L)))
+      if (!(IntegerMarked(*L) || L->getMetadata(PointerFreeKind) ||
+            DataAccess(*L)))
         return Bits;
       Data |= leadsForeign(Bits) || leadsData(Bits);
       From |= dataSources(Src);
@@ -1746,8 +1768,7 @@ private:
     if (!I || !Seen.insert(I).second)
       return P;
     if (const auto* L = llvm::dyn_cast<llvm::LoadInst>(I)) {
-      const bool Data =
-          L->getMetadata(IntegerLoadKind) || L->getMetadata(PointerFreeKind);
+      const bool Data = IntegerMarked(*L) || L->getMetadata(PointerFreeKind);
       return pointersLoaded(originOf(L->getPointerOperand()),
                             Data ? ReadAs::Data : ReadAs::Bytes);
     }
@@ -1854,9 +1875,8 @@ private:
           const llvm::SmallBitVector Ptr = pointersIn(SI->getValueOperand());
           const Origin Src = carried(SI->getValueOperand());
           const Origin Dst = originOf(SI->getPointerOperand());
-          const bool Data =
-              SI->getValueOperand()->getType()->isIntegerTy() &&
-              (DataAccess(*SI) || SI->getMetadata(IntegerLoadKind));
+          const bool Data = SI->getValueOperand()->getType()->isIntegerTy() &&
+                            (DataAccess(*SI) || IntegerMarked(*SI));
           Changed |= recordCopy(Src, Dst, &Ptr, Data);
           bool FData;
           const Origin FS = foreignSource(SI->getValueOperand(), *SI, FData);
@@ -2412,7 +2432,7 @@ private:
       return O;
     }
     if (const auto* L = llvm::dyn_cast<llvm::LoadInst>(I)) {
-      if (!L->getMetadata(IntegerLoadKind))
+      if (!IntegerMarked(*L))
         O.join(loadedFrom(originOf(L->getPointerOperand())));
       return O;
     }
@@ -2940,6 +2960,7 @@ void MarkIntegerLoads(llvm::Function& F) {
   // An alias tag, unlike other metadata, survives when passes merge loads.
   llvm::MDBuilder B(C);
   llvm::MDNode* PtrTag = nullptr;
+  llvm::MDNode* IntTag = nullptr;
   for (llvm::Instruction& I : llvm::instructions(F)) {
     if (!llvm::isa<llvm::LoadInst>(I) && !llvm::isa<llvm::StoreInst>(I))
       continue;
@@ -2970,8 +2991,16 @@ void MarkIntegerLoads(llvm::Function& F) {
       // Into an aggregate: a pointer index alone shows only a cast's type.
       if (G->getNumIndices() > 1)
         Declared = G->getResultElementType();
-    if (Declared == T)
-      I.setMetadata(Kind, llvm::MDNode::get(C, {}));
+    if (Declared != T)
+      continue;
+    I.setMetadata(Kind, llvm::MDNode::get(C, {}));
+    // A root of its own: the tag adds no alias facts.
+    if (!IntTag) {
+      llvm::MDNode* Root = B.createTBAARoot("cppinterop integer accesses");
+      llvm::MDNode* Type = B.createTBAAScalarTypeNode(IntegerTagName, Root);
+      IntTag = B.createTBAAStructTagNode(Type, Type, 0);
+    }
+    I.setMetadata(llvm::LLVMContext::MD_tbaa, IntTag);
   }
 }
 
