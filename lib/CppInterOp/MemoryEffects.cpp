@@ -1210,6 +1210,12 @@ private:
           O.join(foreignSource(Op, DataStore, Data, From, Seen));
       return O;
     }
+    // A member of an aggregate with a pointer carries what the origins of
+    // the aggregate know; an aggregate of integers alone stays unknown.
+    if (const auto* EV = llvm::dyn_cast_or_null<llvm::ExtractValueInst>(I))
+      if (mayHoldPointers(EV->getAggregateOperand()->getType()))
+        return foreignSource(EV->getAggregateOperand(), DataStore, Data, From,
+                             Seen);
     // An argument, a call result or another value: the taint and the
     // origins keep what they know; the rest is unknown.
     O = carried(V);

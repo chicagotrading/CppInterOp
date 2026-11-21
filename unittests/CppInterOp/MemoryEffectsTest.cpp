@@ -4259,3 +4259,62 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CharacterCopyIntoDataMemory) {
   ASSERT_TRUE(MEs[0].Valid);
   EXPECT_FALSE(Writes(MEs[0].TrustedOther)) << Describe(MEs[0]);
 }
+
+// A name from a constant table of {pointer, length} views, copied into the
+// result: the length that the view holds is no foreign pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_LengthFromAConstantView) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %S = type { ptr, i64, i64 }
+    @me_lv_s0 = constant [2 x i8] c"a\00"
+    @me_lv_s1 = constant [3 x i8] c"bc\00"
+    @me_lv_names = constant [2 x { i64, ptr }]
+        [{ i64, ptr } { i64 1, ptr @me_lv_s0 }, { i64, ptr } { i64 2, ptr @me_lv_s1 }]
+    declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+    define internal { i64, ptr } @me_lv_view(i32 %k) noinline {
+      %i = zext i32 %k to i64
+      %e = getelementptr [2 x { i64, ptr }], ptr @me_lv_names, i64 0, i64 %i
+      %v = load { i64, ptr }, ptr %e
+      ret { i64, ptr } %v
+    }
+    define void @_Z10me_lv_namei(ptr sret(%S) %r, i32 %k) {
+      %sv = call { i64, ptr } @me_lv_view(i32 %k)
+      %n = extractvalue { i64, ptr } %sv, 0
+      %p = extractvalue { i64, ptr } %sv, 1
+      %buf = getelementptr i8, ptr %r, i64 16
+      store ptr %buf, ptr %r
+      %len = getelementptr i8, ptr %r, i64 8
+      store i64 %n, ptr %len
+      call void @llvm.memcpy.p0.p0.i64(ptr %buf, ptr %p, i64 1, i1 false)
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  std::vector<std::string> Row = RowOf(Table, "_Z10me_lv_namei");
+  ASSERT_EQ(Row.size(), 9u) << Table;
+  // Kind, two origins, then the flags of the result and of the integer.
+  ASSERT_EQ(Row[7].size(), 6u) << Table;
+  const size_t Bits =
+      llvm::StringRef("0123456789abcdefghijklmnopqrstuv").find(Row[7][3]);
+  EXPECT_FALSE(Bits & 1) << Table;
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1) << Table;
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_lv_s { char* p; long n; long c; };
+    me_lv_s me_lv_name(int k);
+    extern "C" void me_lv_c(const int* k, char* out) {
+      me_lv_s s = me_lv_name(*k);
+      *out = *s.p;
+    }
+  )",
+      {"me_lv_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_FALSE(Writes(MEs[0].TrustedOther)) << Table << Describe(MEs[0]);
+}
