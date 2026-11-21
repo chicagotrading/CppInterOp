@@ -4318,3 +4318,59 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_LengthFromAConstantView) {
   ASSERT_TRUE(MEs[0].Valid);
   EXPECT_FALSE(Writes(MEs[0].TrustedOther)) << Table << Describe(MEs[0]);
 }
+
+// A table entry that constructs an optional string in its result and only
+// reads other memory, called through inline layers. The result object holds
+// nothing of what its memory held before the call.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ResultThroughInlineLayers) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  SKIP_ON_LIBCXX("expects the string layout of libstdc++");
+  TestFixture::CreateInterpreter({"-O0", "-std=c++20"});
+  // Sret, receiver, two integers; the result may receive integer data and
+  // read it back, and holds only its own pointers. Untrusted, the throw path
+  // is opaque.
+  const std::string Table =
+      SummaryHeader() + "_ZNK9me_rl_api3getB5cxx11Eil\tFFF\t-.rc-.-.\twrnn\t" +
+      "mrnn\t..c.\tm\t.....e2521\ti\tFFF\t-.rc-.-.\twrnn\tmrnn\ts.c.\tr\t" +
+      ".....e2620\t_ZNSt13runtime_errorC1EPKc\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+  ASSERT_EQ(
+      Cpp::Declare("#include <new>\n#include <optional>\n#include <string>"),
+      0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_rl_api {
+      long* data;
+      std::optional<std::string> get(int kind, long id) const;
+    };
+    struct me_rl_client {
+      me_rl_api api;
+      std::optional<std::string> get(int kind, long id) const {
+        return api.get(kind, id);
+      }
+    };
+    struct me_rl_getter {
+      static std::optional<std::string> get(const me_rl_client& c, int k,
+                                            long id) {
+        return c.get(k, id);
+      }
+    };
+    extern "C" void me_rl_d(const me_rl_client* c, const int* k,
+                            const long* id) {
+      (void)me_rl_getter::get(*c, *k, *id);
+    }
+    extern "C" void me_rl_k(const me_rl_client* c, const int* k,
+                            const long* id, void* out) {
+      ::new (out) std::optional<std::string>(me_rl_getter::get(*c, *k, *id));
+    }
+  )",
+      {"me_rl_d", "me_rl_k"});
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(Mentions(ME, "runtime_error")) << OpaqueNames(ME);
+    EXPECT_EQ(ME.TrustedOther, ModRef::Read) << Describe(ME);
+    EXPECT_FALSE(ME.TrustedCaptured[0]) << Describe(ME);
+  }
+}

@@ -1387,8 +1387,10 @@ private:
       if (O.unowned() || !O.Consts.empty())
         return false;
       // The callee may store through any level of the memory it may write.
-      // The call's own fresh memory holds what the call stores.
-      if (llvm::isModSet(S.Params[K].Reachable)) {
+      // The call's own fresh memory holds what the call stores, and a result
+      // object that it constructs holds nothing from before the call.
+      if (llvm::isModSet(S.Params[K].Reachable) &&
+          !CB.paramHasAttr(K, llvm::Attribute::StructRet)) {
         O = holdings(O, &CB);
         // The callee may read integer data as a pointer.
         const bool RD = S.Params[K].ReadsData;
@@ -2256,8 +2258,10 @@ private:
   }
 
   // With \p ReadsData, the callee may read integer data as a pointer.
+  // With \p Result, \p O is the result object that a callee constructs: it
+  // reaches nothing of what that memory held before the call.
   void access(ModRefInfo MR, const Origin& O, bool Reachable,
-              bool ReadsData = true) {
+              bool ReadsData = true, bool Result = false) {
     if (MR == ModRefInfo::NoModRef)
       return;
     if (!Reachable) {
@@ -2275,6 +2279,8 @@ private:
     // Not inert: a constant reaches memory that changes.
     if (O.unowned() || !O.Consts.empty())
       R.Other |= MR;
+    if (Result)
+      return;
     // Every level of memory that the objects lead to. A held address of a
     // parameter leads to its own object.
     Origin Objs(N);
@@ -2567,7 +2573,8 @@ private:
       Origin O = originOf(A);
       access(S.Params[K].Direct, O, /*Reachable=*/false);
       access(S.Params[K].Reachable, O, /*Reachable=*/true,
-             S.Params[K].ReadsData);
+             S.Params[K].ReadsData,
+             CB.paramHasAttr(K, llvm::Attribute::StructRet));
       for (unsigned J : dataSources(holdings(O)).set_bits()) {
         R.Params[J].ReadsData |= S.Params[K].ReadsData;
         R.Params[J].CopiesData |= S.Params[K].CopiesData;
