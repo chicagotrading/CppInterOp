@@ -4993,3 +4993,192 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ModelResultHoldsNoAddress) {
   EXPECT_EQ(Plain[7].back(), '1') << Table;
   EXPECT_EQ(Clean[7].back(), '0') << Table;
 }
+
+// A callee returns, as an integer, an address that its argument reaches:
+// an atomic integer, the bytes of a pointer, or a pointer converted to an
+// integer. Under trust, an opaque call may return what its argument objects
+// hold. The caller stores the result, reads it back as a pointer, and
+// writes through it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerResultReachesAnAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::Declare("#include <atomic>\n#include <cstdint>\n"
+                           "#include <cstring>"),
+              0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_ir_g[8] = {};
+      struct me_ir_f { std::uintptr_t a; };
+      struct me_ir_p { long* p; };
+      std::uintptr_t me_ir_addr(const me_ir_p* s);
+      __attribute__((noinline)) std::uintptr_t
+      me_ir_atom(const std::atomic<std::uintptr_t>* a) {
+        return a->load();
+      }
+      __attribute__((noinline)) std::uintptr_t me_ir_bytes(long* const* pp) {
+        std::uintptr_t v;
+        std::memcpy(&v, pp, sizeof v);
+        return v;
+      }
+      __attribute__((noinline)) std::uintptr_t me_ir_p2i(long* const* pp) {
+        return (std::uintptr_t)*pp;
+      }
+      __attribute__((noinline)) void me_ir_poke(const void* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      extern "C" void me_ir_atomic(me_ir_f* d) {
+        std::atomic<std::uintptr_t> a{(std::uintptr_t)&me_ir_g[0]};
+        d->a = me_ir_atom(&a);
+        me_ir_poke(d);
+      }
+      extern "C" void me_ir_memcpy(me_ir_f* d) {
+        long* p = &me_ir_g[0];
+        d->a = me_ir_bytes(&p);
+        me_ir_poke(d);
+      }
+      extern "C" void me_ir_ptoi(me_ir_f* d) {
+        long* p = &me_ir_g[0];
+        d->a = me_ir_p2i(&p);
+        me_ir_poke(d);
+      }
+      extern "C" void me_ir_one(me_ir_f* d) {
+        me_ir_p s{&me_ir_g[0]};
+        d->a = me_ir_addr(&s);
+        me_ir_poke(d);
+      }
+      extern "C" void me_ir_param(me_ir_f* d, const me_ir_p* s) {
+        d->a = me_ir_addr(s);
+        me_ir_poke(d);
+      }
+    )",
+        {"me_ir_atomic", "me_ir_memcpy", "me_ir_ptoi", "me_ir_one",
+         "me_ir_param"});
+    ASSERT_EQ(MEs.size(), 5u);
+    for (size_t K = 0; K < MEs.size(); ++K)
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+    for (size_t K = 0; K < 3; ++K)
+      EXPECT_TRUE(Writes(MEs[K].Other)) << Opt << " " << K << Describe(MEs[K]);
+    for (size_t K = 0; K < 4; ++K)
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Describe(MEs[K]);
+    // The write lands in the memory that the parameter reaches: as for a
+    // copied pointer, s is captured into d and d's reachable memory is
+    // written, or the write is one of other memory.
+    EXPECT_TRUE(Writes(MEs[4].TrustedOther) ||
+                Writes(MEs[4].TrustedParamsReachable[1]) ||
+                (MEs[4].TrustedPointerCaptured[1] &&
+                 Writes(MEs[4].TrustedParamsReachable[0])))
+        << Opt << Describe(MEs[4]);
+  }
+}
+
+// As above, with the callees as table entries from -O0 bodies, and a
+// function that returns the result of a trusted declaration.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerResultThroughTables) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+    declare i64 @me_it_model(ptr captures(none)) memory(argmem: read)
+        nounwind willreturn "cppinterop-trusted-stores"
+    define i64 @me_it_atom(ptr %a) optnone noinline {
+      %a.addr = alloca ptr
+      store ptr %a, ptr %a.addr
+      %t0 = load ptr, ptr %a.addr
+      %v = load atomic i64, ptr %t0 seq_cst, align 8
+      ret i64 %v
+    }
+    define i64 @me_it_bytes(ptr %pp) optnone noinline {
+      %pp.addr = alloca ptr
+      %v = alloca i64
+      store ptr %pp, ptr %pp.addr
+      %t0 = load ptr, ptr %pp.addr
+      call void @llvm.memcpy.p0.p0.i64(ptr %v, ptr %t0, i64 8, i1 false)
+      %t1 = load i64, ptr %v
+      ret i64 %t1
+    }
+    define i64 @me_it_p2i(ptr %pp) optnone noinline {
+      %pp.addr = alloca ptr
+      store ptr %pp, ptr %pp.addr
+      %t0 = load ptr, ptr %pp.addr
+      %t1 = load ptr, ptr %t0
+      %t2 = ptrtoint ptr %t1 to i64
+      ret i64 %t2
+    }
+    define i64 @me_it_trusted(ptr %h) optnone noinline {
+      %h.addr = alloca ptr
+      store ptr %h, ptr %h.addr
+      %t0 = load ptr, ptr %h.addr
+      %t1 = call i64 @me_it_model(ptr %t0)
+      ret i64 %t1
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 4) << Table;
+    ASSERT_EQ(Cpp::Declare("#include <atomic>\n#include <cstdint>\n"
+                           "#include <cstring>"),
+              0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_it_g[8] = {};
+      extern "C" {
+      struct me_it_f { std::uintptr_t a; };
+      struct me_it_p { long* p; };
+      std::uintptr_t me_it_atom(const std::atomic<std::uintptr_t>* a);
+      std::uintptr_t me_it_bytes(long* const* pp);
+      std::uintptr_t me_it_p2i(long* const* pp);
+      std::uintptr_t me_it_trusted(const void* h);
+      void me_it_poke(const void* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      void me_it_atomic(me_it_f* d) {
+        std::atomic<std::uintptr_t> a{(std::uintptr_t)&me_it_g[0]};
+        d->a = me_it_atom(&a);
+        me_it_poke(d);
+      }
+      void me_it_memcpy(me_it_f* d) {
+        long* p = &me_it_g[0];
+        d->a = me_it_bytes(&p);
+        me_it_poke(d);
+      }
+      void me_it_ptoi(me_it_f* d) {
+        long* p = &me_it_g[0];
+        d->a = me_it_p2i(&p);
+        me_it_poke(d);
+      }
+      void me_it_one(me_it_f* d) {
+        me_it_p s{&me_it_g[0]};
+        d->a = me_it_trusted(&s);
+        me_it_poke(d);
+      }
+      void me_it_param(me_it_f* d, const me_it_p* s) {
+        d->a = me_it_trusted(s);
+        me_it_poke(d);
+      }
+      }
+    )",
+        {"me_it_atomic", "me_it_memcpy", "me_it_ptoi", "me_it_one",
+         "me_it_param"});
+    ASSERT_EQ(MEs.size(), 5u);
+    for (size_t K = 0; K < MEs.size(); ++K)
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+    for (size_t K = 0; K < 4; ++K)
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Table << Describe(MEs[K]);
+    EXPECT_TRUE(Writes(MEs[4].TrustedOther) ||
+                Writes(MEs[4].TrustedParamsReachable[1]) ||
+                (MEs[4].TrustedPointerCaptured[1] &&
+                 Writes(MEs[4].TrustedParamsReachable[0])))
+        << Opt << Table << Describe(MEs[4]);
+  }
+}
