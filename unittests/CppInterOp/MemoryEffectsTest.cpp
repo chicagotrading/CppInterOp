@@ -1756,11 +1756,16 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_FreshAllocationContent) {
   EXPECT_TRUE(Writes(Known.ParamsReachable[0]));
   EXPECT_FALSE(Known.Captured[0]);
 
-  // The callee may store any pointer into the allocation.
+  // Untrusted, the callee may store any pointer into the allocation.
+  // Trusted, it stores only pointers into the memory that its argument
+  // reaches: the allocation, which holds a pointer into *t.
   const Cpp::MemoryEffects& Filled = MEs[1];
   ASSERT_TRUE(Filled.Valid);
   EXPECT_TRUE(Mentions(Filled, "me_fill"));
-  EXPECT_TRUE(Writes(Filled.TrustedOther));
+  EXPECT_TRUE(Writes(Filled.Other));
+  EXPECT_TRUE(Writes(Filled.TrustedParamsDirect[0]) ||
+              Writes(Filled.TrustedParamsReachable[0]))
+      << Describe(Filled);
 }
 
 // A pointer into a parameter's memory that leaves in an aggregate result,
@@ -2745,4 +2750,2435 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerInAPrivateSlot) {
   EXPECT_EQ(Capture("me_get_spilled"), ".c o.");
   EXPECT_EQ(Capture("me_wrap_spilled"), ".c o.");
   EXPECT_EQ(Capture("me_get_leaked"), ".c .c");
+}
+
+// A callee reads through two levels of local objects to a global.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ReadThroughNestedObjects) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_nr_g = 0;
+    struct me_nr_in { long* p; };
+    struct me_nr_out { me_nr_in* in; };
+    __attribute__((noinline)) long me_nr_read(const me_nr_out* o) {
+      return *o->in->p;
+    }
+    extern "C" long me_nr_nested() {
+      me_nr_in i{&me_nr_g};
+      me_nr_out o{&i};
+      return me_nr_read(&o);
+    }
+    inline long* const me_nr_tbl[2] = {&me_nr_g, &me_nr_g};
+    struct me_nr_cin { long* const* t; };
+    struct me_nr_cout { me_nr_cin* in; };
+    __attribute__((noinline)) long me_nr_cread(const me_nr_cout* o, int k) {
+      return *o->in->t[k & 1];
+    }
+    extern "C" long me_nr_const(const int* k) {
+      me_nr_cin i{me_nr_tbl};
+      me_nr_cout o{&i};
+      return me_nr_cread(&o, *k);
+    }
+  )",
+      {"me_nr_nested", "me_nr_const"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_NE(ME.Other, ModRef::None);
+  }
+}
+
+// A callee returns a pointer that it loads through two levels.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ResultLoadedThroughTwoLevels) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_rt_g = 0;
+    inline long* const me_rt_c = &me_rt_g;
+    __attribute__((noinline)) long* me_rt_follow(long* const* const* box) {
+      return **box;
+    }
+    extern "C" void me_rt_const() {
+      long* const* b = &me_rt_c;
+      ++*me_rt_follow(&b);
+    }
+    __attribute__((noinline)) long* me_rt_follow2(long** const* box) {
+      return **box;
+    }
+    extern "C" void me_rt_local() {
+      long* p = &me_rt_g;
+      long** q = &p;
+      ++*me_rt_follow2(&q);
+    }
+  )",
+      {"me_rt_const", "me_rt_local"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(Writes(ME.Other));
+  }
+}
+
+// A callee stores its argument through a local box that leads to a global.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CaptureThroughABox) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline void* me_cb_slot = nullptr;
+    struct me_cb_box { void** where; };
+    __attribute__((noinline)) void me_cb_put(const me_cb_box* b, void* p) {
+      *b->where = p;
+    }
+    extern "C" void me_cb_leak(void* p) {
+      me_cb_box b{&me_cb_slot};
+      me_cb_put(&b, p);
+    }
+  )",
+      {"me_cb_leak"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(MEs[0].Captured[0]);
+}
+
+// A callee stores the address of a global into *p; the caller writes **p.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_GlobalStoredIntoAParameter) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_gs_g = 0;
+    __attribute__((noinline)) void me_gs_set(long** p) { *p = &me_gs_g; }
+    extern "C" void me_gs_write(long** p) {
+      me_gs_set(p);
+      **p = 1;
+    }
+  )",
+      {"me_gs_write"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other));
+}
+
+// Three levels of local objects, read and written by a callee.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ThreeLevels) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_t3_g = 0;
+    struct me_t3_a { long* p; };
+    struct me_t3_b { me_t3_a* a; };
+    struct me_t3_c { me_t3_b* b; };
+    __attribute__((noinline)) long me_t3_get(const me_t3_c* c) {
+      return *c->b->a->p;
+    }
+    __attribute__((noinline)) void me_t3_put(const me_t3_c* c) {
+      *c->b->a->p = 1;
+    }
+    extern "C" long me_t3_read() {
+      me_t3_a a{&me_t3_g};
+      me_t3_b b{&a};
+      me_t3_c c{&b};
+      return me_t3_get(&c);
+    }
+    extern "C" void me_t3_write() {
+      me_t3_a a{&me_t3_g};
+      me_t3_b b{&a};
+      me_t3_c c{&b};
+      me_t3_put(&c);
+    }
+    extern "C" long me_t3_local() {
+      long v = 2;
+      me_t3_a a{&v};
+      me_t3_b b{&a};
+      me_t3_c c{&b};
+      return me_t3_get(&c);
+    }
+  )",
+      {"me_t3_read", "me_t3_write", "me_t3_local"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_NE(MEs[0].Other, ModRef::None);
+  EXPECT_TRUE(Writes(MEs[1].Other));
+  // Only stack memory: nothing for the caller to see.
+  EXPECT_EQ(MEs[2].Other, ModRef::None);
+}
+
+// An aggregate by value that holds a pointer to an object that holds a
+// pointer to a global.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AggregateAndPointerLevels) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_ap_g = 0;
+    struct me_ap_in { long* p; };
+    struct me_ap_mid { me_ap_in* in; long n; };
+    struct me_ap_out { me_ap_mid m; long k; };
+    __attribute__((noinline)) long me_ap_byval(me_ap_mid m) {
+      return *m.in->p + m.n;
+    }
+    __attribute__((noinline)) long me_ap_byref(const me_ap_out* o) {
+      return *o->m.in->p;
+    }
+    extern "C" long me_ap_value() {
+      me_ap_in i{&me_ap_g};
+      return me_ap_byval({&i, 1});
+    }
+    extern "C" long me_ap_member() {
+      me_ap_in i{&me_ap_g};
+      me_ap_out o{{&i, 1}, 2};
+      return me_ap_byref(&o);
+    }
+  )",
+      {"me_ap_value", "me_ap_member"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_NE(ME.Other, ModRef::None);
+  }
+}
+
+// A level that a callee returns as fresh memory may hold any pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_LevelFromAReturnedPointer) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_lr_g = 0;
+    struct me_lr_in { long* p; };
+    struct me_lr_out { me_lr_in* in; };
+    __attribute__((noinline)) me_lr_in* me_lr_make() {
+      return new me_lr_in{&me_lr_g};
+    }
+    __attribute__((noinline)) long me_lr_get(const me_lr_out* o) {
+      return *o->in->p;
+    }
+    __attribute__((noinline)) long me_lr_get1(const me_lr_in* i) {
+      return *i->p;
+    }
+    extern "C" long me_lr_nested() {
+      me_lr_out o{me_lr_make()};
+      long r = me_lr_get(&o);
+      delete o.in;
+      return r;
+    }
+    extern "C" long me_lr_direct() {
+      me_lr_in* i = me_lr_make();
+      long r = me_lr_get1(i);
+      delete i;
+      return r;
+    }
+    extern "C" void me_lr_param(me_lr_out* o) {
+      o->in = me_lr_make();
+      *o->in->p = 1;
+    }
+  )",
+      {"me_lr_nested", "me_lr_direct", "me_lr_param"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_NE(MEs[0].Other, ModRef::None);
+  EXPECT_NE(MEs[1].Other, ModRef::None);
+  EXPECT_TRUE(Writes(MEs[2].Other));
+}
+
+// A callee stores a global at one level; the caller accesses another level.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           MemoryEffects_StoreAndAccessAtDifferentLevels) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_sl_g = 0;
+    struct me_sl_in { long* p; };
+    struct me_sl_box { me_sl_in* in; };
+    __attribute__((noinline)) void me_sl_set(const me_sl_box* b) {
+      b->in->p = &me_sl_g;
+    }
+    extern "C" void me_sl_param(me_sl_box* b) {
+      me_sl_set(b);
+      *b->in->p = 1;
+    }
+    extern "C" void me_sl_local(long* q) {
+      me_sl_in i{q};
+      me_sl_box b{&i};
+      me_sl_set(&b);
+      *i.p = 1;
+    }
+    __attribute__((noinline)) void me_sl_set_in(me_sl_in* i) {
+      i->p = &me_sl_g;
+    }
+    extern "C" long me_sl_outer(me_sl_box* b) {
+      me_sl_set_in(b->in);
+      return *b->in->p;
+    }
+  )",
+      {"me_sl_param", "me_sl_local", "me_sl_outer"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other));
+  EXPECT_TRUE(Writes(MEs[1].Other));
+  EXPECT_NE(MEs[2].Other, ModRef::None);
+}
+
+// A pointer that code loads from a global, stored into a parameter's memory
+// or used as the target of a store.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PointerLoadedFromAGlobal) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long* me_pg_slot = nullptr;
+    inline long** me_pg_where = &me_pg_slot;
+    __attribute__((noinline)) void me_pg_fetch(long** p) {
+      *p = *me_pg_where;
+    }
+    extern "C" void me_pg_write(long** p) {
+      me_pg_fetch(p);
+      **p = 1;
+    }
+    struct me_pg_box { long** where; };
+    __attribute__((noinline)) void me_pg_put(const me_pg_box* b, long* p) {
+      *b->where = p;
+    }
+    extern "C" void me_pg_leak(long* p) {
+      me_pg_box b{me_pg_where};
+      me_pg_put(&b, p);
+    }
+  )",
+      {"me_pg_write", "me_pg_leak"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other));
+  EXPECT_TRUE(MEs[1].Captured[0]);
+}
+
+// Recursive callees that access or store two levels down.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_RecursionThroughTwoLevels) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_r2_g = 0;
+    struct me_r2_in { long* p; };
+    struct me_r2_box { me_r2_in* in; };
+    __attribute__((noinline)) long me_r2_get(const me_r2_box* b, int d) {
+      return d <= 0 ? *b->in->p : me_r2_get(b, d - 1) + 1;
+    }
+    extern "C" long me_r2_read(int d) {
+      me_r2_in i{&me_r2_g};
+      me_r2_box b{&i};
+      return me_r2_get(&b, d);
+    }
+    __attribute__((noinline)) void me_r2_set(const me_r2_box* b, int d) {
+      if (d <= 0) {
+        b->in->p = &me_r2_g;
+        return;
+      }
+      me_r2_set(b, d - 1);
+    }
+    extern "C" void me_r2_write(me_r2_box* b, int d) {
+      me_r2_set(b, d);
+      *b->in->p = 1;
+    }
+  )",
+      {"me_r2_read", "me_r2_write"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_NE(MEs[0].Other, ModRef::None);
+  EXPECT_TRUE(Writes(MEs[1].Other));
+}
+
+// Objects that point to themselves or to each other: the closure ends.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CyclicHoldings) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_cy_g = 0;
+    struct me_cy_node { me_cy_node* next; long* v; };
+    __attribute__((noinline)) long me_cy_walk(const me_cy_node* n) {
+      return *n->next->next->next->v;
+    }
+    extern "C" long me_cy_self() {
+      me_cy_node a{nullptr, &me_cy_g};
+      a.next = &a;
+      return me_cy_walk(&a);
+    }
+    extern "C" long me_cy_pair() {
+      long x = 1;
+      me_cy_node a{nullptr, &x};
+      me_cy_node b{&a, &me_cy_g};
+      a.next = &b;
+      return me_cy_walk(&a);
+    }
+    extern "C" long me_cy_local() {
+      long x = 1, y = 2;
+      me_cy_node a{nullptr, &x};
+      me_cy_node b{&a, &y};
+      a.next = &b;
+      return me_cy_walk(&a);
+    }
+    extern "C" long me_cy_param(me_cy_node* p) {
+      me_cy_node a{p, &me_cy_g};
+      p->next = &a;
+      return me_cy_walk(p);
+    }
+  )",
+      {"me_cy_self", "me_cy_pair", "me_cy_local", "me_cy_param"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_NE(MEs[0].Other, ModRef::None);
+  EXPECT_NE(MEs[1].Other, ModRef::None);
+  EXPECT_EQ(MEs[2].Other, ModRef::None);
+  EXPECT_NE(MEs[3].Other, ModRef::None);
+}
+
+// A captured parameter's memory may receive a pointer to a global through
+// the memory that holds the capture.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ForeignPointerThroughACapture) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_fc_g = 0;
+    __attribute__((noinline)) void me_fc_redirect(long*** q) {
+      **q = &me_fc_g;
+    }
+    extern "C" long me_fc_read(long*** q, long** p) {
+      *q = p;
+      me_fc_redirect(q);
+      return **p;
+    }
+  )",
+      {"me_fc_read"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(MEs[0].Captured[1]);
+  EXPECT_NE(MEs[0].Other, ModRef::None) << Describe(MEs[0]);
+}
+
+// Integer data loaded from a global holds no address.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerDataIsNoAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xc1_g = 0;
+    struct me_xc1_s { long n; long* p; };
+    extern "C" void me_xc1_f(me_xc1_s* s) {
+      s->n = me_xc1_g;
+      *s->p = 1;
+    }
+  )",
+      {"me_xc1_f"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_NE(MEs[0].Other, ModRef::None);
+  // Precision: only a read of the global.
+  EXPECT_FALSE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+}
+
+// A callee stores a global address as an integer into *p.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressStoredAsAnInteger) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xia_g1 = 0, me_xia_g2 = 0;
+    __attribute__((noinline)) void me_xia_c(unsigned long* p) {
+      *p = (unsigned long)&me_xia_g1;
+    }
+    extern "C" void me_xia_const(long** p) {
+      me_xia_c((unsigned long*)p);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xia_s(unsigned long* p, int c) {
+      *p = (unsigned long)(c ? &me_xia_g1 : &me_xia_g2);
+    }
+    extern "C" void me_xia_select(long** p, int c) {
+      me_xia_s((unsigned long*)p, c);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xia_l(unsigned long* p, int n) {
+      long* q = &me_xia_g1;
+      for (int i = 0; i < n; ++i)
+        q = (i & 1) ? &me_xia_g2 : q;
+      *p = (unsigned long)q;
+    }
+    extern "C" void me_xia_loop(long** p, int n) {
+      me_xia_l((unsigned long*)p, n);
+      **p = 1;
+    }
+    union me_xia_u { long* p; unsigned long i; };
+    __attribute__((noinline)) void me_xia_pun(me_xia_u* u) {
+      u->i = (unsigned long)&me_xia_g1;
+    }
+    extern "C" void me_xia_union(me_xia_u* u) {
+      me_xia_pun(u);
+      *u->p = 1;
+    }
+  )",
+      {"me_xia_const", "me_xia_select", "me_xia_loop", "me_xia_union"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(Writes(ME.Other)) << Describe(ME);
+  }
+}
+
+// Addresses that integers carry through selects, loads and arithmetic.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressArithmeticInIntegers) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xim_g1 = 0, me_xim_g2 = 0;
+    inline long* me_xim_gp = &me_xim_g1;
+    __attribute__((noinline)) void me_xim_s(unsigned long* p, long* q, int c) {
+      *p = (unsigned long)(c ? &me_xim_g1 : q);
+    }
+    extern "C" void me_xim_mixed(long** p, long* q, int c) {
+      me_xim_s((unsigned long*)p, q, c);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xim_i(unsigned long* p, int c) {
+      unsigned long a = (unsigned long)&me_xim_g1;
+      unsigned long b = (unsigned long)&me_xim_g2;
+      *p = c ? a : b;
+    }
+    extern "C" void me_xim_ints(long** p, int c) {
+      me_xim_i((unsigned long*)p, c);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xim_l(unsigned long* p) {
+      *p = (unsigned long)me_xim_gp;
+    }
+    extern "C" void me_xim_load(long** p) {
+      me_xim_l((unsigned long*)p);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_xim_o(unsigned long* p, int c) {
+      *p = (unsigned long)(c ? &me_xim_g1 : &me_xim_g2) + 8;
+    }
+    extern "C" void me_xim_offset(long** p, int c) {
+      me_xim_o((unsigned long*)p, c);
+      *(*p - 1) = 1;
+    }
+    extern "C" void me_xim_inline(long** p, int c) {
+      *(unsigned long*)p = (unsigned long)(c ? &me_xim_g1 : &me_xim_g2);
+      **p = 1;
+    }
+  )",
+      {"me_xim_mixed", "me_xim_ints", "me_xim_load", "me_xim_offset",
+       "me_xim_inline"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 5u);
+  for (size_t K = 0; K < MEs.size(); ++K) {
+    ASSERT_TRUE(MEs[K].Valid);
+    EXPECT_TRUE(Writes(MEs[K].Other)) << K << "\n" << Describe(MEs[K]);
+  }
+}
+
+// An integer argument of unknown source, copied as bytes into a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerArgumentCopiedAsBytes) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    __attribute__((noinline)) void me_xc2_install(int** dst,
+                                                  unsigned long bits) {
+      __builtin_memcpy(dst, &bits, 8);
+    }
+    extern "C" void me_xc2_c(int** dst, unsigned long bits) {
+      me_xc2_install(dst, bits);
+      **dst = 1;
+    }
+  )",
+      {"me_xc2_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+}
+
+// A pointer loaded from a global, stored as an integer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerFromAGlobalPointer) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xc3_g = 0;
+    inline long* me_xc3_gp = &me_xc3_g;
+    __attribute__((noinline)) void me_xc3_set(unsigned long* p) {
+      *p = (unsigned long)me_xc3_gp;
+    }
+    extern "C" void me_xc3_c() {
+      long* slot;
+      me_xc3_set((unsigned long*)&slot);
+      *slot = 1;
+    }
+  )",
+      {"me_xc3_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+}
+
+// A copy of an object that holds a pointer, done as an integer copy.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_PointerCopiedAsAnInteger) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  ASSERT_EQ(Cpp::Declare("#include <vector>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xpc_g = 0;
+    struct me_xpc_in { long* p; };
+    struct me_xpc_box { me_xpc_in* in; };
+    __attribute__((noinline)) void me_xpc_use(const me_xpc_box* b) {
+      *b->in->p = 1;
+    }
+    __attribute__((noinline)) void me_xpc_usev(const std::vector<me_xpc_box>* v) {
+      *(*v)[0].in->p = 1;
+    }
+    extern "C" void me_xpc_copy() {
+      me_xpc_in i{&me_xpc_g};
+      me_xpc_box t{&i};
+      me_xpc_box* b = new me_xpc_box(t);
+      me_xpc_use(b);
+      delete b;
+    }
+    extern "C" void me_xpc_param(long* q) {
+      me_xpc_in i{q};
+      me_xpc_box t{&i};
+      me_xpc_box* b = new me_xpc_box(t);
+      me_xpc_use(b);
+      delete b;
+    }
+    extern "C" void me_xpc_vector() {
+      me_xpc_in i{&me_xpc_g};
+      std::vector<me_xpc_box> v;
+      v.push_back(me_xpc_box{&i});
+      me_xpc_usev(&v);
+    }
+    extern "C" void me_xpc_vparam(long* q) {
+      me_xpc_in i{q};
+      std::vector<me_xpc_box> v;
+      v.push_back(me_xpc_box{&i});
+      me_xpc_usev(&v);
+    }
+    extern "C" void me_xpc_direct(me_xpc_box* out, long* q) {
+      me_xpc_in* i = new me_xpc_in{q};
+      me_xpc_box t{i};
+      *out = t;
+      me_xpc_use(out);
+    }
+  )",
+      {"me_xpc_copy", "me_xpc_param", "me_xpc_vector", "me_xpc_vparam"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[1].ParamsDirect[0]) || Writes(MEs[1].Other))
+      << Describe(MEs[1]);
+  EXPECT_TRUE(Writes(MEs[2].Other)) << Describe(MEs[2]);
+  EXPECT_TRUE(Writes(MEs[3].ParamsDirect[0]) || Writes(MEs[3].Other))
+      << Describe(MEs[3]);
+}
+
+// Levels behind a smart pointer and a heap box.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SmartPointerLevels) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  ASSERT_EQ(Cpp::Declare("#include <memory>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xup_g = 0;
+    struct me_xup_in { long* p; };
+    struct me_xup_box { me_xup_in* in; };
+    __attribute__((noinline)) void me_xup_use(const std::unique_ptr<me_xup_box>* u) {
+      *(*u)->in->p = 1;
+    }
+    __attribute__((noinline)) void me_xup_raw(const me_xup_box* b) {
+      *b->in->p = 1;
+    }
+    struct me_xup_w {
+      me_xup_box* p;
+      ~me_xup_w() { delete p; }
+    };
+    __attribute__((noinline)) void me_xup_wuse(const me_xup_w* w) {
+      *w->p->in->p = 1;
+    }
+    extern "C" void me_xup_make() {
+      me_xup_in i{&me_xup_g};
+      auto u = std::make_unique<me_xup_box>(me_xup_box{&i});
+      me_xup_use(&u);
+    }
+    extern "C" void me_xup_newu() {
+      me_xup_in i{&me_xup_g};
+      std::unique_ptr<me_xup_box> u(new me_xup_box{&i});
+      me_xup_use(&u);
+    }
+    extern "C" void me_xup_get() {
+      me_xup_in i{&me_xup_g};
+      auto u = std::make_unique<me_xup_box>(me_xup_box{&i});
+      me_xup_raw(u.get());
+    }
+    extern "C" void me_xup_wrap() {
+      me_xup_in i{&me_xup_g};
+      me_xup_w w{new me_xup_box{&i}};
+      me_xup_wuse(&w);
+    }
+    extern "C" void me_xup_wrapnodtor() {
+      me_xup_in i{&me_xup_g};
+      me_xup_box* b = new me_xup_box{&i};
+      me_xup_box* const* pb = &b;
+      me_xup_wuse(reinterpret_cast<const me_xup_w*>(pb));
+      delete b;
+    }
+  )",
+      {"me_xup_make", "me_xup_newu", "me_xup_get", "me_xup_wrap",
+       "me_xup_wrapnodtor"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 5u);
+  for (size_t K = 0; K < MEs.size(); ++K) {
+    ASSERT_TRUE(MEs[K].Valid);
+    EXPECT_TRUE(Writes(MEs[K].Other)) << K << "\n" << Describe(MEs[K]);
+  }
+}
+
+// Lambdas, references, arrays, smart pointers and constructors as levels.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MixedLevelKinds) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  ASSERT_EQ(Cpp::Declare("#include <memory>\n#include <new>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_xmk_g = 0;
+    struct me_xmk_in { long* p; };
+    struct me_xmk_box { me_xmk_in* in; };
+    template <class F> __attribute__((noinline)) void me_xmk_run(F& f) { f(); }
+    extern "C" void me_xmk_lambda() {
+      me_xmk_in i{&me_xmk_g};
+      me_xmk_box b{&i};
+      auto l = [&] { *b.in->p = 1; };
+      me_xmk_run(l);
+    }
+    struct me_xmk_ref { long& r; };
+    struct me_xmk_rbox { const me_xmk_ref* ref; };
+    __attribute__((noinline)) void me_xmk_rset(const me_xmk_rbox* b) {
+      b->ref->r = 1;
+    }
+    extern "C" void me_xmk_refm() {
+      me_xmk_ref r{me_xmk_g};
+      me_xmk_rbox b{&r};
+      me_xmk_rset(&b);
+    }
+    struct me_xmk_arr { long* a[4]; };
+    __attribute__((noinline)) void me_xmk_aset(me_xmk_arr* a, int k) {
+      a->a[k & 3] = &me_xmk_g;
+    }
+    extern "C" void me_xmk_array(me_xmk_arr* a, int k) {
+      me_xmk_aset(a, k);
+      *a->a[0] = 1;
+    }
+    __attribute__((noinline)) void me_xmk_use(const std::unique_ptr<me_xmk_box>* u) {
+      *(*u)->in->p = 1;
+    }
+    extern "C" void me_xmk_uptr() {
+      me_xmk_in i{&me_xmk_g};
+      auto u = std::make_unique<me_xmk_box>(me_xmk_box{&i});
+      me_xmk_use(&u);
+    }
+    extern "C" void me_xmk_heap() {
+      auto* i = new me_xmk_in{&me_xmk_g};
+      auto u = std::make_unique<me_xmk_box>(me_xmk_box{i});
+      me_xmk_use(&u);
+      delete i;
+    }
+    struct me_xmk_s {
+      long* p;
+      __attribute__((noinline)) me_xmk_s() : p(&me_xmk_g) {}
+    };
+    extern "C" void me_xmk_ctor(void* o) {
+      me_xmk_s* s = ::new (o) me_xmk_s();
+      *s->p = 1;
+    }
+  )",
+      {"me_xmk_lambda", "me_xmk_refm", "me_xmk_array", "me_xmk_uptr",
+       "me_xmk_heap", "me_xmk_ctor"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 6u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(Writes(ME.Other)) << Describe(ME);
+  }
+}
+
+// Integer data that holds an address, copied into a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerDataCarriesAnAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_ydl_g = 0;
+    struct me_ydl_f { uintptr_t a; };
+    inline uintptr_t me_ydl_ga = (uintptr_t)&me_ydl_g;
+    inline const uintptr_t me_ydl_tbl[2] = {(uintptr_t)&me_ydl_g,
+                                            (uintptr_t)&me_ydl_g};
+    __attribute__((noinline)) void me_ydl_fromg(me_ydl_f* f) {
+      f->a = me_ydl_ga;
+    }
+    __attribute__((noinline)) void me_ydl_fromt(me_ydl_f* f, int k) {
+      f->a = me_ydl_tbl[k & 1];
+    }
+    __attribute__((noinline)) uintptr_t me_ydl_rd(const me_ydl_f* s) {
+      return s->a;
+    }
+    __attribute__((noinline)) void me_ydl_st(me_ydl_f* f, const me_ydl_f* s) {
+      f->a = me_ydl_rd(s);
+    }
+    __attribute__((noinline)) void me_ydl_pokem(const me_ydl_f* f) {
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    extern "C" void me_ydl_global(me_ydl_f* f) {
+      me_ydl_fromg(f);
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    extern "C" void me_ydl_table(me_ydl_f* f, int k) {
+      me_ydl_fromt(f, k);
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    extern "C" void me_ydl_ret(me_ydl_f* f) {
+      me_ydl_f s{(uintptr_t)&me_ydl_g};
+      f->a = me_ydl_rd(&s);
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    extern "C" void me_ydl_retcallee(me_ydl_f* f) {
+      me_ydl_f s{(uintptr_t)&me_ydl_g};
+      me_ydl_st(f, &s);
+      me_ydl_pokem(f);
+    }
+    extern "C" void me_ydl_globallocal() {
+      me_ydl_f f{0};
+      me_ydl_fromg(&f);
+      me_ydl_pokem(&f);
+    }
+    extern "C" void me_ydl_inline(me_ydl_f* f) {
+      f->a = me_ydl_ga;
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+  )",
+      {"me_ydl_global", "me_ydl_table", "me_ydl_ret", "me_ydl_retcallee",
+       "me_ydl_globallocal", "me_ydl_inline"},
+      /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 6u);
+  for (size_t K = 0; K < MEs.size(); ++K) {
+    ASSERT_TRUE(MEs[K].Valid);
+    EXPECT_TRUE(Writes(MEs[K].Other)) << K << "\n" << Describe(MEs[K]);
+  }
+}
+
+// An address that an integer member holds, copied with the struct and then
+// copied back into a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressInACopiedIntegerMember) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_ym_g = 0;
+    struct me_ym_s { uintptr_t a; long n; };
+    __attribute__((noinline)) void me_ym_copy(me_ym_s* d, const me_ym_s* s) {
+      *d = *s;
+    }
+    extern "C" void me_ym_c(me_ym_s* d) {
+      me_ym_s s{(uintptr_t)&me_ym_g, 0};
+      me_ym_copy(d, &s);
+      long* q;
+      std::memcpy(&q, &d->a, sizeof q);
+      *q = 1;
+    }
+  )",
+      {"me_ym_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+}
+
+// Without optimization: an integer argument stored into an integer member,
+// then copied back into a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressInAnIntegerMemberAtO0) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_yo_g = 0;
+    inline uintptr_t me_yo_ga = (uintptr_t)&me_yo_g;
+    struct me_yo_f { uintptr_t a; long* p; };
+    void me_yo_set(me_yo_f* f, uintptr_t v) { f->a = v; }
+    extern "C" void me_yo_c(me_yo_f* f) {
+      me_yo_set(f, me_yo_ga);
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    struct me_yo_s { uintptr_t a; long n; };
+    void me_yo_copy(me_yo_s* d, const me_yo_s* s) { *d = *s; }
+    extern "C" void me_yo_struct(me_yo_s* d) {
+      me_yo_s s{(uintptr_t)&me_yo_g, 0};
+      me_yo_copy(d, &s);
+      long* q;
+      std::memcpy(&q, &d->a, sizeof q);
+      *q = 1;
+    }
+    // Precision: integer data next to a pointer member.
+    extern "C" void me_yo_data(me_yo_f* f, uintptr_t v) {
+      f->a = v;
+      *f->p = 1;
+    }
+  )",
+      {"me_yo_c", "me_yo_struct", "me_yo_data"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[1].Other)) << Describe(MEs[1]);
+  EXPECT_EQ(MEs[2].Other, ModRef::None) << Describe(MEs[2]);
+}
+
+// A trusted opaque call stores no pointer to other memory into its
+// arguments; an analysed callee is not trusted.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustCoversStoredPointers) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    inline long me_tc_g = 0;
+    void me_tc_fill(long** p);
+    extern "C" void me_tc_opaque(long** p) {
+      me_tc_fill(p);
+      **p = 1;
+    }
+    __attribute__((noinline)) void me_tc_set(long** p) { *p = &me_tc_g; }
+    extern "C" void me_tc_body(long** p) {
+      me_tc_set(p);
+      **p = 1;
+    }
+    struct me_tc_v { long a, b, c, d; };
+    void me_tc_fillv(long** p, me_tc_v v);
+    extern "C" void me_tc_unbounded(long** p) {
+      me_tc_fillv(p, {});
+      **p = 1;
+    }
+  )",
+      {"me_tc_opaque", "me_tc_body", "me_tc_unbounded"});
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  // Untrusted: the opaque call may store any pointer into *p.
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  // Trusted: the same fields as without the stored-pointer tracking.
+  EXPECT_EQ(MEs[0].TrustedOther, ModRef::None) << Describe(MEs[0]);
+  EXPECT_EQ(MEs[0].TrustedParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_EQ(MEs[0].TrustedParamsReachable[0], ModRef::Write);
+  EXPECT_FALSE(MEs[0].TrustedCaptured[0]);
+  // The analysed callee stores the global's address in both variants.
+  EXPECT_TRUE(Writes(MEs[1].Other)) << Describe(MEs[1]);
+  EXPECT_TRUE(Writes(MEs[1].TrustedOther)) << Describe(MEs[1]);
+  // A class by value: the signature does not bound the call.
+  EXPECT_FALSE(AllBounded(MEs[2])) << OpaqueNames(MEs[2]);
+  EXPECT_TRUE(Writes(MEs[2].TrustedOther)) << Describe(MEs[2]);
+}
+
+// A local that a trusted call fills holds pointers into the call's argument
+// memory or fresh memory, not into other memory.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedCallFillsALocal) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_tf_l { long* p; };
+    void me_tf_init(me_tf_l* l);
+    void me_tf_from(me_tf_l* l, long* q);
+    struct me_tf_v { long a, b, c, d; };
+    void me_tf_initv(me_tf_l* l, me_tf_v v);
+    __attribute__((noinline)) void me_tf_touch(long** o) { **o = 1; }
+    extern "C" void me_tf_own(long** out) {
+      me_tf_l l;
+      me_tf_init(&l);
+      *out = l.p;
+      me_tf_touch(out);
+    }
+    extern "C" void me_tf_arg(long* q) {
+      me_tf_l l;
+      me_tf_from(&l, q);
+      *l.p = 1;
+    }
+    extern "C" void me_tf_unbounded(long** out) {
+      me_tf_l l;
+      me_tf_initv(&l, {});
+      *out = l.p;
+      me_tf_touch(out);
+    }
+  )",
+      {"me_tf_own", "me_tf_arg", "me_tf_unbounded"});
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  // As without the stored-pointer tracking.
+  EXPECT_EQ(MEs[0].TrustedOther, ModRef::None) << Describe(MEs[0]);
+  EXPECT_FALSE(MEs[0].TrustedCaptured[0]) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  // l.p may point into q's memory.
+  EXPECT_TRUE(Writes(MEs[1].TrustedParamsDirect[0]) ||
+              Writes(MEs[1].TrustedParamsReachable[0]) ||
+              Writes(MEs[1].TrustedOther))
+      << Describe(MEs[1]);
+  EXPECT_TRUE(Writes(MEs[1].Other)) << Describe(MEs[1]);
+  // The signature does not bound the call.
+  EXPECT_TRUE(Writes(MEs[2].TrustedOther)) << Describe(MEs[2]);
+}
+
+// A trusted call may copy pointers from one argument's memory into another
+// argument's memory, but it keeps no copy of an argument itself.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedCallFillsAParameter) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    void me_fp_mv(long** r, long* const* qq);
+    struct me_fp_in { long* p; };
+    struct me_fp_out { me_fp_in* in; };
+    void me_fp_deep(me_fp_out* r, const me_fp_out* s);
+    // *r = *qq: the write lands in the memory that qq reaches.
+    extern "C" void me_fp_pp(long** r, long* const* qq) {
+      me_fp_mv(r, qq);
+      **r = 1;
+    }
+    // r->in = s->in: the write lands in the memory that s reaches.
+    extern "C" void me_fp_member(me_fp_out* r, const me_fp_out* s) {
+      me_fp_deep(r, s);
+      *r->in->p = 1;
+    }
+  )",
+      {"me_fp_pp", "me_fp_member"});
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(AllBounded(ME)) << OpaqueNames(ME);
+    EXPECT_TRUE(Writes(ME.TrustedParamsReachable[1]) || Writes(ME.TrustedOther))
+        << Describe(ME);
+    // The pointers of qq's memory now also live in r's memory.
+    EXPECT_TRUE(ME.TrustedCaptured[1]) << Describe(ME);
+  }
+}
+
+// The trusted fill of a fresh allocation, without a store into the table.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedFillOfFreshMemory) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  TestFixture::CreateInterpreter();
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_ff_table { int** slots; int own; };
+    void me_ff_fill(int** slots);
+    extern "C" void me_ff_c(me_ff_table* t) {
+      int** fresh = new int*[2];
+      fresh[0] = &t->own;
+      me_ff_fill(fresh);
+      *fresh[1] = 1;
+      delete[] fresh;
+    }
+  )",
+      {"me_ff_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  // fresh[1] points into the allocation or into *t, not into other memory.
+  // Through &t->own the callee may also reach what *t holds.
+  EXPECT_EQ(MEs[0].TrustedOther, ModRef::None) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].TrustedParamsDirect[0])) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].TrustedParamsReachable[0])) << Describe(MEs[0]);
+}
+
+// A getter that returns a string and may throw: the exception runtime and a
+// trusted string allocation add no effect on the receiver.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ThrowingGetterOfAString) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  SKIP_ON_LIBCXX("expects the string layout of libstdc++");
+  TestFixture::CreateInterpreter({"-O2", "-std=c++20"});
+  ASSERT_EQ(Cpp::Declare("#include <new>\n#include <optional>\n"
+                         "#include <stdexcept>\n#include <string>\n"
+                         "#include <vector>"),
+            0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_tg_sym {
+      std::vector<std::string> m;
+      std::optional<std::string> p1(int s, long u) const {
+        if (u < 0 || u >= (long)m.size()) throw std::runtime_error("no p1");
+        if (s < 0) return std::nullopt;
+        return m[u];
+      }
+      std::string name(long k) const {
+        if (k < 0) throw std::runtime_error("neg");
+        return m[k];
+      }
+    };
+    struct me_tg_api {
+      const me_tg_sym& s;
+      std::optional<std::string> get(int a, long u) const { return s.p1(a, u); }
+    };
+    extern "C" void me_tg_discard(const me_tg_api* r, int* a, long* u) {
+      (void)(*r).get(*a, *u);
+    }
+    extern "C" void me_tg_keep(const me_tg_api* r, int* a, long* u, void* out) {
+      ::new (out) std::optional<std::string>((*r).get(*a, *u));
+    }
+    extern "C" void me_tg_name(const me_tg_sym* c, long* k, void* out) {
+      ::new (out) std::string(c->name(*k));
+    }
+  )",
+      {"me_tg_discard", "me_tg_keep", "me_tg_name"});
+  ASSERT_EQ(MEs.size(), 3u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_FALSE(MEs[0].TrustedCaptured[0]) << Describe(MEs[0]);
+  EXPECT_EQ(MEs[1].TrustedOther, ModRef::None) << Describe(MEs[1]);
+  // A trusted allocation of the result may return unknown memory, which the
+  // copy writes; nothing reads other memory.
+  EXPECT_FALSE(static_cast<unsigned>(MEs[2].TrustedOther) &
+               static_cast<unsigned>(ModRef::Read))
+      << Describe(MEs[2]);
+  EXPECT_EQ(MEs[2].TrustedParamsReachable[0], ModRef::Read) << Describe(MEs[2]);
+}
+
+// A parameter captured into a local holder; a callee stores a global through
+// the holder. The capture post-pass must not need the holder's object.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           MemoryEffects_ForeignStoreThroughALocalHolder) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_lh_g = 0;
+    struct me_lh_h { long** p; };
+    __attribute__((noinline)) void me_lh_put(const me_lh_h* h) {
+      *h->p = &me_lh_g;
+    }
+    extern "C" void me_lh_c(long** p) {
+      me_lh_h h{p};
+      me_lh_put(&h);
+      **p = 1;
+    }
+  )",
+      {"me_lh_c"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].TrustedOther)) << Describe(MEs[0]);
+}
+
+// A table entry for a member that writes only an integer of its object. An
+// entry without the stored-pointer flags is read conservatively; an entry
+// from the current summarizer carries them.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryCarriesForeignStores) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  const std::string Fields =
+      llvm::utohexstr(llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::ModRef)
+                          .toIntValue()) +
+      "\t-c-.\tmn\tnn\t..\tn\t...";
+  const char* Code = R"(
+    struct me_sf_pol {
+      float f;
+      mutable unsigned long next;
+      unsigned long need(unsigned long n) const;
+    };
+    struct me_sf_tab { long* p; me_sf_pol pol; };
+    extern "C" void me_sf_c(me_sf_tab* t, const unsigned long* n) {
+      (void)t->pol.need(*n);
+      *t->p = 1;
+    }
+  )";
+  for (const char* Flags : {"", "000"}) {
+    TestFixture::CreateInterpreter({"-O2"});
+    std::string Table =
+        SummaryHeader() + "_ZNK9me_sf_pol4needEm\t" + Fields + Flags + "\t.\n";
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1) << Flags;
+    std::vector<Cpp::MemoryEffects> MEs =
+        Cpp::AnalyzeFunctionsMemoryEffects(Code, {"me_sf_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid);
+    EXPECT_TRUE(MEs[0].Opaque.empty()) << OpaqueNames(MEs[0]);
+    EXPECT_TRUE(Writes(MEs[0].ParamsReachable[0])) << Describe(MEs[0]);
+    if (*Flags)
+      EXPECT_EQ(MEs[0].Other, ModRef::None) << Describe(MEs[0]);
+    else
+      EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+  }
+}
+
+// The summarizer writes the stored-pointer flags. A model declaration that
+// writes its argument stores no foreign pointer only when it says so.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SummaryWritesForeignStores) {
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare i64 @me_sw_model(ptr captures(none), i64) memory(argmem: readwrite)
+    declare i64 @me_sw_bound(ptr captures(none), i64) memory(argmem: readwrite) "cppinterop-trusted-stores"
+    define i64 @me_sw_any(ptr %this, i64 %n) {
+      %r = call i64 @me_sw_model(ptr %this, i64 %n)
+      ret i64 %r
+    }
+    define i64 @me_sw_own(ptr %this, i64 %n) {
+      %r = call i64 @me_sw_bound(ptr %this, i64 %n)
+      ret i64 %r
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  // The result field: kind, two origins, two flag digits, other memory,
+  // the result flag.
+  auto Flags = [&](llvm::StringRef Name) {
+    std::vector<std::string> Row = RowOf(Table, Name);
+    return Row.size() == 9u && Row[7].size() == 7u ? Row[7].substr(3) : Table;
+  };
+  const std::string Any = Flags("me_sw_any");
+  const std::string Own = Flags("me_sw_own");
+  ASSERT_EQ(Any.size(), 4u) << Table;
+  ASSERT_EQ(Own.size(), 4u) << Table;
+  // A base-32 digit; bit 0 says that the parameter may receive one.
+  auto Bits = [](char C) {
+    return llvm::StringRef("0123456789abcdefghijklmnopqrstuv").find(C);
+  };
+  EXPECT_TRUE(Bits(Any[0]) & 1) << Table;
+  EXPECT_FALSE(Bits(Own[0]) & 1) << Table;
+  EXPECT_EQ(Own[2], '0') << Table;
+}
+
+// A callee stores its integer argument into heap memory of its object. At
+// -O0 no type proves it data; the caller knows the integer it passes.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerArgumentIntoAWindow) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt, "-std=c++20"});
+    ASSERT_EQ(Cpp::Declare("#include <algorithm>\n#include <cmath>\n"
+                           "#include <cstdint>\n#include <limits>\n"
+                           "#include <stdexcept>\n#include <vector>"),
+              0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      namespace me_iw_ns {
+      template <class T, std::size_t C> struct Ring {
+        Ring() { m_buffer.resize(C); }
+        std::size_t size() const { return m_write - m_read; }
+        bool empty() const { return m_write == m_read; }
+        T& operator[](std::size_t i) { return m_buffer[(m_read + i) & (C - 1)]; }
+        void push_back(const T& v) {
+          m_buffer[m_write & (C - 1)] = v;
+          if (++m_write - m_read > C)
+            ++m_read;
+        }
+        T pop_front() {
+          if (empty())
+            throw std::runtime_error("pop_front on an empty buffer");
+          return m_buffer[m_read++ & (C - 1)];
+        }
+        std::vector<T> m_buffer;
+        std::size_t m_write = 0, m_read = 0;
+      };
+      struct Window {
+        struct Rec { std::int64_t t{}; double v{}; };
+        void update(std::int64_t now, double value, double ms) {
+          if (now > 0 && value != 0) m_buffer.push_back({now, value});
+          while (m_buffer.size() > 1 && now - m_buffer[1].t >= ms * 1e6)
+            m_buffer.pop_front();
+          m_value = m_buffer[0].v;
+          m_age = std::clamp(double(now - m_buffer[0].t), 0.0, ms * 1e6);
+        }
+        Ring<Rec, 1024> m_buffer;
+        double m_value{}, m_age{};
+      };
+      struct State { bool off; double value, age; Window w; };
+      }
+      extern "C" void me_iw_c(me_iw_ns::State* s, const std::int64_t* now,
+                              const double* v, const double* ms) {
+        if (s->off) return;
+        s->w.update(*now, *v, *ms);
+        s->value = s->w.m_value;
+        s->age = s->w.m_age;
+      }
+    )",
+        {"me_iw_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid) << Opt;
+    EXPECT_EQ(MEs[0].TrustedOther, ModRef::None) << Opt << Describe(MEs[0]);
+    EXPECT_FALSE(MEs[0].TrustedCaptured[0]) << Opt << Describe(MEs[0]);
+    EXPECT_TRUE(Writes(MEs[0].TrustedParamsReachable[0])) << Opt;
+  }
+}
+
+// The out-of-line rehash policy of a hash set, from a table entry with the
+// stored-pointer flags: inserting into a set of integers is no foreign write.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_HashSetWithPolicyEntries) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  SKIP_ON_LIBCXX("expects the out-of-line rehash policy of libstdc++");
+  const std::string E = llvm::utohexstr(
+      llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::ModRef).toIntValue());
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt, "-std=c++20"});
+    const std::string Table =
+        SummaryHeader() +
+        "_ZNKSt8__detail20_Prime_rehash_policy14_M_need_rehashEmmm\t" + E +
+        "\t-c-.-.-.\tmnnn\tnnnn\t....\tn\t.....00000\t.\n" +
+        "_ZNKSt8__detail20_Prime_rehash_policy11_M_next_bktEm\t" + E +
+        "\t-c-.\tmn\tnn\t..\tn\t...000\t.\n";
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 2);
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <unordered_set>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      struct me_hs_state { bool off; std::unordered_set<std::uint64_t> ids; };
+      extern "C" void me_hs_c(me_hs_state* s, const bool* clear,
+                              const std::uint64_t* id) {
+        if (s->off) return;
+        if (*clear) s->ids.clear();
+        s->ids.insert(*id);
+      }
+    )",
+        {"me_hs_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid) << Opt;
+    EXPECT_TRUE(MEs[0].Opaque.empty()) << OpaqueNames(MEs[0]);
+    EXPECT_EQ(MEs[0].Other, ModRef::None) << Opt << Describe(MEs[0]);
+    EXPECT_FALSE(MEs[0].Captured[0]) << Opt << Describe(MEs[0]);
+    EXPECT_TRUE(Writes(MEs[0].ParamsReachable[0])) << Opt;
+  }
+}
+
+// Two handles: integer data of one handle's memory added into the memory of
+// the other is no copy of a pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_SumOfTwoHandles) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      struct me_sh_impl { long v = 0; };
+      inline me_sh_impl me_sh_g;
+      struct me_sh_handle { me_sh_impl* impl = &me_sh_g; };
+      inline long me_sh_poke(const me_sh_handle& a, const me_sh_handle& b) {
+        a.impl->v += b.impl->v;
+        return a.impl->v;
+      }
+      extern "C" void me_sh_c(const me_sh_handle* a, const me_sh_handle* b) {
+        (void)me_sh_poke(*a, *b);
+      }
+    )",
+        {"me_sh_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid) << Opt;
+    EXPECT_FALSE(MEs[0].Captured[1]) << Opt << Describe(MEs[0]);
+    EXPECT_EQ(MEs[0].ParamsReachable[1], ModRef::Read) << Opt;
+    EXPECT_TRUE(Writes(MEs[0].ParamsReachable[0])) << Opt;
+  }
+}
+
+// A table entry of a function that copies integer data of a global into
+// the object it returns. The caller frees the buffer of the result.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ResultFilledFromAGlobal) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %S = type { ptr, i64, i64 }
+    @me_rg_g = global %S zeroinitializer
+    declare noalias ptr @_Znwm(i64)
+    define void @_Z10me_rg_copyv(ptr sret(%S) %r) {
+      %np = getelementptr i8, ptr @me_rg_g, i64 8
+      %n = load i64, ptr %np, !tbaa !1, !cppinterop.integer !5
+      %b = call ptr @_Znwm(i64 %n)
+      store ptr %b, ptr %r, !tbaa !4
+      %rn = getelementptr i8, ptr %r, i64 8
+      store i64 %n, ptr %rn, !tbaa !1, !cppinterop.integer !5
+      %rc = getelementptr i8, ptr %r, i64 16
+      store i64 %n, ptr %rc, !tbaa !1, !cppinterop.integer !5
+      ret void
+    }
+    !0 = !{!"me root"}
+    !2 = !{!"long", !0, i64 0}
+    !1 = !{!2, !2, i64 0}
+    !3 = !{!"any pointer", !0, i64 0}
+    !4 = !{!3, !3, i64 0}
+    !5 = !{}
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  // The integer marks are what MarkIntegerLoads gives the -O0 code.
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1) << Table;
+  ASSERT_EQ(Cpp::Declare("#include <new>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_rg_s { char* p; long n; long c; };
+    me_rg_s me_rg_copy();
+    extern "C" void me_rg_c() {
+      me_rg_s s = me_rg_copy();
+      ::operator delete(s.p, s.c);
+    }
+  )",
+      {"me_rg_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(MEs[0].Opaque.empty()) << OpaqueNames(MEs[0]);
+  // The read of the global; the buffer is fresh memory.
+  EXPECT_EQ(MEs[0].Other, ModRef::Read) << Table << Describe(MEs[0]);
+}
+
+// An old-format entry of a function that writes nothing stores and copies
+// nothing.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_OldReadOnlyEntryCopiesNothing) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  TestFixture::CreateInterpreter({"-O2"});
+  const std::string E = llvm::utohexstr(
+      (llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::Ref) |
+       llvm::MemoryEffects::inaccessibleMemOnly(llvm::ModRefInfo::ModRef))
+          .toIntValue());
+  const std::string Table = SummaryHeader() + "_Z9me_or_logPKcRKl\t" + E +
+                            "\trcrc\trr\trr\t..\tn\t...\t.\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    void me_or_log(const char* fmt, const long& v);
+    struct me_or_box { long* p; long n; };
+    extern "C" void me_or_c(me_or_box* b, const long* v) {
+      b->n = *v;
+      me_or_log("{}", b->n);
+      *b->p = 1;
+    }
+  )",
+      {"me_or_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_EQ(MEs[0].Other, ModRef::None) << Describe(MEs[0]);
+  EXPECT_FALSE(MEs[0].Captured[0]) << Describe(MEs[0]);
+}
+
+// A string from a table entry, copied by characters into memory that holds
+// integer data of a global: the characters are no pointers.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CharacterCopyIntoDataMemory) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  SKIP_ON_LIBCXX("expects the string layout of libstdc++");
+  TestFixture::CreateInterpreter({"-O0", "-std=c++20"});
+  const std::string Table =
+      SummaryHeader() +
+      "_Z10me_cd_makeB5cxx11i\tFF\t-.-.\twn\tnn\too\tn\t...220\t.\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+  ASSERT_EQ(Cpp::Declare("#include <string>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    inline long me_cd_g = 0;
+    struct me_cd_box { long n; std::string s; };
+    std::string me_cd_make(int k);
+    me_cd_box me_cd_get(int k) {
+      const std::string s = me_cd_make(k);
+      return me_cd_box{me_cd_g, s};
+    }
+    extern "C" void me_cd_c(void* out, const int* k) {
+      ::new (out) me_cd_box(me_cd_get(*k));
+    }
+  )",
+      {"me_cd_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_FALSE(Writes(MEs[0].TrustedOther)) << Describe(MEs[0]);
+}
+
+// A name from a constant table of {pointer, length} views, copied into the
+// result: the length that the view holds is no foreign pointer.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_LengthFromAConstantView) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %S = type { ptr, i64, i64 }
+    @me_lv_s0 = constant [2 x i8] c"a\00"
+    @me_lv_s1 = constant [3 x i8] c"bc\00"
+    @me_lv_names = constant [2 x { i64, ptr }]
+        [{ i64, ptr } { i64 1, ptr @me_lv_s0 }, { i64, ptr } { i64 2, ptr @me_lv_s1 }]
+    declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+    define internal { i64, ptr } @me_lv_view(i32 %k) noinline {
+      %i = zext i32 %k to i64
+      %e = getelementptr [2 x { i64, ptr }], ptr @me_lv_names, i64 0, i64 %i
+      %v = load { i64, ptr }, ptr %e
+      ret { i64, ptr } %v
+    }
+    define void @_Z10me_lv_namei(ptr sret(%S) %r, i32 %k) {
+      %sv = call { i64, ptr } @me_lv_view(i32 %k)
+      %n = extractvalue { i64, ptr } %sv, 0
+      %p = extractvalue { i64, ptr } %sv, 1
+      %buf = getelementptr i8, ptr %r, i64 16
+      store ptr %buf, ptr %r
+      %len = getelementptr i8, ptr %r, i64 8
+      store i64 %n, ptr %len
+      call void @llvm.memcpy.p0.p0.i64(ptr %buf, ptr %p, i64 1, i1 false)
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  std::vector<std::string> Row = RowOf(Table, "_Z10me_lv_namei");
+  ASSERT_EQ(Row.size(), 9u) << Table;
+  // Kind, two origins, the flags of the result and of the integer, other
+  // memory, then the result flag.
+  ASSERT_EQ(Row[7].size(), 7u) << Table;
+  const size_t Bits =
+      llvm::StringRef("0123456789abcdefghijklmnopqrstuv").find(Row[7][3]);
+  EXPECT_FALSE(Bits & 1) << Table;
+  TestFixture::CreateInterpreter();
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1) << Table;
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_lv_s { char* p; long n; long c; };
+    me_lv_s me_lv_name(int k);
+    extern "C" void me_lv_c(const int* k, char* out) {
+      me_lv_s s = me_lv_name(*k);
+      *out = *s.p;
+    }
+  )",
+      {"me_lv_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_FALSE(Writes(MEs[0].TrustedOther)) << Table << Describe(MEs[0]);
+}
+
+// A table entry that constructs an optional string in its result and only
+// reads other memory, called through inline layers. The result object holds
+// nothing of what its memory held before the call.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ResultThroughInlineLayers) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  SKIP_ON_LIBCXX("expects the string layout of libstdc++");
+  TestFixture::CreateInterpreter({"-O0", "-std=c++20"});
+  // Sret, receiver, two integers; the result may receive integer data and
+  // read it back, and holds only its own pointers. Untrusted, the throw path
+  // is opaque.
+  const std::string Table =
+      SummaryHeader() + "_ZNK9me_rl_api3getB5cxx11Eil\tFFF\t-.rc-.-.\twrnn\t" +
+      "mrnn\t..c.\tm\t.....e2521\ti\tFFF\t-.rc-.-.\twrnn\tmrnn\ts.c.\tr\t" +
+      ".....e2620\t_ZNSt13runtime_errorC1EPKc\n";
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+  ASSERT_EQ(
+      Cpp::Declare("#include <new>\n#include <optional>\n#include <string>"),
+      0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_rl_api {
+      long* data;
+      std::optional<std::string> get(int kind, long id) const;
+    };
+    struct me_rl_client {
+      me_rl_api api;
+      std::optional<std::string> get(int kind, long id) const {
+        return api.get(kind, id);
+      }
+    };
+    struct me_rl_getter {
+      static std::optional<std::string> get(const me_rl_client& c, int k,
+                                            long id) {
+        return c.get(k, id);
+      }
+    };
+    extern "C" void me_rl_d(const me_rl_client* c, const int* k,
+                            const long* id) {
+      (void)me_rl_getter::get(*c, *k, *id);
+    }
+    extern "C" void me_rl_k(const me_rl_client* c, const int* k,
+                            const long* id, void* out) {
+      ::new (out) std::optional<std::string>(me_rl_getter::get(*c, *k, *id));
+    }
+  )",
+      {"me_rl_d", "me_rl_k"});
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(Mentions(ME, "runtime_error")) << OpaqueNames(ME);
+    EXPECT_EQ(ME.TrustedOther, ModRef::Read) << Describe(ME);
+    EXPECT_FALSE(ME.TrustedCaptured[0]) << Describe(ME);
+  }
+}
+
+// At -O0, a result string copies a local string or a string that the
+// receiver points to. Each copy loads the length twice, and optimization
+// merges the loads. A merged load still reads an integer object: it holds no
+// pointer, and the result holds only its own pointers.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_MergedIntegerLoadStaysData) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  ASSERT_EQ(CppInternal::LoadMemoryEffectsSummaries(
+                SummaryHeader() + "me_ml_make\tFFF\t-.-.\twn\tnn\toc\tn\t" +
+                "...220\t.\n"),
+            1);
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %S = type { ptr, i64, [16 x i8] }
+    declare noalias ptr @_Znwm(i64)
+    declare void @_ZdlPvm(ptr, i64)
+    declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+    declare void @me_ml_make(ptr sret(%S), i8)
+    define linkonce_odr ptr @_ZNSt11char_traitsIcE4copyEPcPKcm(ptr %d, ptr %s,
+        i64 %n) optnone noinline {
+      call void @llvm.memcpy.p0.p0.i64(ptr %d, ptr %s, i64 %n, i1 false)
+      ret ptr %d
+    }
+    define i64 @me_ml_size(ptr %s) optnone noinline {
+      %l = getelementptr inbounds %S, ptr %s, i32 0, i32 1
+      %n = load i64, ptr %l
+      ret i64 %n
+    }
+    define void @me_ml_copy(ptr %r, ptr %s) optnone noinline {
+      %rb = getelementptr inbounds %S, ptr %r, i32 0, i32 2
+      store ptr %rb, ptr %r
+      %p = load ptr, ptr %s
+      %n1 = call i64 @me_ml_size(ptr %s)
+      %n2 = call i64 @me_ml_size(ptr %s)
+      %big = icmp ugt i64 %n1, 15
+      br i1 %big, label %heap, label %copy
+    heap:
+      %size = add i64 %n1, 1
+      %h = call ptr @_Znwm(i64 %size)
+      store ptr %h, ptr %r
+      store i64 %n2, ptr %rb
+      br label %copy
+    copy:
+      %d = load ptr, ptr %r
+      call ptr @_ZNSt11char_traitsIcE4copyEPcPKcm(ptr %d, ptr %p, i64 %n1)
+      %rl = getelementptr inbounds %S, ptr %r, i32 0, i32 1
+      store i64 %n2, ptr %rl
+      ret void
+    }
+    define void @me_ml_get(ptr noalias sret(%S) %r, ptr %this, i8 %k)
+        optnone noinline {
+      %s = alloca %S
+      %own = icmp eq i8 %k, 0
+      br i1 %own, label %mine, label %local
+    mine:
+      %t = load ptr, ptr %this
+      call void @me_ml_copy(ptr %r, ptr %t)
+      ret void
+    local:
+      call void @me_ml_make(ptr sret(%S) %s, i8 %k)
+      call void @me_ml_copy(ptr %r, ptr %s)
+      %p = load ptr, ptr %s
+      %sb = getelementptr inbounds %S, ptr %s, i32 0, i32 2
+      %short = icmp eq ptr %p, %sb
+      br i1 %short, label %done, label %free
+    free:
+      call void @_ZdlPvm(ptr %p, i64 16)
+      br label %done
+    done:
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  std::vector<std::string> Row = RowOf(Table, "me_ml_get");
+  ASSERT_EQ(Row.size(), 9u) << Table;
+  EXPECT_EQ(Row[5][0], 's') << Table;
+}
+
+// A local holds an address as an integer. A callee stores a sum or a
+// tagged form of it into the argument, and the caller reads the argument
+// back as a pointer and writes through it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ArithmeticOnAnAddressInData) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_ad_g[8] = {};
+      struct me_ad_f { uintptr_t a; };
+      __attribute__((noinline)) void me_ad_addk(me_ad_f* d, const me_ad_f* s) {
+        d->a = s->a + 8;
+      }
+      __attribute__((noinline)) void me_ad_tag(me_ad_f* d, const me_ad_f* s) {
+        d->a = (s->a & ~uintptr_t(7)) | 1;
+      }
+      __attribute__((noinline)) void me_ad_poke(const void* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      __attribute__((noinline)) void me_ad_untag(const me_ad_f* d) {
+        *reinterpret_cast<long*>(d->a & ~uintptr_t(7)) = 1;
+      }
+      extern "C" void me_ad_sum(me_ad_f* d) {
+        me_ad_f s{(uintptr_t)&me_ad_g[0]};
+        me_ad_addk(d, &s);
+        me_ad_poke(d);
+      }
+      extern "C" void me_ad_tagged(me_ad_f* d) {
+        me_ad_f s{(uintptr_t)&me_ad_g[0]};
+        me_ad_tag(d, &s);
+        me_ad_untag(d);
+      }
+    )",
+        {"me_ad_sum", "me_ad_tagged"});
+    ASSERT_EQ(MEs.size(), 2u);
+    for (const Cpp::MemoryEffects& ME : MEs) {
+      ASSERT_TRUE(ME.Valid) << Opt;
+      EXPECT_TRUE(Writes(ME.Other)) << Opt << Describe(ME);
+      EXPECT_TRUE(Writes(ME.TrustedOther)) << Opt << Describe(ME);
+    }
+  }
+}
+
+// As above, with the callee as a table entry that the summarizer writes
+// from its -O0 body.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ArithmeticOnAnAddressInATable) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %F = type { i64 }
+    define void @me_at_addk(ptr %d, ptr %s) optnone noinline {
+      %dp = alloca ptr
+      %sp = alloca ptr
+      store ptr %d, ptr %dp
+      store ptr %s, ptr %sp
+      %s1 = load ptr, ptr %sp
+      %sa = getelementptr inbounds %F, ptr %s1, i32 0, i32 0
+      %v = load i64, ptr %sa
+      %w = add i64 %v, 8
+      %d1 = load ptr, ptr %dp
+      %da = getelementptr inbounds %F, ptr %d1, i32 0, i32 0
+      store i64 %w, ptr %da
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  TestFixture::CreateInterpreter({"-O0"});
+  ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1) << Table;
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    inline long me_at_g[8] = {};
+    struct me_at_f { uintptr_t a; };
+    extern "C" void me_at_addk(me_at_f* d, const me_at_f* s);
+    extern "C" void me_at_c(me_at_f* d) {
+      me_at_f s{(uintptr_t)&me_at_g[0]};
+      me_at_addk(d, &s);
+      long* q;
+      std::memcpy(&q, d, sizeof q);
+      *q = 1;
+    }
+  )",
+      {"me_at_c"});
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Table << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[0].TrustedOther)) << Table << Describe(MEs[0]);
+}
+
+// A callee puts an address into an integer object, or passes it on as an
+// integer result or argument. Another callee adds to it. The caller reads
+// the result back as a pointer and writes through it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressDataFromCallees) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_cd_g[8] = {};
+      struct me_cd_f { uintptr_t a; };
+      struct me_cd_big { uintptr_t a; long pad[8]; };
+      __attribute__((noinline)) void me_cd_seta(me_cd_f* f, uintptr_t a) {
+        f->a = a;
+      }
+      __attribute__((noinline)) void me_cd_seta2(me_cd_f* f, uintptr_t a) {
+        me_cd_seta(f, a);
+      }
+      __attribute__((noinline)) void me_cd_addk(me_cd_f* d,
+                                                const me_cd_f* s) {
+        d->a = s->a + 8;
+      }
+      __attribute__((noinline)) void me_cd_addb(me_cd_f* d,
+                                                const me_cd_big* s) {
+        d->a = s->a + 8;
+      }
+      __attribute__((noinline)) void me_cd_fill(me_cd_big* d) {
+        me_cd_big t{};
+        t.a = (uintptr_t)&me_cd_g[0];
+        std::memcpy(d, &t, sizeof t);
+      }
+      __attribute__((noinline)) uintptr_t me_cd_rd(const me_cd_f* s) {
+        return s->a;
+      }
+      __attribute__((noinline)) void me_cd_add8(me_cd_f* d, uintptr_t v) {
+        d->a = v + 8;
+      }
+      __attribute__((noinline)) void me_cd_poke(const void* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      extern "C" void me_cd_set(me_cd_f* d) {
+        me_cd_f s{0};
+        me_cd_seta(&s, (uintptr_t)&me_cd_g[0]);
+        me_cd_addk(d, &s);
+        me_cd_poke(d);
+      }
+      extern "C" void me_cd_set2(me_cd_f* d) {
+        me_cd_f s{0};
+        me_cd_seta2(&s, (uintptr_t)&me_cd_g[0]);
+        me_cd_addk(d, &s);
+        me_cd_poke(d);
+      }
+      extern "C" void me_cd_copy(me_cd_f* d) {
+        me_cd_big s;
+        me_cd_fill(&s);
+        me_cd_addb(d, &s);
+        me_cd_poke(d);
+      }
+      extern "C" void me_cd_split(me_cd_f* d) {
+        me_cd_f s{(uintptr_t)&me_cd_g[0]};
+        me_cd_add8(d, me_cd_rd(&s));
+        me_cd_poke(d);
+      }
+    )",
+        {"me_cd_set", "me_cd_set2", "me_cd_copy", "me_cd_split"});
+    ASSERT_EQ(MEs.size(), 4u);
+    for (size_t K = 0; K < MEs.size(); ++K) {
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+      EXPECT_TRUE(Writes(MEs[K].Other)) << Opt << " " << K << Describe(MEs[K]);
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Describe(MEs[K]);
+    }
+  }
+}
+
+// The callees above as table entries that the summarizer writes from their
+// -O0 bodies.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_AddressDataThroughTables) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    %struct.me_ct_f = type { i64 }
+    %struct.me_ct_big = type { i64, [8 x i64] }
+    @me_ct_g = global [8 x i64] zeroinitializer
+    define void @me_ct_seta(ptr %f, i64 %a) optnone noinline {
+    entry:
+      %f.addr = alloca ptr
+      %a.addr = alloca i64
+      store ptr %f, ptr %f.addr
+      store i64 %a, ptr %a.addr
+      %0 = load i64, ptr %a.addr
+      %1 = load ptr, ptr %f.addr
+      %a1 = getelementptr inbounds nuw %struct.me_ct_f, ptr %1, i32 0, i32 0
+      store i64 %0, ptr %a1
+      ret void
+    }
+    define void @me_ct_seta2(ptr %f, i64 %a) optnone noinline {
+    entry:
+      %f.addr = alloca ptr
+      %a.addr = alloca i64
+      store ptr %f, ptr %f.addr
+      store i64 %a, ptr %a.addr
+      %0 = load ptr, ptr %f.addr
+      %1 = load i64, ptr %a.addr
+      call void @me_ct_seta(ptr %0, i64 %1)
+      ret void
+    }
+    define void @me_ct_addk(ptr %d, ptr %s) optnone noinline {
+    entry:
+      %d.addr = alloca ptr
+      %s.addr = alloca ptr
+      store ptr %d, ptr %d.addr
+      store ptr %s, ptr %s.addr
+      %0 = load ptr, ptr %s.addr
+      %a = getelementptr inbounds nuw %struct.me_ct_f, ptr %0, i32 0, i32 0
+      %1 = load i64, ptr %a
+      %add = add i64 %1, 8
+      %2 = load ptr, ptr %d.addr
+      %a1 = getelementptr inbounds nuw %struct.me_ct_f, ptr %2, i32 0, i32 0
+      store i64 %add, ptr %a1
+      ret void
+    }
+    define void @me_ct_addb(ptr %d, ptr %s) optnone noinline {
+    entry:
+      %d.addr = alloca ptr
+      %s.addr = alloca ptr
+      store ptr %d, ptr %d.addr
+      store ptr %s, ptr %s.addr
+      %0 = load ptr, ptr %s.addr
+      %a = getelementptr inbounds nuw %struct.me_ct_big, ptr %0, i32 0, i32 0
+      %1 = load i64, ptr %a
+      %add = add i64 %1, 8
+      %2 = load ptr, ptr %d.addr
+      %a1 = getelementptr inbounds nuw %struct.me_ct_f, ptr %2, i32 0, i32 0
+      store i64 %add, ptr %a1
+      ret void
+    }
+    define void @me_ct_fill(ptr %d) optnone noinline {
+    entry:
+      %d.addr = alloca ptr
+      %t = alloca %struct.me_ct_big
+      store ptr %d, ptr %d.addr
+      call void @llvm.memset.p0.i64(ptr %t, i8 0, i64 72, i1 false)
+      %a = getelementptr inbounds nuw %struct.me_ct_big, ptr %t, i32 0, i32 0
+      store i64 ptrtoint (ptr @me_ct_g to i64), ptr %a
+      %0 = load ptr, ptr %d.addr
+      call void @llvm.memcpy.p0.p0.i64(ptr %0, ptr %t, i64 72, i1 false)
+      ret void
+    }
+    declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
+    declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+    define i64 @me_ct_rd(ptr %s) optnone noinline {
+    entry:
+      %s.addr = alloca ptr
+      store ptr %s, ptr %s.addr
+      %0 = load ptr, ptr %s.addr
+      %a = getelementptr inbounds nuw %struct.me_ct_f, ptr %0, i32 0, i32 0
+      %1 = load i64, ptr %a
+      ret i64 %1
+    }
+    define void @me_ct_add8(ptr %d, i64 %v) optnone noinline {
+    entry:
+      %d.addr = alloca ptr
+      %v.addr = alloca i64
+      store ptr %d, ptr %d.addr
+      store i64 %v, ptr %v.addr
+      %0 = load i64, ptr %v.addr
+      %add = add i64 %0, 8
+      %1 = load ptr, ptr %d.addr
+      %a = getelementptr inbounds nuw %struct.me_ct_f, ptr %1, i32 0, i32 0
+      store i64 %add, ptr %a
+      ret void
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 7) << Table;
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_ct_h[8] = {};
+      extern "C" {
+      struct me_ct_f { uintptr_t a; };
+      struct me_ct_big { uintptr_t a; long pad[8]; };
+      void me_ct_seta(me_ct_f* f, uintptr_t a);
+      void me_ct_seta2(me_ct_f* f, uintptr_t a);
+      void me_ct_addk(me_ct_f* d, const me_ct_f* s);
+      void me_ct_addb(me_ct_f* d, const me_ct_big* s);
+      void me_ct_fill(me_ct_big* d);
+      uintptr_t me_ct_rd(const me_ct_f* s);
+      void me_ct_add8(me_ct_f* d, uintptr_t v);
+      void me_ct_poke(const me_ct_f* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      void me_ct_set(me_ct_f* d) {
+        me_ct_f s{0};
+        me_ct_seta(&s, (uintptr_t)&me_ct_h[0]);
+        me_ct_addk(d, &s);
+        me_ct_poke(d);
+      }
+      void me_ct_set2(me_ct_f* d) {
+        me_ct_f s{0};
+        me_ct_seta2(&s, (uintptr_t)&me_ct_h[0]);
+        me_ct_addk(d, &s);
+        me_ct_poke(d);
+      }
+      void me_ct_copy(me_ct_f* d) {
+        me_ct_big s;
+        me_ct_fill(&s);
+        me_ct_addb(d, &s);
+        me_ct_poke(d);
+      }
+      void me_ct_split(me_ct_f* d) {
+        me_ct_f s{(uintptr_t)&me_ct_h[0]};
+        me_ct_add8(d, me_ct_rd(&s));
+        me_ct_poke(d);
+      }
+      }
+    )",
+        {"me_ct_set", "me_ct_set2", "me_ct_copy", "me_ct_split"});
+    ASSERT_EQ(MEs.size(), 4u);
+    for (size_t K = 0; K < MEs.size(); ++K) {
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+      EXPECT_TRUE(Writes(MEs[K].Other))
+          << Opt << " " << K << Table << Describe(MEs[K]);
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Describe(MEs[K]);
+    }
+  }
+}
+
+// Models of the rehash policy: each passes its integer arguments to a
+// trusted declaration and returns its integer result. A summary says that
+// the result holds no address, so a hash set that keeps the bucket count
+// and the size of a state with two inline layers stays clean.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_HashSetWithModeledPolicy) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI("the summary table keys Itanium mangled names");
+  SKIP_ON_LIBCXX("expects the out-of-line rehash policy of libstdc++");
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare i64 @me_hm_policy(ptr captures(none), i64)
+        memory(argmem: readwrite) nounwind willreturn
+        "cppinterop-trusted-stores"
+    define i64 @_ZNKSt8__detail20_Prime_rehash_policy11_M_next_bktEm(
+        ptr %this, i64 %n) {
+      %r = call i64 @me_hm_policy(ptr %this, i64 %n)
+      ret i64 %r
+    }
+    define { i8, i64 }
+    @_ZNKSt8__detail20_Prime_rehash_policy14_M_need_rehashEmmm(
+        ptr %this, i64 %b, i64 %e, i64 %i) {
+      %s = add i64 %e, %i
+      %r = call i64 @me_hm_policy(ptr %this, i64 %s)
+      %c = icmp ugt i64 %r, %b
+      %f = zext i1 %c to i8
+      %p = insertvalue { i8, i64 } undef, i8 %f, 0
+      %q = insertvalue { i8, i64 } %p, i64 %r, 1
+      ret { i8, i64 } %q
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt, "-std=c++20"});
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 2) << Table;
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <new>\n"
+                           "#include <type_traits>\n#include <unordered_set>"),
+              0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      struct me_hm_state { bool off; std::unordered_set<std::uint64_t> ids; };
+      inline void me_hm_0(me_hm_state& s, const bool& clear,
+                          const bool& add, const std::uint64_t& id) {
+        if (clear) s.ids.clear();
+        if (add) s.ids.insert(id);
+      }
+      inline void me_hm_1(const bool& bad, me_hm_state& s, const bool& clear,
+                          const bool& add, const std::uint64_t& id) {
+        if (bad) s.off = true;
+        if (s.off) return;
+        me_hm_0(s, clear, add, id);
+      }
+      template <class F> inline void me_hm_sink(void* out, F f) {
+        using R = decltype(f());
+        if constexpr (std::is_void_v<R>) f();
+        else ::new (out) std::remove_cv_t<R>(f());
+      }
+      extern "C" void me_hm_d(const bool* bad, me_hm_state* s,
+                              const bool* clear, const bool* add,
+                              const std::uint64_t* id) {
+        me_hm_1(*bad, *s, *clear, *add, *id);
+      }
+      extern "C" void me_hm_k(const bool* bad, me_hm_state* s,
+                              const bool* clear, const bool* add,
+                              const std::uint64_t* id, void* out) {
+        me_hm_sink(out, [&]() -> decltype(auto) {
+          return me_hm_1(*bad, *s, *clear, *add, *id);
+        });
+      }
+    )",
+        {"me_hm_d", "me_hm_k"});
+    ASSERT_EQ(MEs.size(), 2u);
+    for (const Cpp::MemoryEffects& ME : MEs) {
+      ASSERT_TRUE(ME.Valid) << Opt;
+      EXPECT_TRUE(ME.Opaque.empty()) << OpaqueNames(ME);
+      EXPECT_EQ(ME.Other, ModRef::None) << Opt << Table << Describe(ME);
+      EXPECT_FALSE(ME.Captured[1]) << Opt << Describe(ME);
+      EXPECT_TRUE(Writes(ME.ParamsReachable[1])) << Opt;
+    }
+  }
+}
+
+// A table entry without the result flag: its integer result may hold any
+// address. A callee that keeps it marks the memory, and a read of that
+// memory as a pointer writes other memory.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_OldEntryResultMayHoldAnAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  const std::string E = llvm::utohexstr(
+      llvm::MemoryEffects::argMemOnly(llvm::ModRefInfo::Ref).toIntValue());
+  for (const char* Flag : {"", "0"}) {
+    TestFixture::CreateInterpreter({"-O2"});
+    const std::string Table = SummaryHeader() + "me_or_get\t" + E +
+                              "\t-c\tr\tn\t.\tn\t..00" + Flag + "\t.\n";
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 1);
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      extern "C" std::uintptr_t me_or_get(const long* p);
+      struct me_or_f { std::uintptr_t a; };
+      __attribute__((noinline)) void me_or_seta(me_or_f* f, std::uintptr_t a) {
+        f->a = a;
+      }
+      extern "C" void me_or_c(me_or_f* d, const long* p) {
+        me_or_seta(d, me_or_get(p) + 8);
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+    )",
+        {"me_or_c"});
+    ASSERT_EQ(MEs.size(), 1u);
+    ASSERT_TRUE(MEs[0].Valid);
+    EXPECT_EQ(Writes(MEs[0].Other), *Flag == 0) << Flag << Describe(MEs[0]);
+  }
+}
+
+// Under trust, an opaque call may return what its arguments carry: an
+// address passed in as an integer, or integer data of memory that holds an
+// address. Its result from a plain integer holds none.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedResultCarriesArguments) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_tr2_g[8] = {};
+      struct me_tr2_f { std::uintptr_t a; };
+      extern "C" std::uintptr_t me_tr2_mix(std::uintptr_t v);
+      extern "C" std::uintptr_t me_tr2_read(const me_tr2_f* s);
+      __attribute__((noinline)) void me_tr2_seta(me_tr2_f* f,
+                                                 std::uintptr_t a) {
+        f->a = a;
+      }
+      __attribute__((noinline)) void me_tr2_poke(const me_tr2_f* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      extern "C" void me_tr2_arg(me_tr2_f* d) {
+        me_tr2_seta(d, me_tr2_mix((std::uintptr_t)&me_tr2_g[0]));
+        me_tr2_poke(d);
+      }
+      extern "C" void me_tr2_mem(me_tr2_f* d) {
+        me_tr2_f s{(std::uintptr_t)&me_tr2_g[0]};
+        me_tr2_seta(d, me_tr2_read(&s));
+        me_tr2_poke(d);
+      }
+      extern "C" void me_tr2_plain(me_tr2_f* d) {
+        me_tr2_seta(d, me_tr2_mix(42));
+        me_tr2_poke(d);
+      }
+    )",
+        {"me_tr2_arg", "me_tr2_mem", "me_tr2_plain"});
+    ASSERT_EQ(MEs.size(), 3u);
+    for (size_t K = 0; K < 2; ++K) {
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Describe(MEs[K]);
+    }
+    ASSERT_TRUE(MEs[2].Valid) << Opt;
+    // At -O0 the write through the copied pointer reads as other memory for
+    // a reason that this case does not test.
+    if (Opt[2] == '2')
+      EXPECT_FALSE(Writes(MEs[2].TrustedOther)) << Opt << Describe(MEs[2]);
+  }
+}
+
+// A model declaration may state that its integer result holds no address.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_ModelResultHoldsNoAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare i64 @me_mr_model(ptr captures(none), i64)
+        memory(argmem: read) nounwind willreturn
+    declare i64 @me_mr_clean(ptr captures(none), i64)
+        memory(argmem: read) nounwind willreturn
+        "cppinterop-result-no-address"
+    define i64 @me_mr_hash(ptr %p, i64 %n) {
+      %r = call i64 @me_mr_model(ptr %p, i64 %n)
+      ret i64 %r
+    }
+    define i64 @me_mr_hash_clean(ptr %p, i64 %n) {
+      %r = call i64 @me_mr_clean(ptr %p, i64 %n)
+      ret i64 %r
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  std::vector<std::string> Plain = RowOf(Table, "me_mr_hash");
+  std::vector<std::string> Clean = RowOf(Table, "me_mr_hash_clean");
+  ASSERT_EQ(Plain.size(), 9u) << Table;
+  ASSERT_EQ(Clean.size(), 9u) << Table;
+  EXPECT_EQ(Plain[7].back(), '1') << Table;
+  EXPECT_EQ(Clean[7].back(), '0') << Table;
+}
+
+// A callee returns, as an integer, an address that its argument reaches:
+// an atomic integer, the bytes of a pointer, or a pointer converted to an
+// integer. Under trust, an opaque call may return what its argument objects
+// hold. The caller stores the result, reads it back as a pointer, and
+// writes through it.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerResultReachesAnAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::Declare("#include <atomic>\n#include <cstdint>\n"
+                           "#include <cstring>"),
+              0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_ir_g[8] = {};
+      struct me_ir_f { std::uintptr_t a; };
+      struct me_ir_p { long* p; };
+      std::uintptr_t me_ir_addr(const me_ir_p* s);
+      __attribute__((noinline)) std::uintptr_t
+      me_ir_atom(const std::atomic<std::uintptr_t>* a) {
+        return a->load();
+      }
+      __attribute__((noinline)) std::uintptr_t me_ir_bytes(long* const* pp) {
+        std::uintptr_t v;
+        std::memcpy(&v, pp, sizeof v);
+        return v;
+      }
+      __attribute__((noinline)) std::uintptr_t me_ir_p2i(long* const* pp) {
+        return (std::uintptr_t)*pp;
+      }
+      __attribute__((noinline)) void me_ir_poke(const void* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      extern "C" void me_ir_atomic(me_ir_f* d) {
+        std::atomic<std::uintptr_t> a{(std::uintptr_t)&me_ir_g[0]};
+        d->a = me_ir_atom(&a);
+        me_ir_poke(d);
+      }
+      extern "C" void me_ir_memcpy(me_ir_f* d) {
+        long* p = &me_ir_g[0];
+        d->a = me_ir_bytes(&p);
+        me_ir_poke(d);
+      }
+      extern "C" void me_ir_ptoi(me_ir_f* d) {
+        long* p = &me_ir_g[0];
+        d->a = me_ir_p2i(&p);
+        me_ir_poke(d);
+      }
+      extern "C" void me_ir_one(me_ir_f* d) {
+        me_ir_p s{&me_ir_g[0]};
+        d->a = me_ir_addr(&s);
+        me_ir_poke(d);
+      }
+      extern "C" void me_ir_param(me_ir_f* d, const me_ir_p* s) {
+        d->a = me_ir_addr(s);
+        me_ir_poke(d);
+      }
+    )",
+        {"me_ir_atomic", "me_ir_memcpy", "me_ir_ptoi", "me_ir_one",
+         "me_ir_param"});
+    ASSERT_EQ(MEs.size(), 5u);
+    for (size_t K = 0; K < MEs.size(); ++K)
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+    for (size_t K = 0; K < 3; ++K)
+      EXPECT_TRUE(Writes(MEs[K].Other)) << Opt << " " << K << Describe(MEs[K]);
+    for (size_t K = 0; K < 4; ++K)
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Describe(MEs[K]);
+    // The write lands in the memory that the parameter reaches: as for a
+    // copied pointer, s is captured into d and d's reachable memory is
+    // written, or the write is one of other memory.
+    EXPECT_TRUE(Writes(MEs[4].TrustedOther) ||
+                Writes(MEs[4].TrustedParamsReachable[1]) ||
+                (MEs[4].TrustedPointerCaptured[1] &&
+                 Writes(MEs[4].TrustedParamsReachable[0])))
+        << Opt << Describe(MEs[4]);
+  }
+}
+
+// As above, with the callees as table entries from -O0 bodies, and a
+// function that returns the result of a trusted declaration.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerResultThroughTables) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  llvm::LLVMContext Ctx;
+  llvm::SMDiagnostic Err;
+  std::unique_ptr<llvm::Module> M = llvm::parseAssemblyString(R"(
+    declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+    declare i64 @me_it_model(ptr captures(none)) memory(argmem: read)
+        nounwind willreturn "cppinterop-trusted-stores"
+    define i64 @me_it_atom(ptr %a) optnone noinline {
+      %a.addr = alloca ptr
+      store ptr %a, ptr %a.addr
+      %t0 = load ptr, ptr %a.addr
+      %v = load atomic i64, ptr %t0 seq_cst, align 8
+      ret i64 %v
+    }
+    define i64 @me_it_bytes(ptr %pp) optnone noinline {
+      %pp.addr = alloca ptr
+      %v = alloca i64
+      store ptr %pp, ptr %pp.addr
+      %t0 = load ptr, ptr %pp.addr
+      call void @llvm.memcpy.p0.p0.i64(ptr %v, ptr %t0, i64 8, i1 false)
+      %t1 = load i64, ptr %v
+      ret i64 %t1
+    }
+    define i64 @me_it_p2i(ptr %pp) optnone noinline {
+      %pp.addr = alloca ptr
+      store ptr %pp, ptr %pp.addr
+      %t0 = load ptr, ptr %pp.addr
+      %t1 = load ptr, ptr %t0
+      %t2 = ptrtoint ptr %t1 to i64
+      ret i64 %t2
+    }
+    define i64 @me_it_trusted(ptr %h) optnone noinline {
+      %h.addr = alloca ptr
+      store ptr %h, ptr %h.addr
+      %t0 = load ptr, ptr %h.addr
+      %t1 = call i64 @me_it_model(ptr %t0)
+      ret i64 %t1
+    }
+  )",
+                                                              Err, Ctx);
+  ASSERT_TRUE(M) << Err.getMessage().str();
+  const std::string Table = CppInternal::SummarizeMemoryEffects(*M);
+  for (const char* Opt : {"-O0", "-O2"}) {
+    TestFixture::CreateInterpreter({Opt});
+    ASSERT_EQ(Cpp::LoadMemoryEffectsSummaries(Table.c_str()), 4) << Table;
+    ASSERT_EQ(Cpp::Declare("#include <atomic>\n#include <cstdint>\n"
+                           "#include <cstring>"),
+              0);
+    std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+        R"(
+      inline long me_it_g[8] = {};
+      extern "C" {
+      struct me_it_f { std::uintptr_t a; };
+      struct me_it_p { long* p; };
+      std::uintptr_t me_it_atom(const std::atomic<std::uintptr_t>* a);
+      std::uintptr_t me_it_bytes(long* const* pp);
+      std::uintptr_t me_it_p2i(long* const* pp);
+      std::uintptr_t me_it_trusted(const void* h);
+      void me_it_poke(const void* d) {
+        long* q;
+        std::memcpy(&q, d, sizeof q);
+        *q = 1;
+      }
+      void me_it_atomic(me_it_f* d) {
+        std::atomic<std::uintptr_t> a{(std::uintptr_t)&me_it_g[0]};
+        d->a = me_it_atom(&a);
+        me_it_poke(d);
+      }
+      void me_it_memcpy(me_it_f* d) {
+        long* p = &me_it_g[0];
+        d->a = me_it_bytes(&p);
+        me_it_poke(d);
+      }
+      void me_it_ptoi(me_it_f* d) {
+        long* p = &me_it_g[0];
+        d->a = me_it_p2i(&p);
+        me_it_poke(d);
+      }
+      void me_it_one(me_it_f* d) {
+        me_it_p s{&me_it_g[0]};
+        d->a = me_it_trusted(&s);
+        me_it_poke(d);
+      }
+      void me_it_param(me_it_f* d, const me_it_p* s) {
+        d->a = me_it_trusted(s);
+        me_it_poke(d);
+      }
+      }
+    )",
+        {"me_it_atomic", "me_it_memcpy", "me_it_ptoi", "me_it_one",
+         "me_it_param"});
+    ASSERT_EQ(MEs.size(), 5u);
+    for (size_t K = 0; K < MEs.size(); ++K)
+      ASSERT_TRUE(MEs[K].Valid) << Opt;
+    for (size_t K = 0; K < 4; ++K)
+      EXPECT_TRUE(Writes(MEs[K].TrustedOther))
+          << Opt << " " << K << Table << Describe(MEs[K]);
+    EXPECT_TRUE(Writes(MEs[4].TrustedOther) ||
+                Writes(MEs[4].TrustedParamsReachable[1]) ||
+                (MEs[4].TrustedPointerCaptured[1] &&
+                 Writes(MEs[4].TrustedParamsReachable[0])))
+        << Opt << Table << Describe(MEs[4]);
+  }
 }

@@ -620,8 +620,10 @@ struct MemoryEffects {
   /// and ParamsReachable when every opaque call is trusted to access only
   /// memory through its arguments, to keep no copy of them, and not to write
   /// through a const reference, a pointer to const, or `this` of a const
-  /// method. They show what the visible code does. Equal to the untrusted
-  /// fields when Opaque is empty.
+  /// method. A call that its signature bounds is also trusted to store no
+  /// pointer to other memory, or integer data with such an address, into
+  /// its arguments' memory. They show what the visible code does. Equal to the
+  /// untrusted fields when Opaque is empty.
   ModRef TrustedOther = ModRef::ReadWrite;
   std::vector<bool> TrustedCaptured;
   std::vector<bool> TrustedAddressCaptured;
