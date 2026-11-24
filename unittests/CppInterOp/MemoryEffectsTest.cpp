@@ -5182,3 +5182,226 @@ TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_IntegerResultThroughTables) {
         << Opt << Table << Describe(MEs[4]);
   }
 }
+
+// Disabled: a write to a parameter's own object through a pointer that the
+// function loads back from memory does not show on that parameter.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           DISABLED_MemoryEffects_OwnObjectThroughLoadedPointer) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  // Without optimization clang ignores noinline.
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_ol_n;
+    struct me_ol_b { me_ol_n* back; };
+    struct me_ol_n { me_ol_b* box; long v; };
+    __attribute__((noinline)) void me_ol_link(const me_ol_n* n) {
+      n->box->back = const_cast<me_ol_n*>(n);
+    }
+    extern "C" void me_ol_self(const me_ol_n* n) {
+      me_ol_link(n);
+      n->box->back->v = 1;
+    }
+    inline int me_ol_g = 0;
+    __attribute__((noinline)) int* me_ol_exchange(int** slot) {
+      int* old = *slot;
+      *slot = &me_ol_g;
+      return old;
+    }
+    extern "C" void me_ol_slot(int* p) {
+      int* slot = p;
+      *me_ol_exchange(&slot) = 1;
+    }
+  )",
+      {"me_ol_self", "me_ol_slot"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(Writes(MEs[0].ParamsDirect[0])) << Describe(MEs[0]);
+  EXPECT_TRUE(Writes(MEs[1].ParamsDirect[0])) << Describe(MEs[1]);
+}
+
+// An address that the caller puts into integer data of a parameter is left
+// to the caller: a write through its memcpy copy is reachable memory.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_CallerSuppliedIntegerAddress) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter({"-O2"});
+  ASSERT_EQ(Cpp::Declare("#include <cstdint>\n#include <cstring>"), 0);
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_cs_f { uintptr_t a; };
+    extern "C" void me_cs_mem(const me_cs_f* f) {
+      long* q;
+      std::memcpy(&q, &f->a, sizeof q);
+      *q = 1;
+    }
+    extern "C" void me_cs_cast(const me_cs_f* f) {
+      *reinterpret_cast<long*>(f->a) = 1;
+    }
+  )",
+      {"me_cs_mem", "me_cs_cast"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_EQ(MEs[0].ParamsDirect[0], ModRef::Read) << Describe(MEs[0]);
+  EXPECT_EQ(MEs[0].ParamsReachable[0], ModRef::Write) << Describe(MEs[0]);
+  EXPECT_EQ(MEs[0].Other, ModRef::None) << Describe(MEs[0]);
+  EXPECT_FALSE(MEs[0].Captured[0]);
+  // The cast form stays other memory.
+  EXPECT_EQ(MEs[1].ParamsReachable[0], ModRef::None) << Describe(MEs[1]);
+  EXPECT_TRUE(Writes(MEs[1].Other)) << Describe(MEs[1]);
+}
+
+// Disabled: a callee copies q's pointer into a local that b holds; the write
+// through the local is in neither q's reachable memory nor other memory.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           DISABLED_MemoryEffects_CrossParameterThroughHeldLocal) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    struct me_xh_in { long* p; };
+    struct me_xh_box { me_xh_in* in; };
+    __attribute__((noinline)) void me_xh_stash(me_xh_box* b, me_xh_in* i) {
+      b->in = i;
+    }
+    __attribute__((noinline)) void me_xh_copy(const me_xh_box* b,
+                                              const me_xh_in* q) {
+      b->in->p = q->p;
+    }
+    extern "C" void me_xh_f(me_xh_box* b, const me_xh_in* q) {
+      long loc = 0;
+      me_xh_in x{&loc};
+      me_xh_stash(b, &x);
+      me_xh_copy(b, q);
+      *x.p = 1;
+      b->in = nullptr;
+    }
+  )",
+      {"me_xh_f"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].ParamsReachable[1]) || Writes(MEs[0].Other))
+      << Describe(MEs[0]);
+}
+
+// Disabled: a callee that is not inlined stores p into a fresh object that
+// the function returns; only the inlined form reports the capture.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           DISABLED_MemoryEffects_CaptureThroughFreshResult) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  SKIP_ON_MSVC_ABI(
+      "the runtime model knows the Itanium new, delete and throw entry points");
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    __attribute__((noinline)) void me_cf_put(int** dst, int* p) { *dst = p; }
+    extern "C" int** me_cf_call(int* p) {
+      int** out = new int*;
+      me_cf_put(out, p);
+      return out;
+    }
+    extern "C" int** me_cf_inline(int* p) { return new int*(p); }
+  )",
+      {"me_cf_call", "me_cf_inline"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 2u);
+  for (const Cpp::MemoryEffects& ME : MEs)
+    ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(MEs[1].AddressCaptured[0]) << Describe(MEs[1]);
+  EXPECT_TRUE(MEs[0].Captured[0]) << Describe(MEs[0]);
+  EXPECT_TRUE(MEs[0].AddressCaptured[0]) << Describe(MEs[0]);
+}
+
+// Disabled: a byte-wise copy of a pointer through unsigned char loses the
+// pointer, so the write through the copy to a global is missed.
+TYPED_TEST(CPPINTEROP_TEST_MODE,
+           DISABLED_MemoryEffects_UnsignedCharCopyOfAPointer) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::GetFunctionsMemoryEffects(
+      R"(
+    inline long me_uc_g = 0;
+    struct me_uc_p { long* p; };
+    __attribute__((noinline)) void me_uc_copy(unsigned char* d,
+                                              const unsigned char* s) {
+      for (int i = 0; i < 8; ++i)
+        d[i] = s[i];
+    }
+    extern "C" void me_uc_f(me_uc_p* d) {
+      me_uc_p s{&me_uc_g};
+      me_uc_copy(reinterpret_cast<unsigned char*>(d),
+                 reinterpret_cast<const unsigned char*>(&s));
+      *d->p = 1;
+    }
+  )",
+      {"me_uc_f"}, /*rewind=*/true);
+  ASSERT_EQ(MEs.size(), 1u);
+  ASSERT_TRUE(MEs[0].Valid);
+  EXPECT_TRUE(Writes(MEs[0].Other)) << Describe(MEs[0]);
+}
+
+// A trusted call touches only the objects that its pointer arguments point
+// to, not memory behind pointers in those objects.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedCallReachesOneLevel) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    inline long me_td_g = 0;
+    struct me_td_in { long* p; };
+    struct me_td_h { me_td_in* in; };
+    void me_td_w(me_td_h* h);
+    long me_td_r(const me_td_h* h);
+    extern "C" void me_td_wparam(me_td_h* h) { me_td_w(h); }
+    extern "C" long me_td_rparam(const me_td_h* h) { return me_td_r(h); }
+    extern "C" void me_td_wlocal() {
+      me_td_in in{&me_td_g};
+      me_td_h h{&in};
+      me_td_w(&h);
+    }
+    extern "C" long me_td_rlocal() {
+      me_td_in in{&me_td_g};
+      me_td_h h{&in};
+      return me_td_r(&h);
+    }
+  )",
+      {"me_td_wparam", "me_td_rparam", "me_td_wlocal", "me_td_rlocal"});
+  ASSERT_EQ(MEs.size(), 4u);
+  for (const Cpp::MemoryEffects& ME : MEs) {
+    ASSERT_TRUE(ME.Valid);
+    EXPECT_TRUE(AllBounded(ME)) << OpaqueNames(ME);
+    EXPECT_EQ(ME.TrustedOther, ModRef::None) << Describe(ME);
+  }
+  EXPECT_EQ(MEs[0].TrustedParamsDirect[0], ModRef::ReadWrite);
+  EXPECT_EQ(MEs[0].TrustedParamsReachable[0], ModRef::None);
+  EXPECT_FALSE(MEs[0].TrustedCaptured[0]);
+  EXPECT_EQ(MEs[1].TrustedParamsDirect[0], ModRef::Read);
+  EXPECT_EQ(MEs[1].TrustedParamsReachable[0], ModRef::None);
+  EXPECT_FALSE(MEs[1].TrustedCaptured[0]);
+}
+
+// A trusted call that stores q into r's memory captures q, so q's reachable
+// memory is not an attribution.
+TYPED_TEST(CPPINTEROP_TEST_MODE, MemoryEffects_TrustedStoreOfAnArgument) {
+  SKIP_WITHOUT_MEMORY_EFFECTS();
+  TestFixture::CreateInterpreter({"-O2"});
+  std::vector<Cpp::MemoryEffects> MEs = Cpp::AnalyzeFunctionsMemoryEffects(
+      R"(
+    struct me_sa_box { long* p; };
+    void me_sa_set(me_sa_box* r, long* q);
+    extern "C" void me_sa_f(me_sa_box* r, long* q) {
+      me_sa_set(r, q);
+      *r->p = 1;
+    }
+  )",
+      {"me_sa_f"});
+  ASSERT_EQ(MEs.size(), 1u);
+  const Cpp::MemoryEffects& ME = MEs[0];
+  ASSERT_TRUE(ME.Valid);
+  EXPECT_TRUE(AllBounded(ME)) << OpaqueNames(ME);
+  EXPECT_EQ(ME.TrustedOther, ModRef::None) << Describe(ME);
+  EXPECT_TRUE(ME.TrustedCaptured[1]) << Describe(ME);
+  EXPECT_TRUE(ME.TrustedPointerCaptured[1]) << Describe(ME);
+  EXPECT_TRUE(Writes(ME.TrustedParamsDirect[1]));
+  EXPECT_TRUE(Writes(ME.TrustedParamsReachable[1]));
+}
